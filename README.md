@@ -1,5 +1,7 @@
 # Ai-Shell
 
+**English** | [中文](README.zh-CN.md)
+
 LLM-powered remote Linux operations console. Manage SSH hosts from a desktop app, ask an agent to diagnose problems in natural language, or run shell commands yourself — with a policy engine that blocks credential reads and dangerous actions, and asks for confirmation on high-risk changes.
 
 Built with [Wails v2](https://wails.io/) (Go + Vue 3).
