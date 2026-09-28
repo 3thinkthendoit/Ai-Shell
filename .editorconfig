@@ -1,0 +1,27 @@
+# 仓库源码一律用 LF。
+#
+# 这条不是洁癖：gofmt -l 会把 CRLF 文件报成「格式不合规」，
+# 而它报的是**行尾**而不是缩进 —— 看到告警的人会先去怀疑自己写错了代码，
+# 很难想到问题出在编辑器偷偷把 \n 换成了 \r\n。
+#
+# 已经踩过两次：一次是批量改测试的脚本用了 Python 的 write_text
+# （Windows 上会把 \n 翻成 \r\n），一次是编辑器在保存时自动转换。
+# 与其每次事后用脚本洗回来，不如在这里把规则写死。
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.go]
+indent_style = tab
+
+[*.{js,ts,vue,json,yml,yaml}]
+indent_style = space
+indent_size = 2
+
+# Markdown 里的行尾空格是有意义的（硬换行），不要替用户删掉。
+[*.md]
+trim_trailing_whitespace = false

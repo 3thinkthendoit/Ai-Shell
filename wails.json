@@ -1,0 +1,18 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "ai-shell",
+  "outputfilename": "Ai-Shell",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "Ai-Shell"
+  },
+  "info": {
+    "companyName": "Ai-Shell",
+    "productName": "Ai-Shell",
+    "productVersion": "0.1.0",
+    "comments": "LLM 驱动的 Linux 远程运维台"
+  }
+}
