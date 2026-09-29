@@ -3,7 +3,7 @@
 // store.js 的测试锁住了状态机，这里锁住「状态 -> 界面」这一段：
 // 审批条是否出现、按钮点了到底调了什么、注入告警有没有渲染出来。
 // 这一段没有测试的话，状态对了但界面没反应同样是个 bug。
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import { nextTick } from 'vue'
 import ConsolePanel from '../components/ConsolePanel.vue'
@@ -94,13 +94,12 @@ describe('ConsolePanel 空状态与主机选择', () => {
     expect(wrapper.text()).toContain('nginx 起不来了')
   })
 
-  it('分段按钮显示「Agent会话」并标明 shell 直跑与 LLM', () => {
+  it('分段按钮显示「Agent会话」，能力横幅标明高危确认与 LLM', () => {
     setup()
     const segs = wrapper.findAll('.seg button')
     expect(segs[0].text()).toBe('Agent会话')
-    expect(wrapper.find('.ctx-note').text()).toMatch(/LLM/)
-    expect(wrapper.find('.ctx-note').text()).toMatch(/高危/)
-    expect(wrapper.find('.sess-banner').text()).toMatch(/高危|直跑/)
+    expect(wrapper.find('.sess-banner').text()).toMatch(/高危/)
+    expect(wrapper.find('.sess-banner').text()).toMatch(/LLM/)
   })
 })
 
@@ -378,8 +377,9 @@ describe('ConsolePanel 清空会话上下文', () => {
   // 早先这里写的是 wrapper.find('.ctx-bar button')，靠位置取到第一个 ——
   // 后来在旁边加了个「压缩上下文」，它就成了第一个，四条用例一起红。
   // 位置选择在「同一个容器里会有几个按钮」这件事上没有表达力。
+  // 模型/压缩/清空上下文整行已挪到底部 composer-bar（紧邻输入框）。
   function ctxBtn(label) {
-    const b = wrapper.findAll('.ctx-bar button').find(x => x.text().includes(label))
+    const b = wrapper.findAll('.composer-bar button').find(x => x.text().includes(label))
     if (!b) throw new Error(`未找到按钮：${label}`)
     return b
   }
@@ -459,7 +459,7 @@ describe('ConsolePanel 压缩会话上下文', () => {
   }
 
   function ctxBtn(label) {
-    const b = wrapper.findAll('.ctx-bar button').find(x => x.text().includes(label))
+    const b = wrapper.findAll('.composer-bar button').find(x => x.text().includes(label))
     if (!b) throw new Error(`未找到按钮：${label}`)
     return b
   }
@@ -573,227 +573,34 @@ describe('ConsolePanel 压缩会话上下文', () => {
 
 // ---- 上下文存放位置的说明 ----
 //
-// 会话从「只存内存」改成了「加密落盘」。界面上那句说明必须跟着改 ——
-// 文案与事实相反比没有文案更糟：用户按「重启就没了」的预期去用，
-// 结果敏感对话一直留在磁盘上，而他以为早没了。
+// 会话从「只存内存」改成了「加密落盘」。界面文案与事实相反比没有文案更糟：
+// 用户按「重启就没了」的预期去用，结果敏感对话一直留在磁盘上，而他以为早没了。
+// 说明性文字已精简（详见空态引导与能力横幅），这里锁住底线：
+// 界面上任何位置都不得再声称「重启即清空 / 只存内存」。
 describe('ConsolePanel 上下文存放说明', () => {
-  it('说明里必须写明是落盘的，不能再说「重启即清空」', () => {
+  it('空态引导说明记忆按主机×会话隔离，且不得声称「重启即清空」', () => {
     store.hosts = [{ id: 'h1', name: 'web', user: 'root', addr: '10.0.0.1' }]
     store.currentHostId = 'h1'
     setup({})
 
-    const text = wrapper.find('.ctx-bar').text()
-    expect(text).toContain('按主机独立')
-    expect(text).toMatch(/加密|落盘|本机/)
-    expect(text).toMatch(/LLM/)
-    expect(text).toMatch(/高危|直跑/)
+    const text = wrapper.find('.console').text()
+    expect(text).toContain('记忆相互独立')
     expect(text, '会话已经落盘了，不能再声称重启即清空').not.toContain('重启应用即清空')
     expect(text).not.toContain('只存在内存')
+    expect(wrapper.find('.sess-banner').text()).toMatch(/高危|确认/)
   })
 })
 
-// ---- 会话选择器（一台主机多条会话）----
-//
-// 这一段锁的是「状态 -> 界面」的映射：列表渲染成什么样、
-// 哪个按钮在什么情况下该禁用、点下去到底调了哪个后端方法。
-// 会话状态机本身由 sessions.test.js 覆盖。
-describe('ConsolePanel 会话选择器', () => {
-  const SESSIONS = [
-    { id: 'default', name: '', turns: 0, archivedTurns: 0, isDefault: true },
-    { id: 's1', name: 'nginx 排查', turns: 4, archivedTurns: 0, isDefault: false },
-    { id: 's2', name: '磁盘排查', turns: 0, archivedTurns: 0, isDefault: false }
-  ]
-  const copy = () => SESSIONS.map(s => ({ ...s }))
-
-  // 会话列表由 refreshSessions 填，所以这里直接预置好 store.sessions，
-  // 模拟「列表已经拉回来了」这个正常状态。
-  function mountWithHost(impl = {}) {
-    store.hosts = [{ id: 'h1', name: 'web', user: 'root', addr: '10.0.0.1' }]
-    store.currentHostId = 'h1'
-    store.sessions = { h1: copy() }
-    store.currentSessionId = 'default'
-    return setup(impl)
-  }
-
-  const select = () => wrapper.find('.session-select')
-  const btn = label => {
-    const b = wrapper.findAll('.ctx-bar button').find(x => x.text().trim() === label)
-    if (!b) throw new Error(`未找到按钮：${label}`)
-    return b
-  }
-  const editInput = () => wrapper.find('.session-edit input')
-  const editOK = () => wrapper.findAll('.session-edit button')[0]
-
-  it('把该主机的会话列出来，默认会话排第一', () => {
-    mountWithHost()
-    const opts = select().findAll('option')
-    expect(opts).toHaveLength(3)
-    expect(opts[0].attributes('value')).toBe('default')
-    expect(opts[0].text()).toContain('默认会话')
-    expect(opts[1].text()).toContain('nginx 排查')
-  })
-
-  // 轮数必须显示出来：用户需要一眼看出哪条会话有上下文 ——
-  // 这直接关系到「该清空哪条」「该压缩哪条」。只显示名字的话，
-  // 三条名字相近的会话摆在面前，他只能一条条点进去看。
-  it('选项里带上轮数，让用户看出哪条有上下文', () => {
-    mountWithHost()
-    const opts = select().findAll('option')
-    expect(opts[1].text()).toContain('4 轮')
-    expect(opts[2].text(), '0 轮的会话不必显示轮数，免得噪声').not.toContain('轮')
-  })
-
-  it('切换下拉框会更新当前会话', async () => {
-    mountWithHost()
-    await select().setValue('s2')
-    expect(store.currentSessionId).toBe('s2')
-  })
-
-  it('切换会话后对话区换成那条会话自己的记录', async () => {
-    mountWithHost()
-    store.currentSessionId = 's1'
-    push({ kind: 'user', content: '甲会话的内容' })
-    await nextTick()
-    expect(wrapper.text()).toContain('甲会话的内容')
-
-    await select().setValue('s2')
-    await nextTick()
-    expect(wrapper.text(), '切过去时不该还显示另一条会话的内容').not.toContain('甲会话的内容')
-  })
-
-  it('点「新建」打开内联输入框，确认后带上名字调后端', async () => {
-    mountWithHost({
-      CreateSession: async () => ({ id: 's9', name: '磁盘排查', turns: 0, isDefault: false }),
-      ListSessions: async () => [...copy(), { id: 's9', name: '磁盘排查', turns: 0, isDefault: false }]
-    })
-
-    await btn('新建').trigger('click')
-    await nextTick()
-    expect(editInput().exists()).toBe(true)
-
-    await editInput().setValue('磁盘排查')
-    await editOK().trigger('click')
-    await flushPromises()
-
-    const c = calls.filter(x => x.name === 'CreateSession')
-    expect(c).toHaveLength(1)
-    expect(c[0].args).toEqual(['h1', '磁盘排查'])
-    expect(wrapper.find('.session-edit').exists(), '提交后编辑器应收起').toBe(false)
-    expect(store.currentSessionId, '新建之后应切到那条新会话').toBe('s9')
-  })
-
-  // 空名字在本地就拦下来。放过去的话用户要先关掉编辑器、看一条报错、
-  // 再从头来一遍 —— 而这件事完全可以在本地说清楚。
-  it('空名字在本地拦下，不打后端，也不吞掉编辑器', async () => {
-    mountWithHost()
-    await btn('新建').trigger('click')
-    await nextTick()
-    await editOK().trigger('click')
-    await flushPromises()
-
-    expect(calls.filter(x => x.name === 'CreateSession')).toHaveLength(0)
-    expect(wrapper.text()).toContain('会话名不能为空')
-    expect(wrapper.find('.session-edit').exists(), '报错时编辑器要留着，否则用户得重新输入').toBe(true)
-  })
-
-  it('Esc 取消编辑，不打后端', async () => {
-    mountWithHost()
-    await btn('新建').trigger('click')
-    await nextTick()
-    await editInput().trigger('keydown', { key: 'Escape' })
-    await nextTick()
-
-    expect(wrapper.find('.session-edit').exists()).toBe(false)
-    expect(calls.filter(x => x.name === 'CreateSession')).toHaveLength(0)
-  })
-
-  it('点「改名」预填当前名字，确认后把两个 ID 都发给后端', async () => {
-    mountWithHost({
-      ListSessions: async () => [copy()[0], { id: 's1', name: 'nginx 与证书', turns: 4, isDefault: false }, copy()[2]]
-    })
-    store.currentSessionId = 's1'
-    await nextTick()
-
-    await btn('改名').trigger('click')
-    await nextTick()
-    expect(editInput().element.value, '应预填当前名字，让用户在原名上改').toBe('nginx 排查')
-
-    await editInput().setValue('nginx 与证书')
-    await editOK().trigger('click')
-    await flushPromises()
-
-    const c = calls.filter(x => x.name === 'RenameSession')
-    expect(c).toHaveLength(1)
-    expect(c[0].args).toEqual(['h1', 's1', 'nginx 与证书'])
-  })
-
-  // 删掉一整段排查过程是不可撤销的（后端删完立刻落盘），
-  // 所以必须先让用户看清自己要删的是哪一条。
-  it('点「删除」先确认，确认后带上两个 ID 调后端', async () => {
-    const spy = vi.spyOn(window, 'confirm').mockReturnValue(true)
-    mountWithHost()
-    store.currentSessionId = 's1'
-    await nextTick()
-
-    await btn('删除').trigger('click')
-    await flushPromises()
-
-    expect(spy).toHaveBeenCalled()
-    expect(spy.mock.calls[0][0], '确认文案里要出现会话名，用户才知道删的是哪条').toContain('nginx 排查')
-    const c = calls.filter(x => x.name === 'DeleteSession')
-    expect(c).toHaveLength(1)
-    expect(c[0].args).toEqual(['h1', 's1'])
-    spy.mockRestore()
-  })
-
-  it('确认框里点了取消就不删', async () => {
-    const spy = vi.spyOn(window, 'confirm').mockReturnValue(false)
-    mountWithHost()
-    store.currentSessionId = 's1'
-    await nextTick()
-
-    await btn('删除').trigger('click')
-    await flushPromises()
-
-    expect(calls.filter(x => x.name === 'DeleteSession')).toHaveLength(0)
-    spy.mockRestore()
-  })
-
-  // 默认会话删不掉。界面提前禁用是为了不让用户白点一次再吃一个报错；
-  // 真正的规则只在后端那一处实现（sessions.test.js 里有对应的拒绝用例）。
-  it('默认会话的「删除」按钮禁用，并在 title 里说明原因', () => {
-    mountWithHost()
-    store.currentSessionId = 'default'
-
-    const b = btn('删除')
-    expect(b.attributes('disabled')).toBeDefined()
-    expect(b.attributes('title')).toContain('默认会话不能删除')
-  })
-
-  it('具名会话的「删除」按钮可用', async () => {
-    mountWithHost()
-    store.currentSessionId = 's1'
-    // 必须等一次重渲染：disabled 是随 isDefaultSession 变出来的，
-    // 不等的话读到的还是上一帧（默认会话）的状态。
-    await nextTick()
-    expect(btn('删除').attributes('disabled')).toBeUndefined()
-  })
-
-  it('没选主机时选择器与「新建」都不可用', () => {
-    store.hosts = []
-    store.currentHostId = ''
-    store.currentSessionId = ''
-    store.sessions = {}
-    setup({})
-
-    expect(select().attributes('disabled')).toBeDefined()
-    expect(btn('新建').attributes('disabled')).toBeDefined()
-  })
-
+// ---- 会话管理已移至侧边栏（SessionsSidebar.test.js）----
+// 这里只保留 ConsolePanel 自己的会话相关行为：切主机时重新拉列表。
+describe('ConsolePanel 会话随主机切换', () => {
   // 切主机必须重新拉列表：不拉的话，切到一台之前没看过的机器时选择器是空的，
   // 而它的默认会话其实一直都在 —— 用户会以为这台机器没有会话可用。
   it('切主机时去拉那台主机的会话列表', async () => {
-    mountWithHost()
+    store.hosts = [{ id: 'h1', name: 'web', user: 'root', addr: '10.0.0.1' }]
+    store.currentHostId = 'h1'
+    setup({})
+
     store.currentHostId = 'h2'
     await flushPromises()
 

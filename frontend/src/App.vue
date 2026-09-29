@@ -1,11 +1,12 @@
 <script setup>
 import { onMounted, ref } from 'vue'
-import { store, bootstrap, bindEvents, dismissAuditError } from './store'
+import { store, bootstrap, bindEvents, dismissAuditError, initTheme, setTheme } from './store'
 import ConsolePanel from './components/ConsolePanel.vue'
 import HostsPanel from './components/HostsPanel.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
 import PolicyPanel from './components/PolicyPanel.vue'
 import AuditPanel from './components/AuditPanel.vue'
+import SessionsSidebar from './components/SessionsSidebar.vue'
 
 const tab = ref('console')
 
@@ -17,7 +18,17 @@ const tabs = [
   { key: 'audit', label: '审计日志' }
 ]
 
+// 导航图标：内联 SVG（线性风格，stroke 跟随文字颜色），不引第三方图标库。
+const icons = {
+  console: 'M4 5h16v11H4z M8 20h8 M12 16v4',            // 终端窗口
+  hosts: 'M6 4h12v7H6z M6 13h12v7H6z M9 7.5h.01 M9 16.5h.01', // 服务器两台叠放
+  settings: 'M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7z M12 3v2.5 M12 18.5V21 M4.2 7.5l2.2 1.3 M17.6 15.2l2.2 1.3 M4.2 16.5l2.2-1.3 M17.6 8.8l2.2-1.3', // 齿轮
+  policy: 'M12 3l7 3v5.5c0 4.3-3 7.6-7 9-4-1.4-7-4.7-7-9V6z M9.5 12l1.8 1.8 3.4-3.6', // 盾牌+对勾
+  audit: 'M6 3h9l4 4v14H6z M14 3v5h5 M9.5 12h5 M9.5 16h5' // 文档+行
+}
+
 onMounted(async () => {
+  initTheme()
   bindEvents()
   await bootstrap()
 })
@@ -39,21 +50,25 @@ onMounted(async () => {
           :class="{ active: tab === t.key }"
           @click="tab = t.key"
         >
+          <svg class="nav-icon" width="15" height="15" viewBox="0 0 24 24" aria-hidden="true">
+            <path :d="icons[t.key]" fill="none" stroke="currentColor"
+                  stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
           {{ t.label }}
         </button>
       </nav>
 
+      <!-- 会话列表（WorkBuddy 风格）：随当前主机变化；点击会话切到控制台。 -->
+      <SessionsSidebar v-if="store.ready" class="ssb-wrap" @open="tab = 'console'" />
+
       <div class="posture" v-if="store.ready">
-        <div class="posture-row">
-          <span class="dot" :class="store.posture.degraded ? 'warn' : 'ok'"></span>
-          <span>{{ store.posture.degraded ? '降级保护' : '系统钥匙串' }}</span>
-        </div>
-        <div class="posture-note">
-          {{ store.posture.degraded
-            ? '主密钥存于本地文件（0600），安全性低于钥匙串'
-            : '主密钥托管在操作系统钥匙串，其他软件无法直接读取' }}
-        </div>
-        <div class="posture-host">已配置主机 {{ store.hosts.length }} 台</div>
+        <button
+          class="theme-btn"
+          :title="store.theme === 'dark' ? '切换到浅色主题' : '切换到暗黑主题'"
+          @click="setTheme(store.theme === 'dark' ? 'light' : 'dark')"
+        >
+          {{ store.theme === 'dark' ? '☀ 浅色' : '🌙 暗黑' }}
+        </button>
       </div>
     </aside>
 
@@ -115,21 +130,38 @@ onMounted(async () => {
   margin-top: 2px;
 }
 
+.theme-btn {
+  margin-top: 10px;
+  width: 100%;
+  font-size: 11.5px;
+  min-height: 28px;
+}
+
 nav {
   display: flex;
   flex-direction: column;
   gap: 3px;
 }
 
+.ssb-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
 .nav-btn {
+  gap: 9px;
   text-align: left;
+  justify-content: flex-start;
   border: none;
   background: transparent;
-  padding: 8px 10px;
+  padding: 0 10px;
   border-radius: 8px;
   color: var(--text-2);
 }
-.nav-btn:hover { background: rgba(0, 0, 0, 0.05); }
+.nav-icon { flex-shrink: 0; opacity: 0.75; }
+.nav-btn.active .nav-icon { opacity: 1; }
+.nav-btn:hover { background: var(--hover-overlay); }
 .nav-btn.active {
   background: var(--surface);
   color: var(--accent);
@@ -139,17 +171,12 @@ nav {
 
 .posture {
   margin-top: auto;
-  font-size: 11px;
-  color: var(--text-2);
   border-top: 1px solid var(--border);
   padding-top: 12px;
 }
-.posture-row { display: flex; align-items: center; gap: 6px; font-weight: 500; }
-.posture-note { color: var(--text-3); margin-top: 4px; line-height: 1.5; }
-.posture-host { margin-top: 6px; color: var(--text-3); }
 .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
-.dot.ok { background: #639922; }
-.dot.warn { background: #ba7517; }
+.dot.ok { background: var(--dot-ok); }
+.dot.warn { background: var(--dot-warn); }
 
 .main {
   flex: 1;

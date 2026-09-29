@@ -147,6 +147,20 @@ function callsOf(name) {
   return calls.filter(c => c.name === name)
 }
 
+// selectHost 通过 UiSelect（自绘下拉）切换目标主机。
+// 原生 select 已被替换：触发器是按钮，选项是列表项，不能用 setValue。
+async function selectHost(id) {
+  const h = store.hosts.find(x => x.id === id)
+  await wrapper.find('.host-select .uis-trigger').trigger('click')
+  await flushPromises()
+  const item = wrapper
+    .findAll('.host-select .uis-item')
+    .filter(w => w.text() === `${h.name} — ${h.user}@${h.addr}`)[0]
+  await item.trigger('click')
+  await flushPromises()
+  await nextTick()
+}
+
 beforeEach(() => {
   resetStore()
   resetInstances()
@@ -221,13 +235,12 @@ describe('交互终端 建立会话', () => {
     setup()
     await toTerminal()
 
-    await wrapper.find('.host-select').setValue('h2')
-    await flushPromises()
+    await selectHost('h2')
     expect(instances).toHaveLength(2)
     expect(callsOf('OpenTerminal').map(c => c.args[0])).toEqual(['h1', 'h2'])
 
     // 切回 h1：实例还在（滚动回放没丢），也不重开会话
-    await wrapper.find('.host-select').setValue('h1')
+    await selectHost('h1')
     await flushPromises()
     expect(instances).toHaveLength(2)
     expect(callsOf('OpenTerminal')).toHaveLength(2)
@@ -348,8 +361,7 @@ describe('交互终端 输出回显', () => {
     store.currentHostId = 'h1'
     setup()
     await toTerminal()
-    await wrapper.find('.host-select').setValue('h2')
-    await flushPromises()
+    await selectHost('h2')
 
     const h1 = instances[0]
     const h2 = instances[1]

@@ -35,6 +35,8 @@ export const store = reactive({
   // error 表示启动/调用失败，auditError 表示审计轨迹可能已不完整，
   // 后者不会因为一次成功调用而消失，必须用户显式确认。
   auditError: '',
+  // 主题：'light' | 'dark'。持久化在 localStorage（纯前端偏好，不进加密库）。
+  theme: 'light',
   posture: { keyProtection: '', configDir: '', hostCount: 0, degraded: false },
   hosts: [],
   llm: { baseUrl: '', model: '', hasApiKey: false },
@@ -200,6 +202,37 @@ function upsertTool(v) {
   if (v.status === 'running') store.running = true
 }
 
+// ---- 窗口标题 ----
+// 把系统标题栏（Wails Title）同步为「Ai-Shell · 任务名」，
+// 用户切任务时窗口标题跟着变；拿不到 runtime 或未选任务时回退静态标题。
+export function syncWindowTitle(taskName) {
+  const r = rt()
+  if (!r || typeof r.WindowSetTitle !== 'function') return
+  const base = 'Ai-Shell · Linux 智能运维台'
+  r.WindowSetTitle(taskName ? `${base} — ${taskName}` : base)
+}
+
+// ---- 主题 ----
+const THEME_KEY = 'aishell.theme'
+
+// initTheme 在应用挂载前调用：恢复上次选择并把 data-theme 落到 <html> 上。
+// 注意必须在首帧渲染前执行，否则暗色用户会先看到一帧白屏。
+export function initTheme() {
+  let t = 'light'
+  try {
+    t = localStorage.getItem(THEME_KEY) === 'dark' ? 'dark' : 'light'
+  } catch { /* localStorage 不可用时用默认值 */ }
+  store.theme = t
+  document.documentElement.dataset.theme = t
+}
+
+export function setTheme(t) {
+  if (t !== 'light' && t !== 'dark') return
+  store.theme = t
+  document.documentElement.dataset.theme = t
+  try { localStorage.setItem(THEME_KEY, t) } catch { /* 忽略持久化失败 */ }
+}
+
 export async function bootstrap() {
   try {
     const info = await api().Bootstrap()
@@ -321,9 +354,22 @@ function liveAssistant(step) {
   return targetEntries().find(e => e.kind === 'assistant' && e.stream === step)
 }
 
+// bindEvents 注册所有后端事件。必须可安全重复调用：
+// Wails v2 的 EventsOn 对同名事件是**追加**监听器而不是替换，
+// 热重载或组件重新挂载后再绑一遍，每条事件就会被处理 N 次 ——
+// 表现是终端里「ls 变成 lllsss」、对话消息重复三份。
+// 因此每次先 EventsOff 清掉同名旧监听，再重新注册：调用多少次都只挂一份。
+const EV_NAMES = [
+  'agent:delta', 'agent:message', 'agent:tool', 'agent:toolResult',
+  'agent:injection', 'agent:approval', 'agent:status', 'agent:error',
+  'audit:error', 'agent:done', 'term:data', 'term:exit'
+]
+
 export function bindEvents() {
   const r = rt()
   if (!r) return
+  // 测试用的运行时 mock 可能没有 EventsOff，此时跳过清理直接注册。
+  if (typeof r.EventsOff === 'function') r.EventsOff(...EV_NAMES)
 
   // 流式增量：逐字累加到「活」消息上
   r.EventsOn('agent:delta', d => {
@@ -383,6 +429,8 @@ export function bindEvents() {
 
   r.EventsOn('agent:error', e => {
     store.running = false
+    // 出错即本轮已终止，挂着审批条只会把输入框锁死 —— 必须一并清掉。
+    store.pending = null
     freezeStreams()
     push({ kind: 'error', content: e.message })
   })
@@ -440,7 +488,11 @@ export async function ask(prompt) {
   }
   // 防重入：这个不变量由 store 自己守住，不指望每个调用方都记得先查 running。
   // 否则第二次调用会被后端以「已有会话正在运行」拒绝，给用户弹一个莫名其妙的报错。
-  if (store.running || store.busy) return
+  // 不能静默 return：那会让用户以为「发出去没反应」，必须给出可见提示。
+  if (store.running || store.busy) {
+    push({ kind: 'system', content: '上一轮任务仍在执行中，请等待完成或点「中断」。' })
+    return
+  }
   // 记下这一轮属于哪条时间线。后续所有事件都按它归档 ——
   // 用户中途切了主机或会话也不会把输出写错地方。
   store.activeHostId = store.currentHostId
@@ -541,11 +593,11 @@ export async function createSession(name) {
     const info = await api().CreateSession(hostId, name)
     await refreshSessions(hostId)
     store.currentSessionId = info.id
-    push({ kind: 'system', content: `已新建会话「${info.name}」。` }, hostId, info.id)
+    push({ kind: 'system', content: `已新建任务「${info.name}」。` }, hostId, info.id)
   } catch (e) {
     push({
       kind: 'error',
-      content: `新建会话失败：${e && e.message ? e.message : e}`
+      content: `新建任务失败：${e && e.message ? e.message : e}`
     }, hostId)
   }
 }
@@ -560,7 +612,7 @@ export async function renameSession(sessionId, name) {
   try {
     await api().RenameSession(hostId, sessionId, name)
     await refreshSessions(hostId)
-    push({ kind: 'system', content: `会话已改名为「${name}」。` }, hostId, sessionId)
+    push({ kind: 'system', content: `任务已改名为「${name}」。` }, hostId, sessionId)
   } catch (e) {
     push({
       kind: 'error',
@@ -619,6 +671,22 @@ export async function approve(ok) {  if (!store.pending) return
   }
 
   push({ kind: 'system', content: ok ? '已批准执行' : '已拒绝执行' })
+}
+
+// switchProfile 切换当前使用的 LLM 方案（= 模型）。
+// 会话历史按 (主机, 会话) 存储、与模型无关，且每轮对话开始时才读取
+// 当前激活方案 —— 因此切换不丢上下文，下一轮对话即用新模型。
+export async function switchProfile(id) {
+  try {
+    await api().ActivateLLMProfile(id)
+  } catch (e) {
+    const msg = `切换模型失败：${e && e.message ? e.message : e}`
+    push({ kind: 'error', content: msg })
+    throw e // 让调用方知道失败，避免外层再推「已切换」的成功提示
+  }
+  const info = await api().Bootstrap()
+  store.llm = info.llm || store.llm
+  store.llmProfiles = info.llmProfiles || []
 }
 
 export async function stop() {

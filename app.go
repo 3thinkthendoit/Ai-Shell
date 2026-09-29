@@ -835,6 +835,16 @@ func (a *App) Ask(hostID, sessionID, prompt string) error {
 	}
 	go func() {
 		defer a.lane.leaveAgent()
+		// panic 兜底：agent 内部任何未捕获 panic 原本会直接闪退整个应用，
+		// 且前端永远等不到 done/error。转成错误事件至少让用户看到原因。
+		defer func() {
+			if r := recover(); r != nil {
+				a.emit(agent.EvError, map[string]string{
+					"message": fmt.Sprintf("Agent 内部错误: %v", r),
+				})
+			}
+		}()
+		// Run 的错误路径自身会 emit EvError（见 agent.go），这里不需要再发。
 		_ = a.ag.Run(a.ctx, hostID, sessionID, prompt)
 	}()
 	return nil

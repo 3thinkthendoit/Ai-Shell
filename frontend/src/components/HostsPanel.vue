@@ -1,6 +1,7 @@
 <script setup>
 import { reactive, ref } from 'vue'
 import { store, refreshHosts, push } from '../store'
+import UiSelect from './UiSelect.vue'
 
 const editing = ref(false)
 const busy = ref(false)
@@ -146,11 +147,14 @@ const authLabel = m => ({ password: '密码', private_key: '私钥', agent: 'ssh
           </div>
           <div>
             <label>登录方式</label>
-            <select v-model="form.authMethod">
-              <option value="password">密码</option>
-              <option value="private_key">私钥</option>
-              <option value="agent">ssh-agent</option>
-            </select>
+            <UiSelect
+              v-model="form.authMethod"
+              :options="[
+                { value: 'password', label: '密码' },
+                { value: 'private_key', label: '私钥' },
+                { value: 'agent', label: 'ssh-agent' },
+              ]"
+            />
           </div>
           <div>
             <label>地址 (host:port)</label>

@@ -1,4 +1,7 @@
-:root {
+/* ---- 主题 ----
+   两套配色共用一组语义变量，通过 <html data-theme="..."> 切换。
+   dark 为 Qoder 风格：纯黑基底 + 绿色强调。 */
+:root, [data-theme='light'] {
   --bg: #fafaf8;
   --surface: #ffffff;
   --surface-2: #f4f3ef;
@@ -17,8 +20,43 @@
   --ok-bg: #eaf3de;
   --purple: #534ab7;
   --purple-bg: #eeedfe;
-  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-  --radius: 10px;
+  --hover-overlay: rgba(0, 0, 0, 0.05);
+  --inset-bg: rgba(255, 255, 255, 0.7);
+  --shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  --scrollbar-thumb: rgba(0, 0, 0, 0.16);
+  --scrollbar-thumb-hover: rgba(0, 0, 0, 0.26);
+  --dot-ok: #639922;
+  --dot-warn: #ba7517;
+  color-scheme: light;
+}
+
+[data-theme='dark'] {
+  --bg: #0a0c0a;
+  --surface: #101410;
+  --surface-2: #161b16;
+  --border: rgba(0, 255, 140, 0.14);
+  --border-strong: rgba(0, 255, 140, 0.30);
+  --text: #d6e2d6;
+  --text-2: #8fa38f;
+  --text-3: #5e6f5e;
+  --accent: #00e07f;
+  --accent-bg: rgba(0, 224, 127, 0.12);
+  --danger: #ff6b60;
+  --danger-bg: rgba(255, 107, 96, 0.12);
+  --warn: #f5b04d;
+  --warn-bg: rgba(245, 176, 77, 0.12);
+  --ok: #4dd47c;
+  --ok-bg: rgba(77, 212, 124, 0.12);
+  --purple: #a99df5;
+  --purple-bg: rgba(169, 157, 245, 0.12);
+  --hover-overlay: rgba(0, 255, 140, 0.06);
+  --inset-bg: rgba(255, 255, 255, 0.05);
+  --shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+  --scrollbar-thumb: rgba(0, 255, 140, 0.18);
+  --scrollbar-thumb-hover: rgba(0, 255, 140, 0.32);
+  --dot-ok: #4dd47c;
+  --dot-warn: #f5b04d;
+  color-scheme: dark;
 }
 
 * { box-sizing: border-box; }
@@ -39,21 +77,39 @@ body {
 
 button {
   font: inherit;
+  font-weight: 600;
   cursor: pointer;
+  /* macOS WKWebView 的原生按钮外观（bezel）与默认外边距会让背景色四周留白 —— 必须清掉 */
+  -webkit-appearance: none;
+  appearance: none;
+  margin: 0;
   border: 1px solid var(--border);
   background: var(--surface);
   color: var(--text);
+  white-space: nowrap;
   border-radius: 8px;
-  padding: 6px 12px;
+  /* 与输入框（13px 字号 + 7px 内边距）等高：所有按钮统一 34px，
+     垂直居中由 flex 完成 —— 不再用内边距凑高度，避免各处不一致。 */
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 14px;
   transition: background 0.12s, border-color 0.12s;
 }
 button:hover:not(:disabled) { background: var(--surface-2); border-color: var(--border-strong); }
 button:disabled { opacity: 0.45; cursor: not-allowed; }
-button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
-button.primary:hover:not(:disabled) { background: #14507f; }
+button.primary { background: var(--accent); color: #0a0c0a; border-color: var(--accent); }
+[data-theme='light'] button.primary { color: #fff; }
+[data-theme='light'] button.primary:hover:not(:disabled) { background: #14507f; }
+[data-theme='dark'] button.primary:hover:not(:disabled) { background: #33e899; }
 button.danger { background: var(--danger-bg); color: var(--danger); border-color: var(--danger); }
 button.ok { background: var(--ok-bg); color: var(--ok); border-color: var(--ok); }
-button.sm { padding: 3px 9px; font-size: 12px; }
+/* tonal：浅强调色底 + 主题色文字（与「Agent会话」选中态同风格），比 primary 柔和 */
+button.tonal { background: var(--accent-bg); color: var(--accent); border-color: transparent; font-weight: 600; }
+button.tonal:hover:not(:disabled) { background: var(--accent-bg); border-color: var(--accent); filter: brightness(0.97); }
+/* sm 只缩字号与水平内边距，高度与输入框一致 —— 用户明确要求全局对齐。 */
+button.sm { padding: 0 10px; font-size: 12px; }
 
 input, select, textarea {
   font: inherit;
@@ -65,6 +121,64 @@ input, select, textarea {
   width: 100%;
   outline: none;
 }
+input, textarea { -webkit-appearance: none; appearance: none; }
+input::placeholder, textarea::placeholder { color: var(--text-3); }
+
+/* ---- UiSelect：自绘下拉框（WKWebView 原生 select 弹层有渲染缺陷） ---- */
+.uis { position: relative; }
+.uis-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  font: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 10px;
+  cursor: pointer;
+  text-align: left;
+}
+.uis.open .uis-trigger { border-color: var(--accent); }
+.uis.disabled .uis-trigger { opacity: 0.45; cursor: not-allowed; }
+.uis-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.uis-arrow { flex-shrink: 0; color: var(--text-2); transition: transform 0.15s; }
+.uis.open .uis-arrow { transform: rotate(180deg); }
+.uis-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 100;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  max-height: 240px;
+  overflow-y: auto;
+}
+/* 底部空间不足时改为向上弹（composer 工具条里的模型选择）。 */
+.uis.dropup .uis-menu {
+  top: auto;
+  bottom: calc(100% + 4px);
+}
+.uis-item {
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.uis-item:hover { background: var(--surface-2); }
+.uis-item.selected { color: var(--accent); font-weight: 600; }
+.uis-item.disabled { opacity: 0.45; cursor: not-allowed; }
 input:focus, select:focus, textarea:focus { border-color: var(--accent); }
 textarea { font-family: var(--mono); resize: vertical; line-height: 1.55; }
 label { display: block; font-size: 12px; color: var(--text-2); margin-bottom: 5px; }
@@ -74,6 +188,11 @@ label { display: block; font-size: 12px; color: var(--text-2); margin-bottom: 5p
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 16px;
+}
+
+:root, [data-theme='light'] {
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --radius: 10px;
 }
 
 .row { display: flex; gap: 10px; align-items: center; }
@@ -91,6 +210,6 @@ pre {
 }
 
 ::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.16); border-radius: 6px; }
-::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.26); }
+::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 6px; }
+::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
 ::-webkit-scrollbar-track { background: transparent; }

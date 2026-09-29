@@ -50,22 +50,46 @@ function setHostEl(id, el) {
   else hostEls.delete(id)
 }
 
-// 终端配色跟应用其余部分保持一致（浅色）。
-// 用深色终端在这里会很突兀 —— 它嵌在浅色界面中间，而不是一个独立窗口。
-const THEME = {
-  background: '#fafaf8',
-  foreground: '#2c2c2a',
-  cursor: '#2c2c2a',
-  selectionBackground: 'rgba(24, 95, 165, 0.25)',
-  black: '#2c2c2a',
-  red: '#a32d2d',
-  green: '#3b6d11',
-  yellow: '#854f0b',
-  blue: '#185fa5',
-  magenta: '#534ab7',
-  cyan: '#0f6e56',
-  white: '#5f5e5a'
+// 终端配色跟应用其余部分保持一致（跟随亮/暗主题）。
+// 用与界面割裂的终端配色会很突兀 —— 它嵌在界面中间，而不是一个独立窗口。
+const THEMES = {
+  light: {
+    background: '#fafaf8',
+    foreground: '#2c2c2a',
+    cursor: '#2c2c2a',
+    selectionBackground: 'rgba(24, 95, 165, 0.25)',
+    black: '#2c2c2a',
+    red: '#a32d2d',
+    green: '#3b6d11',
+    yellow: '#854f0b',
+    blue: '#185fa5',
+    magenta: '#534ab7',
+    cyan: '#0f6e56',
+    white: '#5f5e5a'
+  },
+  dark: {
+    background: '#0a0c0a',
+    foreground: '#d6e2d6',
+    cursor: '#00e07f',
+    cursorAccent: '#0a0c0a',
+    selectionBackground: 'rgba(0, 224, 127, 0.30)',
+    black: '#161b16',
+    red: '#ff6b60',
+    green: '#00e07f',
+    yellow: '#f5b04d',
+    blue: '#4da6ff',
+    magenta: '#a99df5',
+    cyan: '#3ddbc4',
+    white: '#8fa38f'
+  }
 }
+const currentXtermTheme = () => THEMES[store.theme] || THEMES.light
+
+// 主题切换时同步更新所有已打开的终端实例。
+watch(() => store.theme, t => {
+  const theme = THEMES[t] || THEMES.light
+  for (const { term } of terms.values()) term.options.theme = theme
+})
 
 // doFit 只在容器**确实有尺寸**时才测量。
 //
@@ -132,7 +156,7 @@ async function ensureTerm(hostId) {
     scrollback: 5000,
     fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
     fontSize: 12.5,
-    theme: THEME
+    theme: currentXtermTheme()
   })
   const fit = new FitAddon()
   term.loadAddon(fit)

@@ -343,18 +343,33 @@ func (c *Client) WriteFile(hostID, path, content string) (Result, error) {
 	sess.Stdout = &stdout
 	sess.Stderr = &stderr
 
+	// 与 Exec 一致的超时保护：远端磁盘满、脚本卡住时 sess.Run 会无限阻塞，
+	// 且该调用不感知 ctx —— 没有超时的话 agent 整轮就挂死在这里。
+	const writeTimeout = 60 * time.Second
+	type runResult struct{ err error }
+	done := make(chan runResult, 1)
 	start := time.Now()
-	if err := sess.Run(writeFileScript(path)); err != nil {
-		var exitErr *ssh.ExitError
-		if errors.As(err, &exitErr) {
-			return Result{
-				Stdout:     decorateBackup(stdout.String()),
-				Stderr:     stderr.String(),
-				ExitCode:   exitErr.ExitStatus(),
-				DurationMs: time.Since(start).Milliseconds(),
-			}, nil
+	go func() { done <- runResult{sess.Run(writeFileScript(path))} }()
+
+	select {
+	case r := <-done:
+		if err := r.err; err != nil {
+			var exitErr *ssh.ExitError
+			if errors.As(err, &exitErr) {
+				return Result{
+					Stdout:     decorateBackup(stdout.String()),
+					Stderr:     stderr.String(),
+					ExitCode:   exitErr.ExitStatus(),
+					DurationMs: time.Since(start).Milliseconds(),
+				}, nil
+			}
+			return Result{}, err
 		}
-		return Result{}, err
+	case <-time.After(writeTimeout):
+		_ = sess.Close() // 解除对 Run 的阻塞，goroutine 随之退出
+		<-done
+		c.Disconnect(hostID)
+		return Result{}, fmt.Errorf("写入文件超时（%s）已被终止", writeTimeout)
 	}
 	return Result{
 		Stdout:     decorateBackup(stdout.String()),
@@ -473,7 +488,13 @@ func (c *Client) connect(hostID string) (*ssh.Client, error) {
 		// 池里没有连接。有人正在拨吗？
 		if ch, ok := c.dialing[hostID]; ok {
 			c.mu.Unlock()
-			<-ch // 等它拨完（成功或失败）
+			// 等待也要有期限：拨号方万一异常挂住（握手阶段对端不回话），
+			// 无限等待会让这台主机的所有调用永久卡死。
+			select {
+			case <-ch: // 等它拨完（成功或失败）
+			case <-time.After(30 * time.Second):
+				return nil, fmt.Errorf("等待主机 %s 的连接建立超时，请重试", hostID)
+			}
 			continue
 		}
 
@@ -550,9 +571,22 @@ func (c *Client) dialRaw(hostID string) (*ssh.Client, error) {
 	return cl, nil
 }
 
+// isAlive 探测连接是否还活着。
+// SendRequest(wantReply=true) 在「半开连接」（对端已被 NAT/防火墙静默回收，
+// 但本机 TCP 还没感知）上会永久阻塞，因此必须带超时：超时即视为已死，
+// 由调用方关闭连接 —— Close 会让卡住的 SendRequest 返回，goroutine 随之退出。
 func isAlive(cl *ssh.Client) bool {
-	_, _, err := cl.SendRequest("keepalive@openssh.com", true, nil)
-	return err == nil
+	errCh := make(chan error, 1)
+	go func() {
+		_, _, err := cl.SendRequest("keepalive@openssh.com", true, nil)
+		errCh <- err
+	}()
+	select {
+	case err := <-errCh:
+		return err == nil
+	case <-time.After(5 * time.Second):
+		return false
+	}
 }
 
 func buildAuthMethods(host vault.Host, sec vault.HostSecret) ([]ssh.AuthMethod, error) {

@@ -622,6 +622,9 @@ func (a *Agent) Run(parent context.Context, hostID, sessionID, prompt string) er
 	a.mu.Lock()
 	if a.running {
 		a.mu.Unlock()
+		// 这里发生在 defer（EvDone）注册之前，若不发事件，前端会永远
+		// 停在「运行中」且看不到任何报错 —— 必须显式告知。
+		a.emit(EvError, map[string]string{"message": "已有会话正在运行，请等待其完成或点「中断」"})
 		return fmt.Errorf("已有会话正在运行")
 	}
 	ctx, cancel := context.WithCancel(parent)

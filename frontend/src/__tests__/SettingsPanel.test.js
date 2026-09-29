@@ -204,6 +204,14 @@ describe('SettingsPanel 多方案', () => {
     expect(call.args[0]).toBe('p1')
   })
 
+  // profile-bar 里第一个 button 已是 UiSelect 的触发器（自绘下拉），
+  // 所以这里的按钮一律按文案找，不按下标。
+  const barBtn = label => {
+    const b = wrapper.findAll('.profile-bar button').find(x => x.text().trim() === label)
+    if (!b) throw new Error(`未找到按钮：${label}`)
+    return b
+  }
+
   it('保存时带方案 ID，新增时不带（由后端生成 ID）', async () => {
     setup()
     await wrapper.findAll('.actions button').at(-1).trigger('click') // 保存
@@ -211,15 +219,28 @@ describe('SettingsPanel 多方案', () => {
     expect(calls.find(c => c.name === 'SaveLLMProfile').args[0].id).toBe('p1')
 
     // 新建模式：editingId 清空
-    await wrapper.findAll('.profile-bar button')[0].trigger('click') // 新建
+    await barBtn('新建').trigger('click')
     await wrapper.findAll('.actions button').at(-1).trigger('click')
     await flushPromises()
     expect(calls.filter(c => c.name === 'SaveLLMProfile')[1].args[0].id).toBe('')
   })
 
+  // pickProfile 通过 UiSelect（自绘下拉）切换正在编辑的方案。
+  // 原生 select 已被替换：触发器是按钮，选项是列表项，不能用 setValue。
+  async function pickProfile(id) {
+    const p = store.llmProfiles.find(x => x.id === id)
+    await wrapper.find('.profile-select .uis-trigger').trigger('click')
+    await flushPromises()
+    const item = wrapper
+      .findAll('.profile-select .uis-item')
+      .filter(w => w.text() === `${p.name}${p.active ? '（使用中）' : ''}`)[0]
+    await item.trigger('click')
+    await flushPromises()
+  }
+
   it('「设为当前」调用 ActivateLLMProfile 并切换到选中的方案', async () => {
     setup()
-    await wrapper.find('.profile-select').setValue('p2')
+    await pickProfile('p2')
     const btn = wrapper.findAll('.profile-bar button').find(b => b.text().includes('设为当前'))
     await btn.trigger('click')
     await flushPromises()
@@ -228,7 +249,7 @@ describe('SettingsPanel 多方案', () => {
 
   it('删除方案调用 DeleteLLMProfile', async () => {
     setup()
-    await wrapper.find('.profile-select').setValue('p2')
+    await pickProfile('p2')
     const btn = wrapper.findAll('.profile-bar button').find(b => b.text().includes('删除'))
     await btn.trigger('click')
     await flushPromises()
@@ -237,7 +258,7 @@ describe('SettingsPanel 多方案', () => {
 
   it('新建模式下表单全空时不发测试请求 —— 否则会拿到激活方案配置的「连接成功」', async () => {
     setup()
-    await wrapper.findAll('.profile-bar button')[0].trigger('click') // 新建
+    await barBtn('新建').trigger('click')
     await clickTest()
 
     expect(calls.filter(c => c.name === 'TestLLM' || c.name === 'TestLLMProfile')).toHaveLength(0)

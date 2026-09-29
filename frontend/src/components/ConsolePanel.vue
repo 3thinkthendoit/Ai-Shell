@@ -2,11 +2,12 @@
 import { computed, nextTick, reactive, ref, watch } from 'vue'
 import {
   store, ask, approve, stop, clearLog, clearSession, compactSession, push,
-  selectSession, createSession, renameSession, deleteSession, refreshSessions, runShell
+  createSession, refreshSessions, runShell, switchProfile, syncWindowTitle
 } from '../store'
 import { classifyInput } from '../inputRoute'
 import { parseBareCd, extractCwd, promptParts } from '../term'
 import InteractiveTerminal from './InteractiveTerminal.vue'
+import UiSelect from './UiSelect.vue'
 
 // agent = Agent会话（终端风：自然语言→Agent，shell→策略后 Exec）
 // terminal = 完整交互终端（PTY，绕过策略）
@@ -166,63 +167,55 @@ function onKeydown(e) {
   }
 }
 
-const sessionId = computed({
-  get: () => store.currentSessionId,
-  set: v => selectSession(v)
-})
-
-const editing = ref('')
-const editName = ref('')
-const editEl = ref(null)
-
+// 会话的切换/新建/重命名/删除都在侧边栏（SessionsSidebar.vue）完成。
 const currentSession = computed(
   () => store.currentSessions.find(s => s.id === store.currentSessionId) || null
 )
 
-const isDefaultSession = computed(() => !!(currentSession.value && currentSession.value.isDefault))
-
-function sessionLabel(s) {
-  const base = s.name || (s.isDefault ? '默认会话' : '未命名会话')
-  return s.turns > 0 ? `${base}（${s.turns} 轮）` : base
-}
-
-function startNewSession() {
-  editing.value = 'new'
-  editName.value = ''
-  nextTick(() => { if (editEl.value) editEl.value.focus() })
-}
-
-function startRenameSession() {
-  if (!currentSession.value) return
-  editing.value = 'rename'
-  editName.value = currentSession.value.name || ''
-  nextTick(() => { if (editEl.value) editEl.value.focus() })
-}
-
-function cancelEdit() {
-  editing.value = ''
-  editName.value = ''
-}
-
-async function commitEdit() {
-  const name = editName.value.trim()
-  if (!name) {
-    push({ kind: 'error', content: '会话名不能为空。' })
-    return
+// 顶栏展示当前任务名，让用户随时知道自己在哪条任务里。
+// 默认任务没有名字：用「主机名 (user@addr)」顶替，与侧边栏列表一致。
+const currentSessionName = computed(() => {
+  const s = currentSession.value
+  if (!s) return ''
+  if (s.name) return s.name
+  if (s.isDefault) {
+    const h = store.hosts.find(x => x.id === store.currentHostId)
+    if (h) return `${h.name} (${h.user}@${h.addr})`
   }
-  const what = editing.value
-  editing.value = ''
-  editName.value = ''
-  if (what === 'new') await createSession(name)
-  else if (what === 'rename') await renameSession(store.currentSessionId, name)
+  return '未命名任务'
+})
+
+const hostOptions = computed(() =>
+  store.hosts.map(h => ({ value: h.id, label: `${h.name} — ${h.user}@${h.addr}` }))
+)
+
+// 窗口标题跟随当前任务：切任务/改名后标题栏立即更新。
+watch(currentSessionName, name => syncWindowTitle(name), { immediate: true })
+
+// 模型（= LLM 方案）选择。激活项以后端 active 标记为准；
+// 会话历史与模型无关，切换不丢上下文。
+const activeProfileId = computed(() =>
+  store.llmProfiles.find(p => p.active)?.id || ''
+)
+const modelOptions = computed(() =>
+  store.llmProfiles.map(p => ({ value: p.id, label: `${p.name} · ${p.model}` }))
+)
+async function onSwitchModel(id) {
+  if (!id || id === activeProfileId.value) return
+  const p = store.llmProfiles.find(x => x.id === id)
+  try {
+    await switchProfile(id)
+  } catch {
+    return // 失败提示已由 switchProfile 推送，成功消息不能照发
+  }
+  push({
+    kind: 'system',
+    content: `已切换模型到「${p ? p.name : id}」，本会话上下文保留，下一轮对话生效。`
+  })
 }
 
-async function onDeleteSession() {
-  if (!store.currentSessionId) return
-  const label = currentSession.value ? sessionLabel(currentSession.value) : '这条会话'
-  if (!confirm(`确认删除会话「${label}」？该会话的上下文会被永久丢弃，此操作不可撤销。`)) return
-  await deleteSession(store.currentSessionId)
-}
+// 会话的新建/重命名/删除已移至侧边栏（SessionsSidebar.vue），
+// 这里只保留作用于「当前会话」的两个操作：压缩与清空。
 
 async function onClearSession() {
   if (!store.currentHostId) {
@@ -239,6 +232,30 @@ async function onCompactSession() {
   }
   await compactSession(store.currentHostId, store.currentSessionId)
 }
+
+// 新建会话（顶栏入口，参考 WorkBuddy 把主操作放在最顺手的位置）。
+// 弹应用内输入框确认 —— WKWebView 上原生 prompt/confirm 都不弹，不能用。
+const showNewModal = ref(false)
+const newName = ref('')
+const newEl = ref(null)
+
+function startNewSession() {
+  if (!store.currentHostId) {
+    push({ kind: 'error', content: '请先选择一台主机。' })
+    return
+  }
+  newName.value = ''
+  showNewModal.value = true
+  nextTick(() => { if (newEl.value) newEl.value.focus() })
+}
+
+async function commitNewSession() {
+  const name = newName.value.trim()
+  showNewModal.value = false
+  newName.value = ''
+  if (!name) return
+  await createSession(name)
+}
 </script>
 
 <template>
@@ -246,76 +263,60 @@ async function onCompactSession() {
     <header class="bar">
       <div class="row grow">
         <label class="inline-label">目标主机</label>
-        <select v-model="store.currentHostId" class="host-select">
-          <option v-if="!store.hosts.length" value="">（暂无主机，请先到「主机管理」添加）</option>
-          <option v-for="h in store.hosts" :key="h.id" :value="h.id">
-            {{ h.name }} — {{ h.user }}@{{ h.addr }}
-          </option>
-        </select>
+        <UiSelect
+          v-model="store.currentHostId"
+          class="host-select"
+          :options="hostOptions"
+          placeholder="（暂无主机，请先到「主机管理」添加）"
+        />
+        <button
+          class="sm tonal new-session-btn"
+          :disabled="!store.currentHostId"
+          title="为当前主机新建一条任务"
+          @click="startNewSession"
+        >＋ 新建任务</button>
       </div>
 
       <div class="seg">
         <button :class="{ on: mode === 'agent' }" @click="mode = 'agent'">Agent会话</button>
         <button :class="{ on: mode === 'terminal' }" @click="mode = 'terminal'">交互终端</button>
       </div>
+
+      <!-- 新建任务弹窗（应用内，WKWebView 上原生 prompt 不弹） -->
+      <div v-if="showNewModal" class="overlay" @click.self="showNewModal = false">
+        <div class="modal">
+          <h3>新建任务</h3>
+          <input
+            ref="newEl"
+            v-model="newName"
+            placeholder="任务名称，如「nginx 排查」"
+            @keydown.enter.prevent="commitNewSession"
+            @keydown.esc.prevent="showNewModal = false"
+          />
+          <div class="modal-hint">Enter 确定 · Esc 取消 · 留空则不创建</div>
+          <div class="modal-actions">
+            <button class="sm" @click="showNewModal = false">取消</button>
+            <button class="sm primary" @click="commitNewSession">创建</button>
+          </div>
+        </div>
+      </div>
     </header>
 
     <template v-if="mode === 'agent'">
-      <div class="ctx-bar">
-        <label class="inline-label">会话</label>
-        <select
-          v-model="sessionId"
-          class="session-select"
-          :disabled="!store.currentHostId"
-        >
-          <option v-for="s in store.currentSessions" :key="s.id" :value="s.id">
-            {{ sessionLabel(s) }}
-          </option>
-        </select>
-        <button class="sm" :disabled="!store.currentHostId" @click="startNewSession">新建</button>
-        <button class="sm" :disabled="!currentSession" @click="startRenameSession">改名</button>
-        <button
-          class="sm"
-          :disabled="!currentSession || isDefaultSession"
-          :title="isDefaultSession ? '默认会话不能删除，用「清空上下文」清空它即可' : ''"
-          @click="onDeleteSession"
-        >删除</button>
-
-        <span class="muted tiny ctx-note">shell 直跑（高危确认）· 自然语言走 <b>LLM</b> · 会话按主机独立加密</span>
-
-        <button class="sm" :disabled="store.compacting" @click="onCompactSession">
-          {{ store.compacting ? '压缩中…' : '压缩上下文' }}
-        </button>
-        <button class="sm" @click="onClearSession">清空上下文</button>
-      </div>
-
-      <div v-if="editing" class="session-edit">
-        <input
-          ref="editEl"
-          v-model="editName"
-          :placeholder="editing === 'new' ? '给这条会话起个名字，例如「nginx 排查」' : '新的会话名'"
-          @keydown.enter.prevent="commitEdit"
-          @keydown.esc.prevent="cancelEdit"
-        />
-        <button class="sm primary" @click="commitEdit">确定</button>
-        <button class="sm" @click="cancelEdit">取消</button>
-        <span class="muted tiny">Enter 确定，Esc 取消</span>
-      </div>
-
       <!-- 风险/能力横幅：与交互终端对称，标明本模式走策略 -->
       <div class="sess-banner">
         <span>
           Agent会话<span v-if="currentHost"> · <b>{{ currentHost.user }}@{{ currentHost.addr }}</b></span>
-          ：自然语言交给 <b>LLM</b>；shell 命令直跑（仅高危需确认）；未知命令会先查本机是否存在。
-          需要 vim/top 等交互程序请切到「交互终端」。
+          ｜ 中文提问交给 <b>LLM</b>，shell 命令直接执行，高危命令会先请你确认。
+          vim/top 等交互程序请用「交互终端」。
         </span>
       </div>
 
       <div class="log term-log" ref="logEl" @click="focusInput">
         <div v-if="!store.entries.length" class="empty">
-          <p>敲 shell 命令直接执行（高危才确认）；用中文描述问题或前缀 <span class="mono">?</span> 则交给 Agent。</p>
-          <p class="muted">例如：<span class="mono">ls -la</span>　或　「nginx 起不来了，帮我看看为什么」</p>
-          <p class="muted">会话按「主机 × 会话」分开保存。</p>
+          <p>输入 shell 命令直接执行；用中文描述问题（或加 <span class="mono">?</span> 前缀）让 Agent 帮你排查。</p>
+          <p class="muted">试试：<span class="mono">ls -la</span>　或　「nginx 起不来了，帮我看看」</p>
+          <p class="muted">每个主机、每个会话的记忆相互独立。</p>
         </div>
 
         <div v-for="e in store.entries" :key="e.id" class="entry">
@@ -422,9 +423,28 @@ async function onCompactSession() {
       </div>
 
       <div class="composer-bar">
+        <label class="inline-label">模型</label>
+        <UiSelect
+          class="model-select"
+          :model-value="activeProfileId"
+          :options="modelOptions"
+          :disabled="store.running || !store.llmProfiles.length"
+          placeholder="（暂无方案，请到「设置」添加）"
+          @change="onSwitchModel"
+        />
+        <button
+          class="sm"
+          :disabled="store.compacting"
+          :title="store.compacting ? '' : '让 LLM 把全部历史重写成一段摘要（花一次 API 调用）。日常使用无需手动压缩：旧的对话轮次已自动移出上下文。'"
+          @click="onCompactSession"
+        >
+          {{ store.compacting ? '压缩中…' : '压缩上下文' }}
+        </button>
+        <button class="sm" @click="onClearSession">清空上下文</button>
+        <span class="composer-sep"></span>
         <button class="sm" @click="clearLog" :disabled="store.running || store.busy">清空记录</button>
         <button v-if="store.running || store.busy" class="sm danger" @click="stop">中断</button>
-        <span class="muted tiny grow-hint">Enter 发送 · Shift+Enter 不适用（单行输入）· <span class="mono">?</span> 前缀强制问 Agent</span>
+        <span class="muted tiny grow-hint">Enter 发送 · 加 <span class="mono">?</span> 开头强制由 Agent 回答</span>
       </div>
     </template>
 
@@ -451,40 +471,44 @@ async function onCompactSession() {
 }
 .inline-label { font-size: 12px; color: var(--text-2); margin: 0; white-space: nowrap; }
 .host-select { max-width: 420px; }
+.new-session-btn { flex-shrink: 0; white-space: nowrap; }
+
+/* 新建会话弹窗（应用内，与侧边栏删除确认同风格） */
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+}
+.modal {
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+  width: min(400px, calc(100% - 60px));
+  box-shadow: var(--shadow);
+}
+.modal h3 { margin: 0 0 12px; font-size: 14px; }
+.modal-hint { font-size: 11px; color: var(--text-3); margin-top: 6px; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 
 .seg { display: flex; gap: 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
 .seg button {
+  flex: 1;
   border: none;
   border-radius: 0;
-  padding: 6px 14px;
+  min-height: 34px;
+  height: 34px;
+  padding: 0 16px;
+  margin: 0;
   background: var(--surface);
   color: var(--text-2);
 }
 .seg button.on { background: var(--accent-bg); color: var(--accent); font-weight: 500; }
-
-.ctx-bar {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  padding: 6px 18px;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
-  flex-shrink: 0;
-}
-.session-select { max-width: 260px; }
-.ctx-note { margin-left: auto; }
-
-.session-edit {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 18px;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface-2);
-  flex-shrink: 0;
-}
-.session-edit input { max-width: 320px; }
+.model-select { flex: 0 1 280px; min-width: 190px; }
 
 .sess-banner {
   flex-shrink: 0;
@@ -575,7 +599,7 @@ async function onCompactSession() {
   background: var(--accent-bg);
   border-radius: var(--radius);
   padding: 9px 12px;
-  color: #0c447c;
+  color: var(--accent);
 }
 .msg.assistant .msg-body { padding: 3px 0; }
 
@@ -651,10 +675,10 @@ async function onCompactSession() {
 .injection-body { font-size: 12px; color: var(--danger); margin-top: 5px; }
 .injection-cmd {
   margin-top: 7px;
-  background: rgba(255, 255, 255, 0.7);
+  background: var(--inset-bg);
   border-radius: 7px;
   padding: 7px 9px;
-  color: #501313;
+  color: var(--danger);
 }
 .injection-hint { font-size: 12px; color: var(--text-2); margin-top: 7px; line-height: 1.65; }
 
@@ -670,10 +694,10 @@ async function onCompactSession() {
 }
 .approval-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .approval-cmd {
-  background: rgba(255, 255, 255, 0.7);
+  background: var(--inset-bg);
   border-radius: 7px;
   padding: 8px 10px;
-  color: #4a1b0c;
+  color: var(--text);
 }
 .approval-reason { font-size: 12px; color: var(--warn); margin-top: 6px; }
 
@@ -685,6 +709,14 @@ async function onCompactSession() {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+/* 「清空记录」与上下文操作之间的竖分隔线 */
+.composer-sep {
+  width: 1px;
+  height: 18px;
+  background: var(--border);
+  margin: 0 4px;
+  flex-shrink: 0;
 }
 .grow-hint { margin-left: auto; }
 </style>

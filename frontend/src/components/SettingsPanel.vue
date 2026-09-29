@@ -1,6 +1,7 @@
 <script setup>
 import { reactive, ref, computed } from 'vue'
 import { store, push } from '../store'
+import UiSelect from './UiSelect.vue'
 
 // ---- 方案（多套 LLM 配置，可切换） ----
 //
@@ -9,6 +10,10 @@ import { store, push } from '../store'
 // 与「正在使用」（active）是两回事：编辑非激活方案时，两者不同。
 const profiles = computed(() => store.llmProfiles || [])
 const editingId = ref(profiles.value.find(p => p.active)?.id || '')
+
+const profileOptions = computed(() =>
+  profiles.value.map(p => ({ value: p.id, label: `${p.name}${p.active ? '（使用中）' : ''}` }))
+)
 
 const form = reactive({
   name: profiles.value.find(p => p.id === editingId.value)?.name || '默认',
@@ -194,12 +199,14 @@ const isLocal = () => /localhost|127\.0\.0\.1|0\.0\.0\.0/.test(form.baseUrl)
     <div class="card">
       <label>配置方案</label>
       <div class="profile-bar">
-        <select class="profile-select" v-model="editingId" @change="loadEditing" :disabled="!profiles.length">
-          <option v-for="p in profiles" :key="p.id" :value="p.id">
-            {{ p.name }}{{ p.active ? '（使用中）' : '' }}
-          </option>
-          <option v-if="!profiles.length" value="" disabled>暂无方案</option>
-        </select>
+        <UiSelect
+          class="profile-select"
+          v-model="editingId"
+          :options="profileOptions"
+          :disabled="!profiles.length"
+          placeholder="暂无方案"
+          @change="loadEditing"
+        />
         <button class="sm" @click="newProfile">新建</button>
         <button class="sm" v-if="editingId && !editingProfile()?.active" :disabled="busy" @click="activate">
           设为当前
