@@ -137,11 +137,12 @@ type Posture struct {
 
 // BootstrapInfo 是前端启动时一次性拉取的全部状态。
 type BootstrapInfo struct {
-	Posture Posture               `json:"posture"`
-	Hosts   []vault.Host          `json:"hosts"`
-	LLM     vault.LLMSettingsView `json:"llm"`
-	Policy  vault.PolicySettings  `json:"policy"`
-	Error   string                `json:"error"`
+	Posture     Posture                `json:"posture"`
+	Hosts       []vault.Host           `json:"hosts"`
+	LLM         vault.LLMSettingsView  `json:"llm"`
+	LLMProfiles []vault.LLMProfileView `json:"llmProfiles"`
+	Policy      vault.PolicySettings   `json:"policy"`
+	Error       string                 `json:"error"`
 }
 
 // Bootstrap 返回启动信息。
@@ -159,9 +160,10 @@ func (a *App) Bootstrap() BootstrapInfo {
 			HostCount:     len(hosts),
 			Degraded:      a.v.Protection() == vault.ProtectionKeyFile,
 		},
-		Hosts:  hosts,
-		LLM:    a.v.LLMSettingsView(),
-		Policy: a.v.Policy(),
+		Hosts:       hosts,
+		LLM:         a.v.LLMSettingsView(),
+		LLMProfiles: a.v.LLMProfiles(),
+		Policy:      a.v.Policy(),
 	}
 }
 
@@ -316,23 +318,38 @@ func (a *App) ForgetHostKey(id string) error {
 
 // ---- LLM 与策略 ----
 
-// SaveLLMRequest 是 LLM 配置入参。apiKey 为空表示保持原值。
-type SaveLLMRequest struct {
+// SaveLLMProfileRequest 是新增/编辑一套 LLM 方案的入参。
+// ID 为空表示新增（后端生成 ID）；API Key 为空表示保持原值。
+type SaveLLMProfileRequest struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
 	BaseURL  string `json:"baseUrl"`
 	Model    string `json:"model"`
 	APIKey   string `json:"apiKey"`
 	ClearKey bool   `json:"clearKey"`
 }
 
-// SaveLLM 保存 LLM 配置。
-func (a *App) SaveLLM(req SaveLLMRequest) error {
+// SaveLLMProfile 新增或更新一套 LLM 配置方案，返回保存后的视图
+// （新增时前端需要它拿后端生成的 ID）。
+func (a *App) SaveLLMProfile(req SaveLLMProfileRequest) (vault.LLMProfileView, error) {
 	if err := a.ready(); err != nil {
-		return err
+		return vault.LLMProfileView{}, err
 	}
-	// 规范化后再落盘：这样 UI 刷新回来的就是能用的地址，
-	// 用户能立刻看出「我原来填多了 /chat/completions」。
-	// （客户端侧 New() 也会再规范化一次，兜住历史配置。）
-	req.BaseURL = llm.NormalizeBaseURL(req.BaseURL)
+
+	id := strings.TrimSpace(req.ID)
+	isNew := id == ""
+	if isNew {
+		id = newID()
+	}
+
+	// 规范化后再落盘（同 SaveLLM：UI 刷新回来的就是能用的地址）。
+	base := llm.NormalizeBaseURL(req.BaseURL)
+	// 编辑时前端会把原值回填进表单，所以「空」只可能是用户真的清空了
+	// 或新建没填 —— 此时存一套空地址的方案，问题要到发起对话时才暴露，
+	// 且用户很难关联到是哪套方案。在这里拒绝，信息离错误最近。
+	if strings.TrimSpace(base) == "" {
+		return vault.LLMProfileView{}, fmt.Errorf("Base URL 不能为空（应填到 /v1 为止）")
+	}
 
 	var key *string
 	if req.ClearKey {
@@ -342,21 +359,76 @@ func (a *App) SaveLLM(req SaveLLMRequest) error {
 		k := strings.TrimSpace(req.APIKey)
 		key = &k
 	}
-	if err := a.v.SetLLM(req.BaseURL, req.Model, key); err != nil {
-		return err
+
+	p := vault.LLMProfile{ID: id, Name: req.Name, BaseURL: base, Model: req.Model}
+	if err := a.v.SaveLLMProfile(p, key); err != nil {
+		return vault.LLMProfileView{}, err
 	}
 
-	note := "更新 LLM 配置（API Key 未改动）"
+	note := "API Key 未改动"
 	if req.ClearKey {
-		note = "更新 LLM 配置（已清除 API Key）"
+		note = "已清除 API Key"
 	} else if key != nil {
-		note = "更新 LLM 配置（已更新 API Key）"
+		note = "已更新 API Key"
 	}
+	action := "更新 LLM 方案"
+	if isNew {
+		action = "新增 LLM 方案"
+	}
+	// 只记地址与模型名，绝不记 Key 原文。
 	a.auditLog(audit.Entry{
 		Kind:    audit.KindLLM,
-		Command: req.BaseURL + " / " + req.Model,
-		Note:    note,
+		Command: base + " / " + req.Model,
+		Note:    fmt.Sprintf("%s「%s」（%s）", action, strings.TrimSpace(req.Name), note),
 	})
+
+	// 从 LLMProfiles 里取回保存后的视图：Active 标记由 vault 的有效激活规则
+	// 决定（比如新增的第一套方案会自动激活），这里不自己推一遍。
+	for _, v := range a.v.LLMProfiles() {
+		if v.ID == id {
+			return v, nil
+		}
+	}
+	return vault.LLMProfileView{ID: id, Name: strings.TrimSpace(req.Name), BaseURL: base, Model: req.Model}, nil
+}
+
+// DeleteLLMProfile 删除一套 LLM 配置方案（至少保留一套，由 vault 把关）。
+func (a *App) DeleteLLMProfile(id string) error {
+	if err := a.ready(); err != nil {
+		return err
+	}
+	name := ""
+	if p, ok := a.v.LLMProfile(id); ok {
+		name = p.Name
+	}
+	if err := a.v.DeleteLLMProfile(id); err != nil {
+		return err
+	}
+	a.auditLog(audit.Entry{
+		Kind: audit.KindLLM,
+		Note: fmt.Sprintf("删除 LLM 方案「%s」", name),
+	})
+	return nil
+}
+
+// ActivateLLMProfile 切换当前使用的方案。下一次对话即用新方案，无需重启。
+func (a *App) ActivateLLMProfile(id string) error {
+	if err := a.ready(); err != nil {
+		return err
+	}
+	name := ""
+	if p, ok := a.v.LLMProfile(id); ok {
+		name = p.Name
+	}
+	if err := a.v.ActivateLLMProfile(id); err != nil {
+		return err
+	}
+	if name != "" {
+		a.auditLog(audit.Entry{
+			Kind: audit.KindLLM,
+			Note: fmt.Sprintf("切换 LLM 方案到「%s」", name),
+		})
+	}
 	return nil
 }
 
@@ -421,7 +493,34 @@ func (a *App) TestLLM(baseURL, model, apiKey string) LLMTestResult {
 	}
 
 	saved, savedKey := a.v.LLM()
-	base, m, key := resolveLLMConfig(baseURL, model, apiKey, saved, savedKey)
+	return a.runLLMTest(saved, savedKey, baseURL, model, apiKey)
+}
+
+// TestLLMProfile 测试一套指定方案的连通性，空字段回落到该方案已保存的值
+// （而不是当前激活方案的值 —— 编辑非激活方案时两者不同）。
+// profileID 为空时行为与 TestLLM 一致；ID 不存在时显式报错而不是静默回落 ——
+// 回落会让用户拿到「另一套方案」的测试结论，比失败更误导。
+func (a *App) TestLLMProfile(profileID, baseURL, model, apiKey string) LLMTestResult {
+	if err := a.ready(); err != nil {
+		return LLMTestResult{Message: err.Error()}
+	}
+
+	saved, savedKey := a.v.LLM()
+	if id := strings.TrimSpace(profileID); id != "" {
+		p, ok := a.v.LLMProfile(id)
+		if !ok {
+			return LLMTestResult{Message: "该方案已不存在（可能已被删除），请刷新后重试。"}
+		}
+		saved = vault.LLMSettings{BaseURL: p.BaseURL, Model: p.Model}
+		savedKey = a.v.LLMKey(id)
+	}
+	return a.runLLMTest(saved, savedKey, baseURL, model, apiKey)
+}
+
+// runLLMTest 是 TestLLM / TestLLMProfile 共用的执行段：
+// 解析「表单优先、已保存回落」，然后真发一次最小请求。
+func (a *App) runLLMTest(saved vault.LLMSettings, savedKey, formBase, formModel, formKey string) LLMTestResult {
+	base, m, key := resolveLLMConfig(formBase, formModel, formKey, saved, savedKey)
 
 	// 防御性检查：正常流程下走不到这里 —— vault 预置了默认值，
 	// 且 SetLLM 忽略空串（无法把 Base URL 清空）。
@@ -510,8 +609,8 @@ func (a *App) SavePolicy(p vault.PolicySettings) error {
 	a.auditLog(audit.Entry{
 		Kind:    audit.KindPolicy,
 		Command: string(eff.Mode),
-		Note: fmt.Sprintf("白名单 %d 条，输出脱敏 %v，单轮最大步数 %d，上下文 %d 轮（单条工具输出上限 %dKiB，总量上限 %dKiB，%d 台主机有独立上限）",
-			len(eff.Whitelist), eff.RedactOutput, eff.MaxSteps,
+		Note: fmt.Sprintf("白名单 %d 条，输出脱敏 %v，单轮最大步数 %d，跨主机执行 %v，上下文 %d 轮（单条工具输出上限 %dKiB，总量上限 %dKiB，%d 台主机有独立上限）",
+			len(eff.Whitelist), eff.RedactOutput, eff.MaxSteps, eff.AllowCrossHost,
 			eff.MaxSessionTurns, eff.MaxStoredToolBytes/1024, eff.MaxSessionBytes/1024,
 			len(eff.SessionOverrides)),
 	})

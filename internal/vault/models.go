@@ -83,6 +83,17 @@ type PolicySettings struct {
 	MaxStoredToolBytes int `json:"maxStoredToolBytes"` // 单条工具输出存入历史时的字节上限
 	MaxSessionBytes    int `json:"maxSessionBytes"`    // 每台主机历史的总字节上限
 
+	// AllowCrossHost 决定 Agent 工具能否操作非本会话所属的主机。
+	//
+	// 工具的 host_id 是 LLM 自己填的，而它能看到全部已配置主机 —— 不设限的话，
+	// 「在 A 机器排查问题的对话」可以悄悄把命令打到 B 机器上，那正是横向移动
+	// 的形状。默认 false：本会话的工具只能打本会话的主机；打开后恢复
+	// 「目标可以是任何已配置主机」，但每条命令仍要过策略与审批。
+	//
+	// 零值即禁止，老配置反序列化后天然安全 —— 宁可多弹一次说明，
+	// 也不给一条用户不知道存在的跨机器通道。
+	AllowCrossHost bool `json:"allowCrossHost"`
+
 	// SessionOverrides 是**按主机**覆盖上面三个值的表，key 是主机 ID。
 	//
 	// 为什么需要：上面三个是全局的，而主机之间的合适值差异很大 ——
@@ -118,23 +129,58 @@ type LLMSettings struct {
 	Model   string `json:"model"`
 }
 
-// LLMSettingsView 是下发给前端的视图（密钥只回传「是否已配置」）。
+// LLMProfile 是一套可切换的 LLM 配置方案。
+//
+// API Key 不放在这里：密钥单独存在 LLMAPIKeys 里，与「不含密钥的视图」
+// 天然隔离 —— 结构体本身就可以安全地下发前端。
+type LLMProfile struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	BaseURL string `json:"baseUrl"`
+	Model   string `json:"model"`
+}
+
+// LLMProfileView 是下发给前端的方案视图（密钥只回传「是否已配置」）。
+type LLMProfileView struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	BaseURL   string `json:"baseUrl"`
+	Model     string `json:"model"`
+	HasAPIKey bool   `json:"hasApiKey"`
+	Active    bool   `json:"active"` // 是否为当前使用的方案
+}
+
+// LLMSettingsView 是当前激活方案的视图（密钥只回传「是否已配置」）。
+// 多方案引入后它退化为「active 那一套」的便捷视图，保留是为了兼容既有前端。
 type LLMSettingsView struct {
 	BaseURL   string `json:"baseUrl"`
 	Model     string `json:"model"`
 	HasAPIKey bool   `json:"hasApiKey"`
 }
 
+// defaultLLMProfileID 是预置/迁移出来的那个方案的 ID。
+// 固定值而不是随机值：迁移逻辑要靠它幂等，重复 Open 不产生重复方案。
+const defaultLLMProfileID = "default"
+
 // store 是落盘的完整数据结构。整个结构体被 AES-GCM 加密后才写磁盘。
+//
+// LLM 的多方案字段（LLMProfiles / LLMAPIKeys / ActiveLLM）与旧字段
+// （LLM / LLMAPIKey）并存：旧字段只在「打开老配置文件时的一次性迁移」里
+// 被读取，迁移后不再使用，但保留 JSON 形状让降级回老版本时不至于丢配置。
 type store struct {
 	Version   int                   `json:"version"`
 	Hosts     []Host                `json:"hosts"`
-	Secrets   map[string]HostSecret `json:"secrets"`  // key = host id
-	HostKeys  map[string]string     `json:"hostKeys"` // addr -> SHA256 指纹（TOFU 防中间人）
-	LLM       LLMSettings           `json:"llm"`
-	LLMAPIKey string                `json:"llmApiKey"`
-	Policy    PolicySettings        `json:"policy"`
-	Whitelist []string              `json:"whitelist"`
+	Secrets   map[string]HostSecret `json:"secrets"`   // key = host id
+	HostKeys  map[string]string     `json:"hostKeys"`  // addr -> SHA256 指纹（TOFU 防中间人）
+	LLM       LLMSettings           `json:"llm"`       // 旧字段：仅迁移时读取
+	LLMAPIKey string                `json:"llmApiKey"` // 旧字段：仅迁移时读取
+
+	LLMProfiles []LLMProfile      `json:"llmProfiles,omitempty"`
+	LLMAPIKeys  map[string]string `json:"llmApiKeys,omitempty"` // profile id -> API Key
+	ActiveLLM   string            `json:"activeLlm,omitempty"`  // 当前使用的方案 ID
+
+	Policy    PolicySettings `json:"policy"`
+	Whitelist []string       `json:"whitelist"`
 }
 
 func defaultStore() store {
@@ -147,6 +193,10 @@ func defaultStore() store {
 			BaseURL: "https://api.openai.com/v1",
 			Model:   "gpt-4o-mini",
 		},
+		// 刻意不在这里预置方案：Open() 时若老 JSON 里没有 llmProfiles 键，
+		// 预置值会在反序列化后残留，令迁移逻辑（LLMProfiles 非空则跳过）
+		// 永远不触发。「首套方案」由 migrateLLMProfilesLocked 统一生成。
+		LLMAPIKeys: map[string]string{},
 		Policy: PolicySettings{
 			Mode:         ModeManual,
 			Whitelist:    defaultWhitelist(),

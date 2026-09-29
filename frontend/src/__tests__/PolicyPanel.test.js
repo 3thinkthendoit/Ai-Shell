@@ -303,3 +303,21 @@ describe('PolicyPanel 主机级覆盖', () => {
     expect(saved.args[0].sessionOverrides.h1).toEqual({ maxSessionTurns: 30 })
   })
 })
+
+describe('PolicyPanel 跨主机执行', () => {
+  it('默认关闭；勾选后随策略一起保存', async () => {
+    setup()
+    const box = wrapper.find('.cross-host')
+    expect(box.element.checked).toBe(false)
+
+    await box.setValue(true)
+    const saved = await save()
+    expect(saved.args[0].allowCrossHost).toBe(true)
+  })
+
+  it('后端已开启时回显为选中', async () => {
+    store.policy = { ...defaultPolicy(), allowCrossHost: true }
+    setup()
+    expect(wrapper.find('.cross-host').element.checked).toBe(true)
+  })
+})

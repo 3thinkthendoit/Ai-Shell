@@ -1170,3 +1170,162 @@ func TestAgentPinSessionLimitsForWholeTurn(t *testing.T) {
 		t.Fatalf("改设置不该立刻清掉已有历史，实得 %d 条", len(hist))
 	}
 }
+
+// ---- 跨主机执行（PolicySettings.AllowCrossHost）----
+
+// registerSecondHost 给测试环境加第二台主机（复用同一台 SSH 测试服务，
+// 但 ID 不同 —— 对策略而言它就是「另一台机器」）。
+func registerSecondHost(t *testing.T, h *harness) string {
+	t.Helper()
+	other := "h-other"
+	if err := h.v.SaveHost(vault.Host{
+		ID: other, Name: "prod-db", Addr: h.srv.Addr,
+		User: sshtest.User, AuthMethod: vault.AuthPassword,
+	}, &vault.HostSecret{Password: sshtest.Password}); err != nil {
+		t.Fatal(err)
+	}
+	return other
+}
+
+// 默认（AllowCrossHost=false）：在 h-test 的会话里对 h-other 调用工具
+// 必须被策略拒绝 —— 不拨号、不审批、不执行，agent 收到拒绝说明后继续收尾。
+func TestAgentCrossHostDeniedByDefault(t *testing.T) {
+	h := newHarness(t, []string{
+		respToolCall("c1", "run_command", `{"host_id":"h-other","command":"uptime"}`),
+		respContent("被拒绝了，我只报告本机。"),
+	}, policy.ModeWhitelist, true) // autoApprove=true：若走到审批说明拦截失败
+
+	other := registerSecondHost(t, h)
+
+	if err := runDefault(h.ag, context.Background(), h.hostID, "看看数据库那台机器"); err != nil {
+		t.Fatal(err)
+	}
+	if h.hasEvent(EvApproval) {
+		t.Fatal("跨主机调用应在策略裁决前被拒，不该进入审批")
+	}
+	if got := h.lastAnswer(); !strings.Contains(got, "本机") {
+		t.Fatalf("agent 应带着拒绝结果收尾，实得: %q", got)
+	}
+
+	// 审计里必须有一条 cross_host 拒绝记录，且目标主机就是被点名的
+	// 那一台 —— 跨机器的尝试必须留下可追查的痕迹。
+	entries, err := h.auditor.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range entries {
+		if e.Kind == audit.KindTool && e.Rule == "cross_host" && e.HostID == other {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("审计日志中应有一条指向被拒目标主机的 cross_host 拒绝记录")
+	}
+
+	// 给 LLM 的拒绝说明不该泄漏「设置里有开关」—— 对受限环境的用户，
+	// 那等于让模型主动引导用户去找开关。开关提示只出现在给用户的 Reason 里。
+	if len(h.fake.messagesAt(1)) > 0 {
+		for _, m := range h.fake.messagesAt(1) {
+			if m.Role == "tool" && strings.Contains(m.Content, "策略设置") {
+				t.Fatalf("给模型的拒绝文本不应包含设置入口提示: %q", m.Content)
+			}
+		}
+	}
+}
+
+// 打开 AllowCrossHost 后恢复旧行为：目标可以是任何已配置主机，
+// 且仍走正常的策略/审批链（这里走白名单自动放行）。
+func TestAgentCrossHostAllowedWhenPolicyEnables(t *testing.T) {
+	h := newHarness(t, []string{
+		respToolCall("c1", "run_command", `{"host_id":"h-other","command":"uptime"}`),
+		respContent("两台都正常。"),
+	}, policy.ModeWhitelist, false)
+
+	registerSecondHost(t, h)
+	p := h.v.Policy()
+	p.AllowCrossHost = true
+	if err := h.v.SetPolicy(p); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- runDefault(h.ag, context.Background(), h.hostID, "看看两台机器的负载") }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("运行失败: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("开启开关后不应被拒绝或卡住")
+	}
+	if h.hasEvent(EvApproval) {
+		t.Fatal("命中白名单的命令不应请求审批")
+	}
+	if got := h.lastAnswer(); !strings.Contains(got, "两台") {
+		t.Fatalf("agent 应完成跨主机排查，实得: %q", got)
+	}
+}
+
+// 会话没有归属主机（hostID 为空串）时，任何非空 host_id 的工具调用都必须
+// 被拒绝 —— 「没有归属」意味着这一轮不该碰任何机器，全拒比全放安全。
+// 这条规则目前只存在于代码分支里，没有用例钉住就会在重构时静默翻转。
+func TestAgentNoSessionHostDeniesAllTools(t *testing.T) {
+	h := newHarness(t, []string{
+		respToolCall("c1", "run_command", `{"host_id":"h-test","command":"echo SHOULD-NOT-RUN"}`),
+		respContent("没有归属主机，我不执行。"),
+	}, policy.ModeWhitelist, true)
+
+	if err := h.ag.Run(context.Background(), "", DefaultSessionID, "随便看看"); err != nil {
+		t.Fatal(err)
+	}
+	if h.hasEvent(EvApproval) {
+		t.Fatal("无归属主机的会话不应进入审批")
+	}
+
+	entries, err := h.auditor.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Kind == audit.KindTool && strings.Contains(e.Command, "SHOULD-NOT-RUN") {
+			if e.ExitCode != nil {
+				t.Fatalf("命令不应被执行，审计却记录了退出码 %d", *e.ExitCode)
+			}
+			if e.Rule != "cross_host" {
+				t.Fatalf("拒绝原因应是 cross_host，实得 %q", e.Rule)
+			}
+		}
+	}
+}
+
+// 开启开关后，跨主机的**非白名单**命令仍要走人工审批，且审批弹窗里
+// 目标主机必须如实显示 —— 用户是在批准「对另一台机器动手」，
+// 看不到目标主机名的审批等于没审。
+func TestAgentCrossHostGoesThroughApproval(t *testing.T) {
+	h := newHarness(t, []string{
+		respToolCall("c1", "run_command", `{"host_id":"h-other","command":"touch /tmp/marker"}`),
+		respContent("已执行。"),
+	}, policy.ModeManual, true)
+
+	other := registerSecondHost(t, h)
+	p := h.v.Policy()
+	p.AllowCrossHost = true
+	if err := h.v.SetPolicy(p); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runDefault(h.ag, context.Background(), h.hostID, "在数据库机上建个标记文件"); err != nil {
+		t.Fatal(err)
+	}
+	if !h.hasEvent(EvApproval) {
+		t.Fatal("非白名单命令应请求审批")
+	}
+	if h.approval == nil {
+		t.Fatal("审批事件应携带工具调用详情")
+	}
+	if h.approval.HostID != other || h.approval.HostName != "prod-db" {
+		t.Fatalf("审批弹窗应如实显示目标主机，实得 id=%q name=%q",
+			h.approval.HostID, h.approval.HostName)
+	}
+}

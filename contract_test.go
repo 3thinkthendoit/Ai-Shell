@@ -118,7 +118,11 @@ var (
 // 这些方法就会从发现集合里消失，测试立刻失败 —— 而不是静默通过。
 var requiredMethods = []string{
 	"Bootstrap", "ListHosts", "SaveHost", "DeleteHost", "TestHost",
-	"SaveLLM", "TestLLM", "SavePolicy", "Ask", "Approve", "Stop", "RunShell",
+	// LLM 多方案：TestLLM 仍在（新建方案时的测试路径），日常的
+	// 保存/测试/切换/删除走下面这组；vault.SetLLM 仅剩内部与测试用途。
+	"TestLLM", "SaveLLMProfile", "TestLLMProfile",
+	"ActivateLLMProfile", "DeleteLLMProfile",
+	"SavePolicy", "Ask", "Approve", "Stop", "RunShell",
 	"ClearSession", "CompactSession",
 	// 会话的增删改查。这四条一起构成「一台主机多条会话」的全部入口，
 	// 少任何一条，对应的界面操作就会静默失效（点了没反应）。

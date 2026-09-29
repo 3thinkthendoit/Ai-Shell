@@ -1,8 +1,17 @@
 <script setup>
-import { reactive, ref } from 'vue'
+import { reactive, ref, computed } from 'vue'
 import { store, push } from '../store'
 
+// ---- 方案（多套 LLM 配置，可切换） ----
+//
+// 数据事实来源是 store.llmProfiles（Bootstrap 拉回，每项带 active 标记）。
+// editingId 是「正在编辑」的方案；空串表示「新建中」，而不是某个真实方案。
+// 与「正在使用」（active）是两回事：编辑非激活方案时，两者不同。
+const profiles = computed(() => store.llmProfiles || [])
+const editingId = ref(profiles.value.find(p => p.active)?.id || '')
+
 const form = reactive({
+  name: profiles.value.find(p => p.id === editingId.value)?.name || '默认',
   baseUrl: store.llm.baseUrl,
   model: store.llm.model,
   apiKey: '',
@@ -13,6 +22,76 @@ const busy = ref(false)
 const testing = ref(false)
 const testRes = ref(null)   // TestLLM 的返回，见 app.go 的 LLMTestResult
 const corrected = ref('')   // 被自动修正的 Base URL（原值多填了端点）
+
+const editingProfile = () => profiles.value.find(p => p.id === editingId.value)
+
+// 把某套方案载入表单。Key 永远不回填（后端不下发），留空 = 不修改。
+function loadEditing() {
+  const p = editingProfile()
+  form.name = p ? p.name : ''
+  form.baseUrl = p ? p.baseUrl : ''
+  form.model = p ? p.model : ''
+  form.apiKey = ''
+  form.clearKey = false
+  testRes.value = null
+  corrected.value = ''
+}
+
+// 新建模式：清空表单，编辑目标指向尚不存在的方案。
+function newProfile() {
+  editingId.value = ''
+  form.name = ''
+  form.baseUrl = ''
+  form.model = ''
+  form.apiKey = ''
+  form.clearKey = false
+  testRes.value = null
+  corrected.value = ''
+}
+
+// 保存/切换/删除后统一重拉状态。顺带把表单对齐到「当前编辑的方案」——
+// 新增方案的 ID 是后端生成的，前端必须跟着改。
+async function refreshLLM() {
+  const info = await window.go.main.App.Bootstrap()
+  store.llm = info.llm
+  store.llmProfiles = info.llmProfiles || []
+  if (!profiles.value.some(p => p.id === editingId.value)) {
+    editingId.value = profiles.value.find(p => p.active)?.id || ''
+  }
+  loadEditing()
+}
+
+// 设为当前使用的方案。下一次对话即生效，无需重启。
+async function activate() {
+  const id = editingId.value
+  if (!id) return
+  busy.value = true
+  try {
+    await window.go.main.App.ActivateLLMProfile(id)
+    await refreshLLM()
+    push({ kind: 'system', content: `已切换到方案「${form.name}」，下一轮对话生效。` })
+  } catch (e) {
+    push({ kind: 'error', content: `切换方案失败：${e && e.message ? e.message : e}` })
+  } finally {
+    busy.value = false
+  }
+}
+
+// 删除方案。后端保证至少留一套，这里不重复判断 —— 让后端说那句话。
+async function removeProfile() {
+  const id = editingId.value
+  if (!id) return
+  busy.value = true
+  try {
+    await window.go.main.App.DeleteLLMProfile(id)
+    await refreshLLM()
+    push({ kind: 'system', content: '已删除该方案。' })
+  } catch (e) {
+    push({ kind: 'error', content: `删除方案失败：${e && e.message ? e.message : e}` })
+  } finally {
+    busy.value = false
+  }
+}
 
 const presets = [
   { label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
@@ -39,14 +118,19 @@ function baseFromURL(u) {
 async function save() {
   busy.value = true
   try {
-    await window.go.main.App.SaveLLM({ ...form })
-    const info = await window.go.main.App.Bootstrap()
-    store.llm = info.llm
-    form.apiKey = ''
-    form.clearKey = false
-    testRes.value = null
-    corrected.value = ''
-    push({ kind: 'system', content: 'LLM 配置已保存' })
+    const saved = await window.go.main.App.SaveLLMProfile({
+      id: editingId.value,
+      name: form.name || '默认',
+      baseUrl: form.baseUrl,
+      model: form.model,
+      apiKey: form.apiKey,
+      clearKey: form.clearKey
+    })
+    editingId.value = saved.id
+    // refreshLLM 内部会 loadEditing()：表单对齐到保存后的值
+    // （含后端规范化过的 Base URL），并清掉 Key 输入框与测试结果。
+    await refreshLLM()
+    push({ kind: 'system', content: `LLM 方案「${saved.name}」已保存` })
   } catch (e) {
     push({ kind: 'error', content: String(e) })
   } finally {
@@ -56,18 +140,26 @@ async function save() {
 
 // 真的发一次最小请求。
 //
-// 之前这里只检查「有没有填 API Key」，然后让人自己去控制台试 ——
-// 那种按钮会给人「已经验过了」的错觉，比没有更糟。
-// 地址写错（例如把完整的 /chat/completions 填进 Base URL）恰恰是最常见的问题，
-// 只有真发一次请求才测得出来。
-//
 // 传的是**表单里的值**而不是已保存的值，所以「先测再存」是可行的。
+// 编辑已有方案时走 TestLLMProfile：空字段回落到**该方案**已保存的值，
+// 而不是当前激活方案的 —— 否则编辑 B 方案时拿 A 的 Key 去测，结论是错的。
 async function test() {
+  // 新建模式下表单全空时不发请求：后端 TestLLM 会回落到激活方案的配置，
+  // 用户会拿到一个「连接成功」—— 但验证的根本不是他没填完的这套。
+  if (!editingId.value && !form.baseUrl.trim() && !form.model.trim()) {
+    testRes.value = { ok: false, message: '请先填写 Base URL 与模型名。' }
+    return
+  }
   testing.value = true
   testRes.value = null
   corrected.value = ''
   try {
-    const res = await window.go.main.App.TestLLM(form.baseUrl, form.model, form.apiKey)
+    let res
+    if (editingId.value) {
+      res = await window.go.main.App.TestLLMProfile(editingId.value, form.baseUrl, form.model, form.apiKey)
+    } else {
+      res = await window.go.main.App.TestLLM(form.baseUrl, form.model, form.apiKey)
+    }
     testRes.value = res
 
     // 后端会规范化地址。若与用户填的不一致就把表单改过来 ——
@@ -94,12 +186,39 @@ const isLocal = () => /localhost|127\.0\.0\.1|0\.0\.0\.0/.test(form.baseUrl)
         <h2>LLM 设置</h2>
         <p class="muted">
           任何兼容 OpenAI <span class="mono">/v1/chat/completions</span> 与 function calling 的服务都能接入。
-          指向本地模型时，数据完全不出你的机器。
+          指向本地模型时，数据完全不出你的机器。可以保存多套方案，随时切换。
         </p>
       </div>
     </header>
 
     <div class="card">
+      <label>配置方案</label>
+      <div class="profile-bar">
+        <select class="profile-select" v-model="editingId" @change="loadEditing" :disabled="!profiles.length">
+          <option v-for="p in profiles" :key="p.id" :value="p.id">
+            {{ p.name }}{{ p.active ? '（使用中）' : '' }}
+          </option>
+          <option v-if="!profiles.length" value="" disabled>暂无方案</option>
+        </select>
+        <button class="sm" @click="newProfile">新建</button>
+        <button class="sm" v-if="editingId && !editingProfile()?.active" :disabled="busy" @click="activate">
+          设为当前
+        </button>
+        <button class="sm danger" v-if="profiles.length > 1 && editingId" :disabled="busy" @click="removeProfile">
+          删除
+        </button>
+      </div>
+      <div class="muted profile-hint" v-if="editingId">
+        {{ editingProfile()?.active
+          ? '这套方案正在被所有对话使用。'
+          : '编辑后点「保存」，再用「设为当前」切换过去。' }}
+      </div>
+    </div>
+
+    <div class="card" style="margin-top: 12px">
+      <label>方案名称</label>
+      <input v-model="form.name" class="profile-name" placeholder="例如：DeepSeek / 本地 Qwen" />
+
       <label>快速预设</label>
       <div class="presets">
         <button v-for="p in presets" :key="p.label" class="sm" @click="applyPreset(p)">
@@ -117,11 +236,12 @@ const isLocal = () => /localhost|127\.0\.0\.1|0\.0\.0\.0/.test(form.baseUrl)
 
       <label style="margin-top: 14px">
         API Key
-        <span v-if="store.llm.hasApiKey" class="muted">（已保存，留空表示不修改）</span>
+        <span v-if="editingId && editingProfile()?.hasApiKey" class="muted">（已保存，留空表示不修改）</span>
+        <span v-else-if="!editingId && store.llm.hasApiKey" class="muted">（当前方案已保存，新方案需另行填写）</span>
       </label>
       <input v-model="form.apiKey" class="api-key" type="password" placeholder="sk-..." />
 
-      <label class="chk" v-if="store.llm.hasApiKey">
+      <label class="chk" v-if="editingId && editingProfile()?.hasApiKey">
         <input type="checkbox" v-model="form.clearKey" />
         清除已保存的 API Key
       </label>
@@ -177,6 +297,11 @@ const isLocal = () => /localhost|127\.0\.0\.1|0\.0\.0\.0/.test(form.baseUrl)
 .panel-head p { margin: 0; font-size: 12px; line-height: 1.7; max-width: 640px; }
 
 .presets { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.profile-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.profile-select { flex: 1; min-width: 180px; }
+.profile-name { margin-bottom: 12px; }
+.profile-hint { margin-top: 8px; font-size: 12px; }
 
 .notice {
   margin-top: 14px;

@@ -462,3 +462,84 @@ func TestTestLLM_UsesOwnShortTimeoutNotClientTimeout(t *testing.T) {
 		t.Errorf("应提示超时，实得: %s", res.Message)
 	}
 }
+
+// TestLLMProfile 对不存在的方案 ID 必须显式报错，而不是静默回落到
+// 激活方案 —— 回落会让用户拿到「另一套方案」的测试结论，比失败更误导。
+// （场景：编辑到一半，这套方案在别处被删了。）
+func TestTestLLMProfile_UnknownIDReportsDeleted(t *testing.T) {
+	f := newFakeLLM(t)
+	a := newTestApp(t)
+
+	// 前提：激活方案配置可用（迁移自 defaultStore 的旧字段）。
+	// 若它自己就能测通，说明「报错」不是碰巧因配置不可用而触发的。
+	key := "sk-active"
+	if err := a.v.SetLLM(f.URL+"/v1", "active-model", &key); err != nil {
+		t.Fatal(err)
+	}
+	if res := a.TestLLM("", "", ""); !res.OK {
+		t.Fatalf("前提不成立：激活方案应可测通，实得 %s", res.Message)
+	}
+	hitsBefore := f.hits
+
+	res := a.TestLLMProfile("nonexistent", f.URL+"/v1", "m", "k")
+
+	if res.OK {
+		t.Fatal("不存在的方案 ID 不应报告成功（那是在测别的方案的配置）")
+	}
+	if f.hits != hitsBefore {
+		t.Fatalf("不存在的方案 ID 不应发出 HTTP 请求，多发了 %d 次", f.hits-hitsBefore)
+	}
+	if !strings.Contains(res.Message, "不存在") {
+		t.Errorf("应说明方案已不存在，实得: %s", res.Message)
+	}
+}
+
+// 编辑非激活方案且表单留空 Key 时，测试必须用**该方案**已保存的 Key，
+// 而不是激活方案的 —— 这是 TestLLMProfile 存在的全部理由。
+func TestTestLLMProfile_FallsBackToThatProfilesKey(t *testing.T) {
+	f := newFakeLLM(t)
+	a := newTestApp(t)
+
+	activeKey := "sk-active"
+	if err := a.v.SetLLM(f.URL+"/v1", "active-model", &activeKey); err != nil {
+		t.Fatal(err)
+	}
+	bKey := "sk-profile-b"
+	if err := a.v.SaveLLMProfile(vault.LLMProfile{
+		ID: "pb", Name: "B", BaseURL: f.URL + "/v1", Model: "b-model",
+	}, &bKey); err != nil {
+		t.Fatal(err)
+	}
+
+	// 表单只填 Base URL 与模型名，Key 留空 → 必须回落到 pb 自己的 Key。
+	res := a.TestLLMProfile("pb", f.URL+"/v1", "b-model", "")
+
+	if !res.OK {
+		t.Fatalf("应测通，实得: %s", res.Message)
+	}
+	if f.auth != "Bearer sk-profile-b" {
+		t.Fatalf("应使用方案 B 自己的 Key，实得 %q", f.auth)
+	}
+}
+
+// 保存方案时 Base URL 为空必须被拒绝：存一套空地址的方案，问题要到
+// 发起对话时才暴露，且用户很难关联到是哪套方案。
+func TestSaveLLMProfile_RejectsEmptyBaseURL(t *testing.T) {
+	a := newTestApp(t)
+
+	if _, err := a.SaveLLMProfile(SaveLLMProfileRequest{Name: "x", BaseURL: "   ", Model: "m"}); err == nil {
+		t.Fatal("空 Base URL 应被拒绝")
+	}
+	if _, err := a.SaveLLMProfile(SaveLLMProfileRequest{ID: "p1", Name: "x", BaseURL: "", Model: "m"}); err == nil {
+		t.Fatal("编辑时清空 Base URL 也应被拒绝")
+	}
+
+	// 正常值应能保存，且返回的视图带后端生成的 ID。
+	view, err := a.SaveLLMProfile(SaveLLMProfileRequest{Name: "x", BaseURL: "https://x/v1", Model: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.ID == "" {
+		t.Fatal("新增后应返回后端生成的 ID")
+	}
+}

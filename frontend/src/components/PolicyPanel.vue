@@ -6,6 +6,7 @@ const form = reactive({
   mode: store.policy.mode,
   whitelist: (store.policy.whitelist || []).join('\n'),
   redactOutput: store.policy.redactOutput,
+  allowCrossHost: store.policy.allowCrossHost ?? false,
   maxOutput: store.policy.maxOutput,
   maxSteps: store.policy.maxSteps,
   maxSessionTurns: store.policy.maxSessionTurns ?? 8,
@@ -161,6 +162,7 @@ async function save() {
       mode: form.mode,
       whitelist: form.whitelist.split('\n').map(s => s.trim()).filter(Boolean),
       redactOutput: form.redactOutput,
+      allowCrossHost: form.allowCrossHost,
       maxOutput: Number(form.maxOutput) || 32768,
       maxSteps: Number(form.maxSteps) || 12,
       maxSessionTurns: Number(form.maxSessionTurns) || 8,
@@ -228,6 +230,20 @@ async function save() {
         对人敲的 shell：名单当作「已知 Linux 命令库」——库外命令会先
         <span class="mono">command -v</span>，不存在则提示改问 Agent。
         含重定向（<span class="mono">&gt;</span>）的命令不会因白名单自动放行。
+      </div>
+    </div>
+
+    <div class="card" style="margin-top: 12px">
+      <label>执行范围</label>
+      <label class="chk">
+        <input type="checkbox" v-model="form.allowCrossHost" class="cross-host" />
+        允许跨主机执行（默认关闭）
+      </label>
+      <div class="muted hint">
+        关闭时，一条会话里的工具只能操作<b>该会话所属的主机</b> ——
+        Agent 看得到所有主机，但对其余主机的调用会被直接拒绝。
+        这是在防「A 机器的排查对话悄悄把命令打到 B 机器上」的横向移动。
+        打开后，目标可以是任何已配置主机，但每条命令仍要过安全策略与审批。
       </div>
     </div>
 

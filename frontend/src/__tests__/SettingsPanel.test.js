@@ -13,12 +13,21 @@ import { store } from '../store.js'
 function makeApp(impl = {}) {
   const calls = []
   const base = {
-    Bootstrap: async () => ({ llm: { baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini', hasApiKey: true } }),
-    SaveLLM: async () => undefined,
+    Bootstrap: async () => ({ llm: { baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini', hasApiKey: true }, llmProfiles: store.llmProfiles }),
     TestLLM: async () => ({
       ok: true, message: '连接成功', url: 'https://api.openai.com/v1/chat/completions',
       status: 200, model: 'gpt-4o-mini', reply: 'pong', durationMs: 320
-    })
+    }),
+    TestLLMProfile: async () => ({
+      ok: true, message: '连接成功', url: 'https://a/v1/chat/completions',
+      status: 200, model: 'm1', reply: 'pong', durationMs: 320
+    }),
+    SaveLLMProfile: async (req) => ({
+      id: req.id || 'new-id', name: req.name || '默认',
+      baseUrl: req.baseUrl, model: req.model, hasApiKey: !!req.apiKey, active: false
+    }),
+    ActivateLLMProfile: async () => undefined,
+    DeleteLLMProfile: async () => undefined
   }
   const merged = { ...base, ...impl }
   const app = {}
@@ -165,5 +174,74 @@ describe('SettingsPanel 测试连接', () => {
     await wrapper.findAll('.presets button')[0].trigger('click')
     expect(wrapper.find('.test-result').exists()).toBe(false)
     expect(wrapper.find('.fix-hint').exists()).toBe(false)
+  })
+})
+
+// ---- 多方案（profile）----
+//
+// 前提不变式：编辑已有方案时必须带上方案 ID —— 否则后端会把「编辑」
+// 当成「新建」，或者用错回落配置（拿激活方案的 Key 去测非激活方案）。
+describe('SettingsPanel 多方案', () => {
+  const PROFILES = [
+    { id: 'p1', name: 'A', baseUrl: 'https://a/v1', model: 'm1', hasApiKey: true, active: true },
+    { id: 'p2', name: 'B', baseUrl: 'https://b/v1', model: 'm2', hasApiKey: false, active: false }
+  ]
+
+  beforeEach(() => {
+    store.llmProfiles = PROFILES.map(p => ({ ...p }))
+  })
+
+  afterEach(() => {
+    store.llmProfiles = []
+  })
+
+  it('编辑已有方案时，测试连接走 TestLLMProfile 并带方案 ID（回落到该方案的 Key）', async () => {
+    setup()
+    // 默认编辑激活方案 p1
+    await clickTest()
+    const call = calls.find(c => c.name === 'TestLLMProfile')
+    expect(call).toBeTruthy()
+    expect(call.args[0]).toBe('p1')
+  })
+
+  it('保存时带方案 ID，新增时不带（由后端生成 ID）', async () => {
+    setup()
+    await wrapper.findAll('.actions button').at(-1).trigger('click') // 保存
+    await flushPromises()
+    expect(calls.find(c => c.name === 'SaveLLMProfile').args[0].id).toBe('p1')
+
+    // 新建模式：editingId 清空
+    await wrapper.findAll('.profile-bar button')[0].trigger('click') // 新建
+    await wrapper.findAll('.actions button').at(-1).trigger('click')
+    await flushPromises()
+    expect(calls.filter(c => c.name === 'SaveLLMProfile')[1].args[0].id).toBe('')
+  })
+
+  it('「设为当前」调用 ActivateLLMProfile 并切换到选中的方案', async () => {
+    setup()
+    await wrapper.find('.profile-select').setValue('p2')
+    const btn = wrapper.findAll('.profile-bar button').find(b => b.text().includes('设为当前'))
+    await btn.trigger('click')
+    await flushPromises()
+    expect(calls.find(c => c.name === 'ActivateLLMProfile').args[0]).toBe('p2')
+  })
+
+  it('删除方案调用 DeleteLLMProfile', async () => {
+    setup()
+    await wrapper.find('.profile-select').setValue('p2')
+    const btn = wrapper.findAll('.profile-bar button').find(b => b.text().includes('删除'))
+    await btn.trigger('click')
+    await flushPromises()
+    expect(calls.find(c => c.name === 'DeleteLLMProfile').args[0]).toBe('p2')
+  })
+
+  it('新建模式下表单全空时不发测试请求 —— 否则会拿到激活方案配置的「连接成功」', async () => {
+    setup()
+    await wrapper.findAll('.profile-bar button')[0].trigger('click') // 新建
+    await clickTest()
+
+    expect(calls.filter(c => c.name === 'TestLLM' || c.name === 'TestLLMProfile')).toHaveLength(0)
+    expect(wrapper.find('.test-result').classes()).toContain('bad')
+    expect(wrapper.find('.test-result').text()).toContain('请先填写')
   })
 })

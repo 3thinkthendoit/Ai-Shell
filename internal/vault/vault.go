@@ -96,6 +96,9 @@ func (v *Vault) Open() error {
 	if err != nil {
 		if os.IsNotExist(err) {
 			v.opened = true
+			// 全新安装也要走一次迁移：defaultStore 里预置的旧字段
+			// （llm / llmApiKey）正是靠它变成第一套方案的。
+			v.migrateLLMProfilesLocked()
 			return v.saveLocked() // 落一个初始文件
 		}
 		return fmt.Errorf("读取凭证库失败: %w", err)
@@ -114,11 +117,41 @@ func (v *Vault) Open() error {
 	if v.st.HostKeys == nil {
 		v.st.HostKeys = map[string]string{}
 	}
+	if v.st.LLMAPIKeys == nil {
+		v.st.LLMAPIKeys = map[string]string{}
+	}
 	if v.st.Policy.Mode == "" {
 		v.st.Policy = defaultStore().Policy
 	}
+	v.migrateLLMProfilesLocked()
 	v.opened = true
 	return nil
+}
+
+// migrateLLMProfilesLocked 把旧版单套 LLM 配置迁移成多方案格式（须持锁）。
+//
+// 触发条件：还没有任何方案，但旧字段里有配置。迁移是幂等的 ——
+// 一旦 LLMProfiles 非空就什么都不做，重复 Open 不会产生重复方案。
+// ID 固定为 defaultLLMProfileID，这样「迁移 → 删掉旧字段 → 再迁移」
+// 这种异常序列也只会得到一个方案。
+//
+// 迁移后旧字段不再使用（但保留在 JSON 里，见 store 的注释）。
+// 这里刻意不立即落盘：Open 是热路径，等下一次任何写入顺手把新格式带上即可。
+func (v *Vault) migrateLLMProfilesLocked() {
+	if len(v.st.LLMProfiles) != 0 {
+		return
+	}
+	if v.st.LLM.BaseURL == "" && v.st.LLMAPIKey == "" {
+		return
+	}
+	v.st.LLMProfiles = []LLMProfile{{
+		ID:      defaultLLMProfileID,
+		Name:    "默认",
+		BaseURL: v.st.LLM.BaseURL,
+		Model:   v.st.LLM.Model,
+	}}
+	v.st.LLMAPIKeys[defaultLLMProfileID] = v.st.LLMAPIKey
+	v.st.ActiveLLM = defaultLLMProfileID
 }
 
 // Protection 返回当前主密钥的保护方式。
@@ -260,8 +293,11 @@ func (v *Vault) SecretStrings() []string {
 			out = append(out, s)
 		}
 	}
-	if v.st.LLMAPIKey != "" {
-		add(v.st.LLMAPIKey)
+	// 旧字段与新方案表的 Key 都要参与脱敏比对。旧字段在迁移后是空的，
+	// 但留着这个出口：万一哪天迁移逻辑变了，这里不能成为漏网之鱼。
+	add(v.st.LLMAPIKey)
+	for _, k := range v.st.LLMAPIKeys {
+		add(k)
 	}
 	for _, s := range v.st.Secrets {
 		add(s.Password)
@@ -312,12 +348,184 @@ func (v *Vault) ForgetHostKey(addr string) error {
 	return v.saveLocked()
 }
 
-// ---- LLM 配置 ----
+// ---- LLM 配置（多方案） ----
+//
+// 所有读路径都收敛到「当前激活的方案」：LLM() / LLMSettingsView() 只认
+// activeProfileLocked() 的结果，调用方（Agent、测试连接）完全不必知道
+// 方案的存在。切换方案 = 改一个字符串字段，下一次对话即生效。
 
-// LLMSettingsView 返回可下发给前端的 LLM 配置（不含密钥）。
+// activeProfileLocked 返回当前激活的方案（须持锁）。
+// ActiveLLM 为空或指向已删除的方案时回落到第一个 —— 删除路径会维护
+// ActiveLLM，这里只是兜底，保证读路径永远拿得到一套可用配置。
+func (v *Vault) activeProfileLocked() *LLMProfile {
+	for i := range v.st.LLMProfiles {
+		if v.st.LLMProfiles[i].ID == v.st.ActiveLLM {
+			return &v.st.LLMProfiles[i]
+		}
+	}
+	if len(v.st.LLMProfiles) > 0 {
+		return &v.st.LLMProfiles[0]
+	}
+	return nil
+}
+
+// activeProfileIDLocked 返回有效激活 ID（须持锁），与上面同一个兜底规则。
+func (v *Vault) activeProfileIDLocked() string {
+	if p := v.activeProfileLocked(); p != nil {
+		return p.ID
+	}
+	return ""
+}
+
+// LLMProfiles 返回可下发给前端的方案列表（不含密钥）。
+func (v *Vault) LLMProfiles() []LLMProfileView {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	active := v.activeProfileIDLocked()
+	out := make([]LLMProfileView, 0, len(v.st.LLMProfiles))
+	for _, p := range v.st.LLMProfiles {
+		out = append(out, LLMProfileView{
+			ID:        p.ID,
+			Name:      p.Name,
+			BaseURL:   p.BaseURL,
+			Model:     p.Model,
+			HasAPIKey: v.st.LLMAPIKeys[p.ID] != "",
+			Active:    p.ID == active,
+		})
+	}
+	return out
+}
+
+// LLMProfile 按 ID 取一套方案（不含密钥）。
+func (v *Vault) LLMProfile(id string) (LLMProfile, bool) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	for _, p := range v.st.LLMProfiles {
+		if p.ID == id {
+			return p, true
+		}
+	}
+	return LLMProfile{}, false
+}
+
+// LLMKey 返回指定方案的 API Key。仅供后端调用。
+func (v *Vault) LLMKey(profileID string) string {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.st.LLMAPIKeys[profileID]
+}
+
+// SaveLLMProfile 新增或更新一套方案。apiKey 为 nil 时保留原密钥。
+// p.ID 必须非空（生成新 ID 是调用方的职责 —— 那是应用层的关注点）。
+func (v *Vault) SaveLLMProfile(p LLMProfile, apiKey *string) error {
+	if strings.TrimSpace(p.Name) == "" {
+		return errors.New("方案名称不能为空")
+	}
+	if p.ID == "" {
+		return errors.New("缺少方案 ID")
+	}
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if !v.opened {
+		return ErrLocked
+	}
+
+	p.Name = strings.TrimSpace(p.Name)
+	// 与 SetLLM 相同的规范化语义：非空才更新（编辑时留空 = 保留原值）。
+	if nb := strings.TrimRight(strings.TrimSpace(p.BaseURL), "/"); nb != "" {
+		p.BaseURL = nb
+	} else if i := v.indexOfProfileLocked(p.ID); i >= 0 {
+		p.BaseURL = v.st.LLMProfiles[i].BaseURL
+	}
+	if m := strings.TrimSpace(p.Model); m != "" {
+		p.Model = m
+	} else if i := v.indexOfProfileLocked(p.ID); i >= 0 {
+		p.Model = v.st.LLMProfiles[i].Model
+	}
+
+	if i := v.indexOfProfileLocked(p.ID); i >= 0 {
+		v.st.LLMProfiles[i] = p
+	} else {
+		v.st.LLMProfiles = append(v.st.LLMProfiles, p)
+		// 第一套方案自动成为激活方案 —— 保证「永远至少有一套可用配置」。
+		if v.activeProfileIDLocked() == "" {
+			v.st.ActiveLLM = p.ID
+		}
+	}
+	if apiKey != nil {
+		if v.st.LLMAPIKeys == nil {
+			v.st.LLMAPIKeys = map[string]string{}
+		}
+		v.st.LLMAPIKeys[p.ID] = strings.TrimSpace(*apiKey)
+	}
+	return v.saveLocked()
+}
+
+// DeleteLLMProfile 删除一套方案。至少保留一套 —— 空列表会让所有读路径
+// 落到旧字段兜底上，那是一条迁移之后没人再维护的死路。
+func (v *Vault) DeleteLLMProfile(id string) error {
+	if strings.TrimSpace(id) == "" {
+		return errors.New("缺少方案 ID")
+	}
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if !v.opened {
+		return ErrLocked
+	}
+	i := v.indexOfProfileLocked(id)
+	if i < 0 {
+		return errors.New("方案不存在")
+	}
+	if len(v.st.LLMProfiles) == 1 {
+		return errors.New("至少保留一套配置方案，不能删除最后一套")
+	}
+	v.st.LLMProfiles = append(v.st.LLMProfiles[:i], v.st.LLMProfiles[i+1:]...)
+	delete(v.st.LLMAPIKeys, id)
+	// 删的正好是激活方案：切到剩下的第一套，而不是留一个悬空引用
+	// 让读路径去猜（activeProfileLocked 虽然有兜底，但状态要 honest）。
+	if v.st.ActiveLLM == id {
+		v.st.ActiveLLM = v.st.LLMProfiles[0].ID
+	}
+	return v.saveLocked()
+}
+
+// ActivateLLMProfile 切换当前使用的方案。
+func (v *Vault) ActivateLLMProfile(id string) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if !v.opened {
+		return ErrLocked
+	}
+	if v.indexOfProfileLocked(id) < 0 {
+		return errors.New("方案不存在")
+	}
+	v.st.ActiveLLM = id
+	return v.saveLocked()
+}
+
+// indexOfProfileLocked 返回方案下标，不存在返回 -1（须持锁）。
+func (v *Vault) indexOfProfileLocked(id string) int {
+	for i := range v.st.LLMProfiles {
+		if v.st.LLMProfiles[i].ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+// LLMSettingsView 返回当前激活方案的可下发视图（不含密钥）。
 func (v *Vault) LLMSettingsView() LLMSettingsView {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
+	if p := v.activeProfileLocked(); p != nil {
+		return LLMSettingsView{
+			BaseURL:   p.BaseURL,
+			Model:     p.Model,
+			HasAPIKey: v.st.LLMAPIKeys[p.ID] != "",
+		}
+	}
 	return LLMSettingsView{
 		BaseURL:   v.st.LLM.BaseURL,
 		Model:     v.st.LLM.Model,
@@ -326,12 +534,30 @@ func (v *Vault) LLMSettingsView() LLMSettingsView {
 }
 
 // SetLLM 更新 LLM 配置。apiKey 为 nil 时保留原密钥。
+//
+// 多方案引入后它退化为「更新当前激活方案」：既有调用方（测试与老代码）
+// 的语义不变 —— 它们本来就只想改「正在用的那套」。
 func (v *Vault) SetLLM(baseURL, model string, apiKey *string) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if !v.opened {
 		return ErrLocked
 	}
+	if p := v.activeProfileLocked(); p != nil {
+		if strings.TrimSpace(baseURL) != "" {
+			p.BaseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+		}
+		if strings.TrimSpace(model) != "" {
+			p.Model = strings.TrimSpace(model)
+		}
+		if apiKey != nil {
+			v.st.LLMAPIKeys[p.ID] = strings.TrimSpace(*apiKey)
+		}
+		return v.saveLocked()
+	}
+	// 兜底：没有任何方案时退回旧字段。只有「配置文件损坏或迁移被跳过」
+	// 才可能到这里（Open 的迁移会为旧字段生成首套方案）；留着这条路
+	// 是为了让 LLM() 永远有值可读，而不是 panic 或返回零值。
 	if strings.TrimSpace(baseURL) != "" {
 		v.st.LLM.BaseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	}
@@ -344,10 +570,13 @@ func (v *Vault) SetLLM(baseURL, model string, apiKey *string) error {
 	return v.saveLocked()
 }
 
-// LLM 返回 LLM 配置与密钥。仅供后端调用。
+// LLM 返回当前激活方案的配置与密钥。仅供后端调用。
 func (v *Vault) LLM() (LLMSettings, string) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
+	if p := v.activeProfileLocked(); p != nil {
+		return LLMSettings{BaseURL: p.BaseURL, Model: p.Model}, v.st.LLMAPIKeys[p.ID]
+	}
 	return v.st.LLM, v.st.LLMAPIKey
 }
 

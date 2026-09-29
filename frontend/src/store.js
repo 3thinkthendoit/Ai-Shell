@@ -38,6 +38,9 @@ export const store = reactive({
   posture: { keyProtection: '', configDir: '', hostCount: 0, degraded: false },
   hosts: [],
   llm: { baseUrl: '', model: '', hasApiKey: false },
+  // llmProfiles 是全部 LLM 配置方案（每项含 active 标记，不含密钥）。
+  // 当前使用哪一套以每项的 active 为准，不另存副本 —— 两份数据迟早不一致。
+  llmProfiles: [],
   // 会话上下文的三项上限与后端默认值保持一致（8 / 8KiB / 256KiB）。
   // 这里只是 Bootstrap 回来之前的占位值，真实值以 Bootstrap 为准。
   policy: {
@@ -48,7 +51,9 @@ export const store = reactive({
     maxSteps: 12,
     maxSessionTurns: 8,
     maxStoredToolBytes: 8192,
-    maxSessionBytes: 262144
+    maxSessionBytes: 262144,
+    // 跨主机执行默认禁止：一条会话的工具只能打它所属的主机。
+    allowCrossHost: false
   },
   currentHostId: '',
 
@@ -205,6 +210,7 @@ export async function bootstrap() {
     store.posture = info.posture
     store.hosts = info.hosts || []
     store.llm = info.llm || store.llm
+    store.llmProfiles = info.llmProfiles || []
     store.policy = info.policy || store.policy
     if (!store.currentHostId && store.hosts.length) store.currentHostId = store.hosts[0].id
     store.ready = true
