@@ -72,9 +72,36 @@ function focusInput() {
 
 async function send() {
   const text = draft.value.trim()
-  if (!text || sessionLocked.value) return
+  if (sessionLocked.value) return
   if (!store.currentHostId) {
     push({ kind: 'error', content: '请先选择一台主机。' })
+    return
+  }
+
+  // 空命令：像真实终端一样，回车只在时间线里刷新一个提示符（本地 no-op，exit 0），
+  // 不下发远端、不经策略引擎。空白字符同样视为空：回车即清空当前行。
+  if (!text) {
+    draft.value = ''
+    const p = prompt.value
+    push({
+      kind: 'shell',
+      cmd: '',
+      who: p.who,
+      path: p.path,
+      sym: p.sym,
+      pending: false,
+      stdout: '',
+      stderr: '',
+      exitCode: 0,
+      durationMs: 0,
+      error: '',
+      hint: '',
+      truncated: false,
+      decision: '',
+      reason: '',
+      status: 'done'
+    })
+    focusInput()
     return
   }
 
@@ -162,6 +189,11 @@ async function execShellLine(c) {
 }
 
 function onKeydown(e) {
+  // 输入法组词期间的 Enter 是确认候选词，不能当「发送」：
+  // 此时 draft 还没同步（Vue 在组词期间不更新 model），
+  // 误触发会把空命令/旧草稿发出去，时间线里插进多余一行。
+  // keyCode 229 是 WKWebView 等老内核上 isComposing 缺失时的兜底。
+  if (e.isComposing || e.keyCode === 229) return
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault()
     send()
@@ -270,6 +302,19 @@ async function commitNewSession() {
   await createSession(name)
 }
 
+// 弹窗输入框的 Enter/Esc 与主输入框同理：输入法组词期间要让路，
+// 否则确认中文任务名候选词的那次 Enter 会把弹窗直接关掉。
+function onNewKeydown(e) {
+  if (e.isComposing || e.keyCode === 229) return
+  if (e.key === 'Enter') {
+    e.preventDefault()
+    commitNewSession()
+  } else if (e.key === 'Escape') {
+    e.preventDefault()
+    showNewModal.value = false
+  }
+}
+
 async function copyPendingCmd() {
   const text = pendingCmd.value
   if (!text) return
@@ -337,8 +382,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
             ref="newEl"
             v-model="newName"
             placeholder="任务名称，如「nginx 排查」"
-            @keydown.enter.prevent="commitNewSession"
-            @keydown.esc.prevent="showNewModal = false"
+            @keydown="onNewKeydown"
           />
           <div class="modal-hint">Enter 确定 · Esc 取消 · 留空则不创建</div>
           <div class="modal-actions">
@@ -360,13 +404,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
       </div>
 
       <div class="log term-log" ref="logEl" @click="focusInput">
-        <div v-if="!store.entries.length" class="empty">
-          <p>输入 shell 命令直接执行；用中文描述问题（或加 <span class="mono">?</span> 前缀）让 Agent 帮你排查。</p>
-          <p class="muted">试试：<span class="mono">ls -la</span>　或　「nginx 起不来了，帮我看看」</p>
-          <p class="muted">每个主机、每个会话的记忆相互独立。</p>
-        </div>
-
-        <div v-for="e in store.entries" :key="e.id" class="entry">
+        <div v-for="e in store.entries" :key="e.id" class="entry" :class="'entry-' + e.kind">
           <!-- 人工 shell 回显 -->
           <div v-if="e.kind === 'shell'" class="shell-block">
             <div class="term-line">
@@ -531,7 +569,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
 }
 .inline-label { font-size: 12px; color: var(--text-2); margin: 0; white-space: nowrap; }
 .host-select { max-width: 420px; }
-.new-session-btn { flex-shrink: 0; white-space: nowrap; }
+.new-session-btn { flex-shrink: 0; white-space: nowrap; font-size: 13px; }
 
 /* 新建会话弹窗（应用内，与侧边栏删除确认同风格） */
 .overlay {
@@ -612,9 +650,11 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
   cursor: text;
 }
 
-.empty { color: var(--text-2); padding: 20px 4px; line-height: 1.9; font-family: var(--font, inherit); }
-
 .shell-block { margin-bottom: 2px; }
+/* 连续的终端回显行要像真实终端一样紧贴：
+   容器 gap(10px) + 块内下边距(2px) 全部抵消，只留行高。 */
+.entry-shell + .entry-shell { margin-top: -12px; }
+.entry-shell + .term-live { margin-top: -12px; }
 .term-line { white-space: pre-wrap; word-break: break-word; }
 .p-who { color: var(--ok); }
 .p-sep { color: var(--text-3); }
@@ -637,7 +677,10 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
   word-break: break-word;
 }
 
-.term-live { display: flex; align-items: baseline; margin-top: 4px; }
+/* 不用 align-items: baseline：WKWebView 里 <input> 在 flex 中的基线
+   由边框盒合成，会和旁边 span 的文字错开半行（输入内容整体偏高）。
+   prompt span 与 input 行高同为 12.5px×1.6，居中对齐即基线对齐。 */
+.term-live { display: flex; align-items: center; margin-top: 4px; }
 .term-live > span { flex-shrink: 0; white-space: pre; }
 .term-input {
   flex: 1;

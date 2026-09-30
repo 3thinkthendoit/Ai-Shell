@@ -88,12 +88,6 @@ describe('ConsolePanel 空状态与主机选择', () => {
     expect(wrapper.text()).toContain('root@10.0.0.1')
   })
 
-  it('没有对话记录时显示引导文案', () => {
-    setup()
-    expect(wrapper.text()).toContain('策略引擎')
-    expect(wrapper.text()).toContain('nginx 起不来了')
-  })
-
   it('分段按钮显示「Agent会话」，能力横幅标明高危确认与 LLM', () => {
     setup()
     const segs = wrapper.findAll('.seg button')
@@ -228,6 +222,9 @@ describe('ConsolePanel 审批条', () => {
 
   it('新建任务弹窗打开时 Esc 让路，只在其关闭后才收命令弹窗', async () => {
     setup()
+    // 「新建任务」按钮在无主机时是禁用的，先给一台主机
+    store.hosts = [{ id: 'h1', name: 'web', user: 'r', addr: 'a' }]
+    store.currentHostId = 'h1'
     store.pending = { id: 'a7', name: 'run_command', command: 'ls' }
     await nextTick()
     await wrapper.findAll('.approval button').find(b => b.text() === '详细').trigger('click')
@@ -288,6 +285,59 @@ describe('ConsolePanel 对话发送', () => {
     expect(runs[0].args[2]).toBe('~')
     expect(wrapper.find('.shell-block .p-cmd').text()).toBe('ls -la')
     expect(wrapper.find('.term-out').text()).toContain('ok')
+  })
+
+  it('空回车只在本地刷新一个提示符，不下发远端', async () => {
+    store.hosts = [{ id: 'h1', name: 'web', user: 'root', addr: '10.0.0.1' }]
+    store.currentHostId = 'h1'
+    setup()
+    const inp = wrapper.find('.term-input')
+    await inp.setValue('')
+    await inp.trigger('keydown', { key: 'Enter' })
+    await flushPromises()
+    // 本地 no-op：既不走 Ask 也不走 RunShell
+    expect(calls.filter(c => c.name === 'Ask')).toHaveLength(0)
+    expect(calls.filter(c => c.name === 'RunShell')).toHaveLength(0)
+    // 时间线末尾多出一个命令行为空的 shell 块（像真实终端按了次回车）
+    const blocks = wrapper.findAll('.shell-block')
+    expect(blocks).toHaveLength(1)
+    expect(blocks[0].find('.p-cmd').text()).toBe('')
+  })
+
+  it('空白字符回车同样视为空命令，并清空输入框', async () => {
+    store.hosts = [{ id: 'h1', name: 'web', user: 'root', addr: '10.0.0.1' }]
+    store.currentHostId = 'h1'
+    setup()
+    const inp = wrapper.find('.term-input')
+    await inp.setValue('   ')
+    await inp.trigger('keydown', { key: 'Enter' })
+    await flushPromises()
+    expect(calls.filter(c => c.name === 'RunShell')).toHaveLength(0)
+    expect(calls.filter(c => c.name === 'Ask')).toHaveLength(0)
+    // 像真实终端一样：回车即清空当前行，空格不残留在输入框里
+    expect(inp.element.value).toBe('')
+    expect(wrapper.findAll('.shell-block')).toHaveLength(1)
+  })
+
+  it('输入法组词期间的 Enter 不发送、不插空提示符', async () => {
+    store.hosts = [{ id: 'h1', name: 'web', user: 'root', addr: '10.0.0.1' }]
+    store.currentHostId = 'h1'
+    setup()
+    const inp = wrapper.find('.term-input')
+    await inp.setValue('ls')
+    // 确认候选词的 Enter：isComposing 为真，必须被忽略
+    await inp.trigger('keydown', { key: 'Enter', isComposing: true })
+    await flushPromises()
+    expect(calls.filter(c => c.name === 'RunShell')).toHaveLength(0)
+    expect(wrapper.findAll('.shell-block')).toHaveLength(0)
+    // 老内核兜底：keyCode 229 同样忽略
+    await inp.trigger('keydown', { key: 'Enter', keyCode: 229 })
+    await flushPromises()
+    expect(calls.filter(c => c.name === 'RunShell')).toHaveLength(0)
+    // 组词结束后的 Enter 才真正发送
+    await inp.trigger('keydown', { key: 'Enter' })
+    await flushPromises()
+    expect(calls.filter(c => c.name === 'RunShell')).toHaveLength(1)
   })
 
   it('? 前缀强制走 Agent', async () => {
@@ -660,16 +710,15 @@ describe('ConsolePanel 压缩会话上下文', () => {
 //
 // 会话从「只存内存」改成了「加密落盘」。界面文案与事实相反比没有文案更糟：
 // 用户按「重启就没了」的预期去用，结果敏感对话一直留在磁盘上，而他以为早没了。
-// 说明性文字已精简（详见空态引导与能力横幅），这里锁住底线：
+// 说明性文字已精简（空态引导整块移除，只剩能力横幅），这里锁住底线：
 // 界面上任何位置都不得再声称「重启即清空 / 只存内存」。
 describe('ConsolePanel 上下文存放说明', () => {
-  it('空态引导说明记忆按主机×会话隔离，且不得声称「重启即清空」', () => {
+  it('界面不得声称「重启即清空 / 只存内存」', () => {
     store.hosts = [{ id: 'h1', name: 'web', user: 'root', addr: '10.0.0.1' }]
     store.currentHostId = 'h1'
     setup({})
 
     const text = wrapper.find('.console').text()
-    expect(text).toContain('记忆相互独立')
     expect(text, '会话已经落盘了，不能再声称重启即清空').not.toContain('重启应用即清空')
     expect(text).not.toContain('只存在内存')
     expect(wrapper.find('.sess-banner').text()).toMatch(/高危|确认/)

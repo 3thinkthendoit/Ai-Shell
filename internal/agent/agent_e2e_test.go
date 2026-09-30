@@ -139,7 +139,13 @@ func writeSSEFromResponse(w http.ResponseWriter, resp string) {
 			}}})
 		}
 	}
-	io.WriteString(w, "data: [DONE]\n\n")
+	// 收尾事件不可省：空正文时上面一个 delta 都不会发，
+	// 流里事件数为 0 会先被客户端的「未返回任何流式数据」拦掉，
+	// 永远走不到空回复判定。带上 finish_reason 则更贴近真实服务端。
+	final, _ := json.Marshal(map[string]any{
+		"choices": []any{map[string]any{"delta": map[string]any{}, "finish_reason": "stop"}},
+	})
+	io.WriteString(w, "data: "+string(final)+"\n\ndata: [DONE]\n\n")
 	if fl != nil {
 		fl.Flush()
 	}
