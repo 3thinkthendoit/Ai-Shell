@@ -7,6 +7,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -592,6 +593,13 @@ func (a *Agent) chatOnce(ctx context.Context, client *llm.Client, msgs []llm.Mes
 	}
 	// 已经吐出过内容、或者本来就是用户主动中断 —— 不能重试，否则会重复输出或违背用户意图
 	if dc.got || ctx.Err() != nil {
+		return llm.Message{}, err
+	}
+	// 空回复不重试：它意味着 SSE 流本身工作正常（HTTP 200、事件都能解析），
+	// 只是模型没产出内容——退回非流式只会多花一次请求和两倍延迟，
+	// 结果多半还是同一个空回复。让调用方把错误显式亮给用户。
+	var empty *llm.EmptyReplyError
+	if errors.As(err, &empty) {
 		return llm.Message{}, err
 	}
 	reply, ferr := client.Chat(ctx, msgs, toolDefs(allowCrossHost))

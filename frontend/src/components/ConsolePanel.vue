@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
   store, ask, approve, stop, clearLog, clearSession, compactSession, push,
   createSession, refreshSessions, runShell, switchProfile, syncWindowTitle
@@ -59,6 +59,7 @@ watch(scrollKey, async () => {
 })
 
 watch(() => store.pending, async () => {
+  if (!store.pending) showCmdDetail.value = false
   await nextTick()
   if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight
 })
@@ -236,6 +237,18 @@ async function onCompactSession() {
 // 新建会话（顶栏入口，参考 WorkBuddy 把主操作放在最顺手的位置）。
 // 弹应用内输入框确认 —— WKWebView 上原生 prompt/confirm 都不弹，不能用。
 const showNewModal = ref(false)
+
+// 审批命令详细弹窗：卡片内只做限高预览，全文（复制/细看）放弹窗
+const showCmdDetail = ref(false)
+const cmdCopied = ref(false)
+// 关闭就重置复制标记：下次打开不该残留「已复制」的假状态
+watch(showCmdDetail, v => { if (!v) cmdCopied.value = false })
+const pendingCmd = computed(() => {
+  const p = store.pending
+  if (!p) return ''
+  const raw = p.command || p.args
+  return typeof raw === 'string' ? raw : JSON.stringify(raw ?? '', null, 2)
+})
 const newName = ref('')
 const newEl = ref(null)
 
@@ -256,6 +269,40 @@ async function commitNewSession() {
   if (!name) return
   await createSession(name)
 }
+
+async function copyPendingCmd() {
+  const text = pendingCmd.value
+  if (!text) return
+  let ok = false
+  try {
+    await navigator.clipboard.writeText(text)
+    ok = true
+  } catch { ok = false }
+  if (!ok) {
+    // WKWebView 等环境下 clipboard API 可能不可用，退回 execCommand
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    try { ok = document.execCommand('copy') } catch { ok = false }
+    ta.remove()
+  }
+  if (ok) {
+    cmdCopied.value = true
+    setTimeout(() => { cmdCopied.value = false }, 1500)
+  }
+}
+
+function onWinKeydown(e) {
+  // 新建任务弹窗的输入框有自己的 Esc 处理：它在顶层时这里让路，
+  // 避免一次 Esc 同时关掉两层、或把用户正编辑的任务名弹窗误关。
+  if (showNewModal.value) return
+  if (e.key === 'Escape' && showCmdDetail.value) showCmdDetail.value = false
+}
+onMounted(() => window.addEventListener('keydown', onWinKeydown))
+onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
 </script>
 
 <template>
@@ -345,7 +392,7 @@ async function commitNewSession() {
 
           <div v-else-if="e.kind === 'assistant'" class="msg assistant">
             <div class="msg-role">LLM</div>
-            <div class="msg-body">{{ e.content }}<span v-if="e.streaming" class="caret"></span></div>
+            <div class="msg-body">{{ e.content }}<span v-if="e.streaming" class="caret"></span><span v-if="!e.content && !e.streaming" class="muted tiny">（模型返回了空回复）</span></div>
           </div>
 
           <div v-else-if="e.kind === 'tool'" class="tool">
@@ -413,6 +460,7 @@ async function commitNewSession() {
           <span class="badge warn">需要你的批准</span>
           <span class="mono">{{ store.pending.name }}</span>
           <span class="muted" v-if="store.pending.hostName">@{{ store.pending.hostName }}</span>
+          <button class="sm right" @click="showCmdDetail = true">详细</button>
         </div>
         <pre class="approval-cmd">{{ store.pending.command || store.pending.args }}</pre>
         <div class="approval-reason">{{ store.pending.reason }}</div>
@@ -449,6 +497,18 @@ async function commitNewSession() {
     </template>
 
     <InteractiveTerminal v-show="mode === 'terminal'" :active="mode === 'terminal'" />
+
+    <!-- 命令详细弹窗：审批卡内只做预览，超长命令在这里看全文 -->
+    <div v-if="showCmdDetail" class="overlay" @click.self="showCmdDetail = false">
+      <div class="modal cmd-modal">
+        <h3>待执行命令详细</h3>
+        <pre class="cmd-detail">{{ pendingCmd }}</pre>
+        <div class="modal-actions">
+          <button class="sm" @click="copyPendingCmd">{{ cmdCopied ? '已复制' : '复制' }}</button>
+          <button class="sm primary" @click="showCmdDetail = false">关闭</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -495,6 +555,23 @@ async function commitNewSession() {
 .modal-hint { font-size: 11px; color: var(--text-3); margin-top: 6px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 
+/* 命令详细弹窗：宽一些，命令块内部滚动 */
+.cmd-modal { width: min(760px, calc(100% - 60px)); }
+.cmd-detail {
+  margin: 0;
+  max-height: 55vh;
+  overflow: auto;
+  background: var(--inset-bg);
+  border-radius: 7px;
+  padding: 10px 12px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .seg { display: flex; gap: 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
 .seg button {
   flex: 1;
@@ -522,6 +599,7 @@ async function commitNewSession() {
 
 .term-log {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 12px 16px 8px;
   display: flex;
@@ -691,15 +769,23 @@ async function commitNewSession() {
   border-radius: var(--radius);
   padding: 12px 14px;
   flex-shrink: 0;
+  /* 卡片整体不超过面板剩余高度，避免底部按钮被 overflow:hidden 裁掉 */
+  max-height: 70%;
+  display: flex;
+  flex-direction: column;
 }
-.approval-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.approval-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-shrink: 0; }
 .approval-cmd {
   background: var(--inset-bg);
   border-radius: 7px;
   padding: 8px 10px;
   color: var(--text);
+  /* 卡片内只做预览：限高裁剪，全文走「详细」弹窗 */
+  max-height: 168px;
+  overflow: hidden;
 }
-.approval-reason { font-size: 12px; color: var(--warn); margin-top: 6px; }
+.approval-reason { font-size: 12px; color: var(--warn); margin-top: 6px; flex-shrink: 0; }
+.approval .row { flex-shrink: 0; }
 
 .composer-bar {
   flex-shrink: 0;

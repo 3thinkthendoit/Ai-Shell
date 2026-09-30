@@ -137,7 +137,7 @@ describe('ConsolePanel 审批条', () => {
     setup()
     store.pending = { id: 'a3', name: 'run_command', command: 'ls' }
     await nextTick()
-    const buttons = wrapper.findAll('.approval button')
+    const buttons = wrapper.findAll('.approval .row button')
     await buttons[0].trigger('click')
     await nextTick()
     expect(calls.filter(c => c.name === 'Approve')).toHaveLength(1)
@@ -149,7 +149,7 @@ describe('ConsolePanel 审批条', () => {
     setup()
     store.pending = { id: 'a4', name: 'run_command', command: 'rm -rf /tmp/x' }
     await nextTick()
-    const buttons = wrapper.findAll('.approval button')
+    const buttons = wrapper.findAll('.approval .row button')
     await buttons[1].trigger('click')
     await nextTick()
     expect(calls[0].args).toEqual(['a4', false])
@@ -159,11 +159,96 @@ describe('ConsolePanel 审批条', () => {
     setup({ Approve: async () => false })
     store.pending = { id: 'stale', name: 'run_command', command: 'ls' }
     await nextTick()
-    await wrapper.findAll('.approval button')[0].trigger('click')
+    await wrapper.findAll('.approval .row button')[0].trigger('click')
     await nextTick()
     expect(wrapper.find('.approval').exists()).toBe(false)
     expect(wrapper.text()).not.toContain('已批准执行')
     expect(wrapper.text()).toContain('已失效')
+  })
+
+  it('「详细」按钮弹出全文弹窗，可关闭，批准后随之收起', async () => {
+    setup()
+    const cmd = Array.from({ length: 40 }, (_, i) => `echo line-${i}`).join('\n')
+    store.pending = { id: 'a5', name: 'run_command', command: cmd }
+    await nextTick()
+
+    // 默认无弹窗；点「详细」后出现且包含完整命令
+    expect(wrapper.find('.cmd-modal').exists()).toBe(false)
+    const detailBtn = wrapper.findAll('.approval button').find(b => b.text() === '详细')
+    await detailBtn.trigger('click')
+    await nextTick()
+    const modal = wrapper.find('.cmd-modal')
+    expect(modal.exists()).toBe(true)
+    expect(modal.find('.cmd-detail').text()).toContain('echo line-39')
+
+    // Esc 关闭
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
+    await nextTick()
+    expect(wrapper.find('.cmd-modal').exists()).toBe(false)
+
+    // 再打开后批准，pending 清空，弹窗一并收起
+    await detailBtn.trigger('click')
+    await nextTick()
+    await wrapper.findAll('.approval .row button')[0].trigger('click')
+    await nextTick()
+    expect(wrapper.find('.approval').exists()).toBe(false)
+    expect(wrapper.find('.cmd-modal').exists()).toBe(false)
+  })
+
+  it('「复制」成功显示已复制，关闭重开不残留', async () => {
+    setup()
+    const orig = navigator.clipboard
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { writeText: async () => {} },
+      configurable: true
+    })
+    try {
+      store.pending = { id: 'a6', name: 'run_command', command: 'ls' }
+      await nextTick()
+      const detailBtn = wrapper.findAll('.approval button').find(b => b.text() === '详细')
+      await detailBtn.trigger('click')
+      await nextTick()
+      const copyBtn = wrapper.findAll('.cmd-modal button').find(b => b.text() === '复制')
+      await copyBtn.trigger('click')
+      await flushPromises()
+      await nextTick()
+      expect(copyBtn.text()).toBe('已复制')
+
+      // 关闭后重开：不能残留上一次的「已复制」
+      await wrapper.findAll('.cmd-modal button').find(b => b.text() === '关闭').trigger('click')
+      await nextTick()
+      await detailBtn.trigger('click')
+      await nextTick()
+      const copyBtn2 = wrapper.findAll('.cmd-modal button').find(b => b.text().includes('复制'))
+      expect(copyBtn2.text()).toBe('复制')
+    } finally {
+      Object.defineProperty(navigator, 'clipboard', { value: orig, configurable: true })
+    }
+  })
+
+  it('新建任务弹窗打开时 Esc 让路，只在其关闭后才收命令弹窗', async () => {
+    setup()
+    store.pending = { id: 'a7', name: 'run_command', command: 'ls' }
+    await nextTick()
+    await wrapper.findAll('.approval button').find(b => b.text() === '详细').trigger('click')
+    await nextTick()
+    // 叠加打开新建任务弹窗
+    await wrapper.findAll('button').find(b => b.text().includes('新建任务')).trigger('click')
+    await nextTick()
+    expect(wrapper.find('.cmd-modal').exists()).toBe(true)
+
+    // 新建弹窗在顶层：Esc 不应误关命令弹窗
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
+    await nextTick()
+    expect(wrapper.find('.cmd-modal').exists()).toBe(true)
+    expect(wrapper.find('.modal').exists()).toBe(true)
+
+    // 新建弹窗关掉后，Esc 恢复关闭命令弹窗
+    await wrapper.findAll('.modal-actions button').find(b => b.text() === '取消').trigger('click')
+    await nextTick()
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
+    await nextTick()
+    expect(wrapper.find('.cmd-modal').exists()).toBe(false)
   })
 })
 

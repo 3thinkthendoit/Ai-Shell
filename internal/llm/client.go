@@ -141,6 +141,35 @@ type Delta struct {
 	Content string
 }
 
+// EmptyReplyError 表示模型成功返回但内容为空。
+//
+// 单独成一个类型而不是裸 error：agent 的 chatOnce 依赖错误形状决定
+// 是否退回非流式重试——空回复说明 SSE 流本身工作正常（HTTP 200、
+// 事件都能解析），重试只会白白多花一次请求和两倍延迟，必须能区分开。
+type EmptyReplyError struct {
+	FinishReason string
+}
+
+func (e *EmptyReplyError) Error() string {
+	if e.FinishReason != "" {
+		return fmt.Sprintf("模型返回了空回复（finish_reason: %s），请检查模型配置或稍后重试", e.FinishReason)
+	}
+	return "模型返回了空回复，请检查模型配置或稍后重试"
+}
+
+// emptyReplyErr 把「模型成功返回但内容为空」整理成显式错误。
+//
+// 空回复若被当成合法的终局回答放行，agent 会静默结束这一轮：
+// 前端渲染一条空消息，用户看到的就是「发出去没反应」，连排查入口都没有。
+// finish_reason 往往能直接指出原因（content_filter / length …），必须带出来。
+// 只有正文为空且**没有任何工具调用**才算空回复——纯工具调用轮返回空正文是正常的。
+func emptyReplyErr(msg Message, finish string) error {
+	if strings.TrimSpace(msg.Content) != "" || len(msg.ToolCalls) > 0 {
+		return nil
+	}
+	return &EmptyReplyError{FinishReason: finish}
+}
+
 // newRequest 构造一次 chat/completions 请求。stream 为 true 时要求服务端以 SSE 返回。
 func (c *Client) newRequest(ctx context.Context, msgs []Message, tools []Tool, stream bool) (*http.Request, error) {
 	body := chatRequest{
@@ -300,7 +329,11 @@ func (c *Client) Chat(ctx context.Context, msgs []Message, tools []Tool) (Messag
 	if len(cr.Choices) == 0 {
 		return Message{}, fmt.Errorf("LLM 未返回任何候选结果")
 	}
-	return cr.Choices[0].Message, nil
+	msg := cr.Choices[0].Message
+	if err := emptyReplyErr(msg, cr.Choices[0].FinishReason); err != nil {
+		return Message{}, err
+	}
+	return msg, nil
 }
 
 // ChatStream 以流式方式发送一轮对话。
@@ -344,6 +377,9 @@ func (c *Client) ChatStream(ctx context.Context, msgs []Message, tools []Tool, o
 			return Message{}, fmt.Errorf("LLM 未返回任何候选结果")
 		}
 		msg := cr.Choices[0].Message
+		if err := emptyReplyErr(msg, cr.Choices[0].FinishReason); err != nil {
+			return Message{}, err
+		}
 		if onDelta != nil && msg.Content != "" {
 			onDelta(Delta{Content: msg.Content})
 		}
@@ -360,12 +396,13 @@ func (c *Client) consumeSSE(ctx context.Context, body io.Reader, onDelta func(De
 		args     strings.Builder
 	}
 	var (
-		content   strings.Builder
-		tools     = map[int]*accum{}
-		unparsed  int
-		events    int
-		doneFlag  bool
-		errInBody error
+		content      strings.Builder
+		tools        = map[int]*accum{}
+		unparsed     int
+		events       int
+		doneFlag     bool
+		errInBody    error
+		finishReason string
 	)
 
 	dispatch := func(payload string) bool {
@@ -385,6 +422,9 @@ func (c *Client) consumeSSE(ctx context.Context, body io.Reader, onDelta func(De
 			return false
 		}
 		for _, choice := range ch.Choices {
+			if choice.FinishReason != "" {
+				finishReason = choice.FinishReason
+			}
 			if d := choice.Delta.Content; d != "" {
 				content.WriteString(d)
 				if onDelta != nil {
@@ -480,6 +520,11 @@ func (c *Client) consumeSSE(ctx context.Context, body io.Reader, onDelta func(De
 			Type:     "function",
 			Function: FunctionCall{Name: acc.name, Arguments: acc.args.String()},
 		})
+	}
+	// 空回复检查必须放在工具调用聚合**之后**：纯工具调用轮正文为空是正常的，
+	// 提前检查会把每一次工具调用都误判成空回复。
+	if err := emptyReplyErr(msg, finishReason); err != nil {
+		return Message{}, err
 	}
 	return msg, nil
 }

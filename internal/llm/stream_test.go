@@ -447,3 +447,114 @@ func TestChatStreamRequiresConfig(t *testing.T) {
 		t.Fatal("未配置 Base URL 时应当报错")
 	}
 }
+
+// ---- 空回复必须显式报错 ----
+
+// 模型成功返回（HTTP 200）但正文为空时，绝不能当成合法的空回答放行：
+// 那样 agent 会静默结束这一轮，前端渲染一条看不见的空消息，
+// 用户看到的就是「发出去没响应」。finish_reason 能直接指出原因，必须带出来。
+func TestEmptyReplyIsAnError(t *testing.T) {
+	// 流式：只发 finish_reason，不给正文
+	srv := sseServer(t, []string{
+		`data: {"choices":[{"delta":{},"finish_reason":"content_filter"}]}` + "\n\n",
+		"data: [DONE]\n\n",
+	})
+	_, err := newTestClient(t, srv).ChatStream(context.Background(), nil, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "content_filter") {
+		t.Fatalf("流式空回复应报错并带 finish_reason，实得: %v", err)
+	}
+
+	// 网关忽略 stream、整体返回 JSON 的空回复
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"content_filter"}]}`)
+	}))
+	defer plain.Close()
+	_, err = newTestClient(t, plain).ChatStream(context.Background(), nil, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "content_filter") {
+		t.Fatalf("整体 JSON 空回复应报错并带 finish_reason，实得: %v", err)
+	}
+
+	// 非流式 Chat 同样处理
+	_, err = newTestClient(t, plain).Chat(context.Background(), nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "content_filter") {
+		t.Fatalf("非流式空回复应报错并带 finish_reason，实得: %v", err)
+	}
+
+	// 没有任何事件的空流也会报错（命中「未返回任何流式数据」，同样是显式失败）
+	bare := sseServer(t, []string{"data: [DONE]\n\n"})
+	if _, err = newTestClient(t, bare).ChatStream(context.Background(), nil, nil, nil); err == nil {
+		t.Fatal("只有 [DONE] 的空流应当报错")
+	}
+}
+
+// 流式路径下「正文为空 + 工具调用」的聚合顺序必须正确：
+// 空回复检查若放在工具调用聚合之前，会把每一次纯工具调用轮误判成空回复，
+// agent 的多轮工具调用会全部退化为非流式重试（并多消耗一次请求）。
+func TestChatStreamEmptyContentWithToolCallsIsNotAnEmptyReply(t *testing.T) {
+	tc := func(index int, part string) string {
+		b, _ := json.Marshal(map[string]any{
+			"choices": []any{map[string]any{
+				"delta": map[string]any{
+					"tool_calls": []any{map[string]any{"index": index, "function": map[string]any{"arguments": part}}},
+				},
+			}},
+		})
+		return "data: " + string(b) + "\n\n"
+	}
+	srv := sseServer(t, []string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"run_command"}}]}}]}` + "\n\n",
+		tc(0, `{"command":`),
+		tc(0, `"ls"}`),
+		"data: [DONE]\n\n",
+	})
+	msg, err := newTestClient(t, srv).ChatStream(context.Background(), nil, nil, nil)
+	if err != nil {
+		t.Fatalf("空正文+工具调用的流式轮不应报空回复: %v", err)
+	}
+	if len(msg.ToolCalls) != 1 || msg.ToolCalls[0].Function.Arguments != `{"command":"ls"}` {
+		t.Fatalf("工具调用聚合错误: %+v", msg.ToolCalls)
+	}
+}
+
+// 纯工具调用轮（正文为空、只有 tool_calls）是 agent 的正常中间步骤，不能误伤。
+func TestToolCallsWithoutContentIsNotAnEmptyReply(t *testing.T) {
+	body, _ := json.Marshal(map[string]any{
+		"choices": []any{map[string]any{
+			"message": map[string]any{
+				"role": "assistant",
+				"tool_calls": []any{map[string]any{
+					"id":   "call1",
+					"type": "function",
+					"function": map[string]any{
+						"name":      "run_command",
+						"arguments": `{"command":"ls"}`,
+					},
+				}},
+			},
+			"finish_reason": "tool_calls",
+		}},
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	msg, err := newTestClient(t, srv).Chat(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatalf("纯工具调用轮不应报空回复: %v", err)
+	}
+	if len(msg.ToolCalls) != 1 || msg.ToolCalls[0].Function.Name != "run_command" {
+		t.Fatalf("工具调用解析错误: %+v", msg.ToolCalls)
+	}
+}
+
+// 全空白正文等同于空回复：渲染出来同样不可见。
+func TestWhitespaceOnlyReplyIsAnError(t *testing.T) {
+	srv := sseServer(t, []string{delta("  \n  "), "data: [DONE]\n\n"})
+	_, err := newTestClient(t, srv).ChatStream(context.Background(), nil, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "空回复") {
+		t.Fatalf("全空白回复应报错，实得: %v", err)
+	}
+}

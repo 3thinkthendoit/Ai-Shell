@@ -793,6 +793,24 @@ func TestAgentFallsBackWhenGatewayIgnoresStream(t *testing.T) {
 	}
 }
 
+// 模型返回空回复时**不得**退回非流式重试：SSE 流本身是通的
+// （HTTP 200、事件都能解析），重试只会多花一次请求和两倍延迟，
+// 结果多半还是同一个空回复。错误必须显式亮给用户。
+func TestAgentEmptyReplyDoesNotRetryNonStream(t *testing.T) {
+	h := newHarness(t, []string{respContent("")}, policy.ModeWhitelist, true)
+
+	err := runDefault(h.ag, context.Background(), h.hostID, "试试")
+	if err == nil || !strings.Contains(err.Error(), "空回复") {
+		t.Fatalf("空回复应显式报错，实得: %v", err)
+	}
+	if got := h.fake.requestCount(); got != 1 {
+		t.Fatalf("空回复不应触发非流式重试，实际发出了 %d 次请求", got)
+	}
+	if !h.hasEvent(EvError) {
+		t.Fatal("应向界面发出 agent:error 事件，而不是静默结束")
+	}
+}
+
 // ---- 按主机分组的会话上下文 ----
 
 // brief 把消息链压成一行，用于失败信息 —— 直接打印整个 []Message 没人看得下去。
