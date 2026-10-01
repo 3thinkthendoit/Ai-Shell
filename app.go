@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -18,6 +19,7 @@ import (
 	"ai-shell/internal/agent"
 	"ai-shell/internal/audit"
 	"ai-shell/internal/llm"
+	"ai-shell/internal/policy"
 	"ai-shell/internal/sshclient"
 	"ai-shell/internal/vault"
 )
@@ -32,6 +34,40 @@ type App struct {
 	openErr error
 	shell   shellGate   // 人工 shell 命令的审批闸门（与 Agent 工具审批分开）
 	lane    sessionLane // Ask 与 RunShell 互斥道
+
+	// termVT 是常驻终端的 VT 管线注册表（termKey = host+session → 状态）：每条任务
+	// 各一条独立 shell，屏幕模型负责认全屏重绘（OSC 133 命令边界 + CUP/ED 特征 +
+	// 备用屏幕开关），在命令结束/备用屏幕释放/PTY 退出时把最后一帧定格送进快照管线。
+	// 快照器不开周期静止timer：agent 命令的输出已有有界捕获，
+	// 模型缺的只是「人眼看到的那一屏」。
+	mu         sync.Mutex
+	termVT     map[string]*termVTState
+	activeSess map[string]string // hostID → 前端正在看的会话（Ask 上下文路由用）
+}
+
+// termKeySep 是组合 host+session 成终端注册表键的分隔符（不可打印，避免与
+// 真实 hostID/sessionID 内容冲突）。termKey 把「哪台主机的哪条任务」编成一个键，
+// sshclient 的 PTY 注册表与 App.termVT 都以它为准。
+const termKeySep = "\x1f"
+
+func termKey(hostID, sessionID string) string {
+	// 与会话的规范 ID 对齐：默认会话的真实 ID 是 agent.DefaultSessionID，而前端
+	// 在「会话列表还没拉回来」的窗口里会以空串挂上终端（见 bucketKey 把 '' 归一成
+	// DEFAULT_SESSION）。agent.Run 也会把空 sessionID 归一成 DefaultSessionID 后再
+	// 发出 toolResult 的 sessionId。这里同步归一，让 raw "" 与 "default" 合成同一个
+	// 注册表键 —— 否则默认会话下 TTY 交接写进的 key 和 PTY 注册的 key 对不上，
+	// WriteTerminal 查不到 PTY 报「没有打开」，而这条错误在前端被静默吞掉。
+	if sessionID == "" {
+		sessionID = agent.DefaultSessionID
+	}
+	return hostID + termKeySep + sessionID
+}
+
+// termVTState 一台主机常驻终端的 VT 管线。snapper 只借它的哈希去重
+// （同一屏连续触发只送一次），周期静止计时器从不启动。
+type termVTState struct {
+	screen  *sshclient.Screen
+	snapper *sshclient.Snapshotter
 }
 
 // NewApp 创建应用实例。
@@ -632,6 +668,9 @@ func (a *App) SavePolicy(p vault.PolicySettings) error {
 const (
 	EvTermData = "term:data"
 	EvTermExit = "term:exit"
+	// EvTermTUI 报告远端是否被全屏程序接管（vim/top/htop）。前端终端内
+	// 直接输入据此让路：接管中不本地缓冲按键，原样透传，避免吞键。
+	EvTermTUI = "term:tui"
 )
 
 // termDataPayload 构造 term:data 的事件载荷。
@@ -639,21 +678,24 @@ const (
 // 抽成纯函数是为了能直接断言编码结果。载荷一旦编错，前端拿到的是乱码或
 // 丢数据，而那种 bug 从界面上几乎定位不回来 —— 你只会看到「终端里偶尔
 // 出现问号」，既复现不了，也想不到是后端编码的问题。
-func termDataPayload(hostID string, b []byte) map[string]string {
+// sessionId 让前端把输出路由到**正确任务**的那块表面（每任务独立 shell）。
+func termDataPayload(hostID, sessionID string, b []byte) map[string]string {
 	return map[string]string{
-		"hostId": hostID,
-		"data":   base64.StdEncoding.EncodeToString(b),
+		"hostId":    hostID,
+		"sessionId": sessionID,
+		"data":      base64.StdEncoding.EncodeToString(b),
 	}
 }
 
-// OpenTerminal 打开（或复用）某台主机的交互终端。
+// OpenTerminal 打开（或复用）某台主机上某条任务的交互终端。
 //
 // 不返回输出：终端是一条**持续的流**，用「一次调用一次结果」建模会把实时性
-// 整个丢掉。输出通过 term:data 事件推送，退出通过 term:exit。
+// 整个丢掉。输出通过 term:data 事件推送（带 sessionId），退出通过 term:exit。
 //
-// 已经开着活终端时复用而不是重开 —— 界面在切模式、切主机时会反复调这里，
-// 而用户 cd 过去的目录、跑着的进程都在那条会话里。
-func (a *App) OpenTerminal(hostID string, cols, rows int) error {
+// 每条任务（host+session）各一条独立连接；同一任务反复打开则复用 —— 界面切回
+// 同一任务时会反复调这里，而用户 cd 过去的目录、跑着的进程都在那条 shell 里。
+// 开新任务前先关掉同主机其它任务的终端（只留当前任务）。
+func (a *App) OpenTerminal(hostID, sessionID string, cols, rows int) error {
 	if err := a.ready(); err != nil {
 		return err
 	}
@@ -661,17 +703,73 @@ func (a *App) OpenTerminal(hostID string, cols, rows int) error {
 		return errors.New("请先选择一台主机")
 	}
 
-	before := a.ssh.PTY(hostID)
-	p, err := a.ssh.OpenPTY(hostID, "xterm-256color", sshclient.TerminalSize{Cols: cols, Rows: rows},
+	key := termKey(hostID, sessionID)
+	// 只留当前任务：关掉这台主机上其它任务的 shell（各自触发 onExit 定格 + term:exit）。
+	for _, oldKey := range a.ssh.CloseHostPTYsExcept(hostID, key) {
+		a.dropTermVT(oldKey, nil)
+	}
+
+	// 屏幕模型与定格管线每条任务一份：top/vim 退出时的最后一帧
+	// 靠它进模型上下文。触发点有三个（见 SetTriggers 与 onExit）：
+	// 命令结束且全屏重绘过、备用屏幕释放、PTY 退出。
+	c, r := cols, rows
+	if c < 2 || c > 512 {
+		c = 80
+	}
+	if r < 2 || r > 512 {
+		r = 24
+	}
+	screen := sshclient.NewScreen(c, r)
+	snapper := sshclient.NewSnapshotter(screen, 0, func(text string, final bool) {
+		// 定格归属本任务自己的 sessionID（不再依赖 activeSession）。
+		a.deliverSnapshot(hostID, sessionID, key, text, final)
+	})
+	screen.SetTriggers(
+		func(tui bool) {
+			// 命令结束（OSC 133;D）：只有全屏重绘过的命令才定格 ——
+			// ls 这种流式输出的结尾画面没有信息量，进上下文是纯噪音。
+			if tui {
+				snapper.Flush()
+			}
+		},
+		func() { snapper.Flush() }, // 备用屏幕释放：vim/htop 退出的那一瞬
+	)
+	// onExit 捕获这一份 vt：晚到的退出只应清掉自己这条管线，不能把
+	// 「切走再切回」后新开的那条的状态误删（见 dropTermVT 的身份守卫）。
+	vt := &termVTState{screen: screen, snapper: snapper}
+	// lastTui 记录上一次上报的全屏接管状态，只在**变化**时发 term:tui，
+	// 避免每个输出块都推一条事件把前端淹掉。
+	lastTui := false
+
+	before := a.ssh.PTY(key)
+	p, err := a.ssh.OpenPTY(hostID, key, "xterm-256color", sshclient.TerminalSize{Cols: cols, Rows: rows},
 		func(b []byte) {
 			// base64 而不是字符串：一次读取完全可能把一个多字节 UTF-8 字符
 			// 切成两半（远端一次 write 的边界和字符边界无关）。当成字符串发，
 			// 前端就会把半个字符渲染成乱码。交给 xterm.js 的 UTF-8 解码器去
 			// 处理跨块的续字节 —— 它本来就是干这个的。
-			a.emit(EvTermData, termDataPayload(hostID, b))
+			screen.Feed(b)
+			if tui := screen.InTUI(); tui != lastTui {
+				lastTui = tui
+				a.emit(EvTermTUI, map[string]any{"hostId": hostID, "sessionId": sessionID, "active": tui})
+			}
+			a.emit(EvTermData, termDataPayload(hostID, sessionID, b))
 		},
 		func(reason string) {
-			a.emit(EvTermExit, map[string]string{"hostId": hostID, "reason": reason})
+			// 最后机会：把退出时的画面定格留给模型（内容未变时自动去重）。
+			snapper.Final()
+			a.dropTermVT(key, vt)
+			// 竞态守卫（与 dropTermVT 的身份守卫同源）：dropTermVT 只在登记的仍是
+			// 自己时才删。若删后这一 key 上仍挂着 VT，说明是**更新一代**的终端（用户
+			// 切走再切回同一任务重开了 PTY），本次是晚到的旧退出 —— 不能把新终端的
+			// 表面标成 closed（它的 onData 还在写字节），否则表现为「新终端一开就结束」。
+			a.mu.Lock()
+			superseded := a.termVT[key] != nil
+			a.mu.Unlock()
+			if superseded {
+				return
+			}
+			a.emit(EvTermExit, map[string]string{"hostId": hostID, "sessionId": sessionID, "reason": reason})
 			a.auditLog(audit.Entry{
 				Kind:     audit.KindTerminal,
 				HostID:   hostID,
@@ -682,13 +780,21 @@ func (a *App) OpenTerminal(hostID string, cols, rows int) error {
 			})
 		})
 	if err != nil {
+		snapper.Stop()
 		return err
 	}
 
-	// 只有**真的新开了一条**才记审计。复用时不记：界面每次切回终端都会调
-	// 这里，照记的话审计里会堆满「打开了终端」而用户其实一次都没开过新的，
-	// 反而把真正的那一次淹没掉。
+	// 只有**真的新开了一条**才记审计、注 shell integration。复用时不记：
+	// 界面每次切回同一任务都会调这里，照记的话审计里会堆满「打开了终端」
+	// 而用户其实一次都没开过新的，反而把真正的那一次淹没掉。
 	if p != before {
+		a.mu.Lock()
+		if a.termVT == nil {
+			a.termVT = map[string]*termVTState{}
+		}
+		a.termVT[key] = vt
+		a.mu.Unlock()
+		a.injectShellIntegration(p)
 		a.auditLog(audit.Entry{
 			Kind:     audit.KindTerminal,
 			HostID:   hostID,
@@ -697,8 +803,85 @@ func (a *App) OpenTerminal(hostID string, cols, rows int) error {
 			Rule:     "pty",
 			Note:     "打开了交互终端（不经过策略引擎，命令以登录用户身份直接执行）",
 		})
+	} else {
+		snapper.Stop() // 复用活的那条：新管线让位给还挂在旧 PTY 上的那份
 	}
 	return nil
+}
+
+// shellIntegration 是 shell integration 注入片段：用 OSC 133 上报命令边界
+// （C=开始，D;退出码=结束），客户端的 VT 模型靠它知道「一条命令结束了」，
+// 再结合全屏重绘特征把最后一帧定格。bash 走 DEBUG trap + PROMPT_COMMAND，
+// zsh 走 preexec/precmd；其它 shell 不注入（降级为备用屏幕释放与 PTY 退出
+// 两个触发点）。压成一行：交互式 shell 对多行复合命令会画续行提示符
+// （PS2），终端第一屏会被弄脏。
+//
+// zsh 分支里的函数体 `precmd() { …; }` 的右花括号**必须**由 `;`（或换行）收尾：
+// bash 虽不走 elif 分支，但要**解析**整个 if/elif/fi —— 少了那个 `;`，`}` 会被当成
+// printf 的参数、花括号组永不闭合，bash 一路读到 `fi` 报「syntax error near
+// unexpected token `fi`」，连 bash 分支的 trap/PROMPT_COMMAND 也一并没装上。
+const shellIntegration = `if [ -n "$BASH_VERSION" ]; then trap 'printf "\033]133;C\007"' DEBUG; PROMPT_COMMAND='printf "\033]133;D;%s\007" "$?"'; elif [ -n "$ZSH_VERSION" ]; then precmd() { printf "\033]133;D;%s\007" "$?"; }; preexec() { printf "\033]133;C\007"; }; fi`
+
+// injectShellIntegration 把 shell integration 片段送进刚开好的 shell。
+//
+// 先 stty -echo 再送片段：远端 shell 会把写进去的东西原样回显，
+// 不关回显的话用户第一屏会看到一行 trap/PROMPT_COMMAND 天书。
+//
+// 关键：不能把三行连着一次性写出去。远端 tty 的 ECHO 是在**收到输入时**就回显，
+// 而不是等 shell 执行；若片段和「stty -echo」挤在同一次输入里，tty 会在 ECHO 关掉前
+// 把三行**全部**回显出来（表现为片段也显示在屏幕上），而且第一行的自擦除会因光标已
+// 移到下方而擦错行。所以先单独发「关回显」（并让它擦掉自己那行回显），等一下让远端真正
+// 执行完 stty -echo，再发片段 —— 此时 ECHO 已关，片段不再被回显。
+// 只保留当前任务、终端刚开时屏上本就没有用户内容，擦掉这一行不影响登录横幅（MOTD）。
+func (a *App) injectShellIntegration(p *sshclient.PTY) {
+	// 关回显；命令很短（单行不换行），末尾拼一段 printf 输出「光标上移一行 + 清除整行」
+	// 的 ANSI 序列，正好抹掉「stty -echo…」这一行自身的回显。
+	_ = p.Write([]byte("stty -echo;printf '\\033[1A\\033[2K'\n"))
+	// 给远端一个往返的时间执行 stty -echo，避免片段与它挤进同一次输入被一次性回显。
+	time.Sleep(shellIntegrationEchoDelay)
+	_ = p.Write([]byte(shellIntegration + "\n"))
+	_ = p.Write([]byte("stty echo\n"))
+}
+
+// shellIntegrationEchoDelay 是「关回显」与「送片段」之间的缓冲：确保远端已把 ECHO
+// 关掉，片段才不会作为输入被 tty 回显出来。取值兼顾慢速链路的往返与终端打开的延迟。
+const shellIntegrationEchoDelay = 250 * time.Millisecond
+
+// ReportActiveSession 前端报告「某台主机上正在看哪条会话」。
+// 常驻终端的定格快照要落到人正在看的那条时间线上，后端自己
+// 无从知道前端停在哪个会话 —— 切会话/切主机时前端调一次。
+func (a *App) ReportActiveSession(hostID, sessionID string) error {
+	if err := a.ready(); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	if a.activeSess == nil {
+		a.activeSess = map[string]string{}
+	}
+	a.activeSess[hostID] = sessionID
+	a.mu.Unlock()
+	return nil
+}
+
+func (a *App) activeSession(hostID string) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.activeSess[hostID]
+}
+
+// dropTermVT 停掉并移除某个终端（按 termKey）的 VT 管线。幂等。
+//
+// want 是身份守卫：非空时只有当前登记的仍是 want 才删。一条终端晚到的
+// onExit 若按 key 无条件删，会把「切走再切回」后新开的那条管线误删 ——
+// 重开的终端于是静默失去定格能力（screen 还在喂、snapper 已 Stop），且不报错。
+// want 为 nil 表示无条件清（用户显式关闭终端，语义上就该清掉当前这条）。
+func (a *App) dropTermVT(key string, want *termVTState) {
+	a.mu.Lock()
+	if vt, ok := a.termVT[key]; ok && (want == nil || vt == want) {
+		vt.snapper.Stop()
+		delete(a.termVT, key)
+	}
+	a.mu.Unlock()
 }
 
 // WriteTerminal 把用户的按键转发到远端。data 是 base64 编码的原始字节。
@@ -706,7 +889,7 @@ func (a *App) OpenTerminal(hostID string, cols, rows int) error {
 // 用 base64 而不是字符串：中文输入法、粘贴进来的内容都要按原始字节送，
 // 中间任何一次「字符串 ↔ 字节」的转换都可能引入替换字符，
 // 而用户看到的是自己敲的字变成了问号。
-func (a *App) WriteTerminal(hostID, data string) error {
+func (a *App) WriteTerminal(hostID, sessionID, data string) error {
 	if err := a.ready(); err != nil {
 		return err
 	}
@@ -714,7 +897,7 @@ func (a *App) WriteTerminal(hostID, data string) error {
 	if err != nil {
 		return fmt.Errorf("按键数据解码失败: %w", err)
 	}
-	p := a.ssh.PTY(hostID)
+	p := a.ssh.PTY(termKey(hostID, sessionID))
 	if p == nil {
 		return errors.New("交互终端没有打开")
 	}
@@ -730,13 +913,22 @@ func (a *App) WriteTerminal(hostID, data string) error {
 //
 // 少了这一步，远端程序会一直以为自己还是初始尺寸：top 的进程列表挤在
 // 左边一小条里，vim 画错半屏。窗口尺寸不是装饰，是程序的排版依据。
-func (a *App) ResizeTerminal(hostID string, cols, rows int) error {
+func (a *App) ResizeTerminal(hostID, sessionID string, cols, rows int) error {
 	if err := a.ready(); err != nil {
 		return err
 	}
-	p := a.ssh.PTY(hostID)
+	key := termKey(hostID, sessionID)
+	p := a.ssh.PTY(key)
 	if p == nil {
 		return nil // 还没打开就谈不上调整，静默忽略
+	}
+	// 屏幕模型跟着换几何：全屏 TUI 重绘的行列要和模型对得上，
+	// 不然定格快照的文本直接错位。
+	a.mu.Lock()
+	vt := a.termVT[key]
+	a.mu.Unlock()
+	if vt != nil {
+		vt.screen.Resize(cols, rows)
 	}
 	if err := p.Resize(sshclient.TerminalSize{Cols: cols, Rows: rows}); err != nil &&
 		!errors.Is(err, sshclient.ErrPTYClosed) {
@@ -745,16 +937,18 @@ func (a *App) ResizeTerminal(hostID string, cols, rows int) error {
 	return nil
 }
 
-// CloseTerminal 关掉某台主机的交互终端。
+// CloseTerminal 关掉某台主机上某条任务的交互终端。
 //
 // 返回 false 表示本来就没开着 —— 那不是错误，用户按晚了而已。
-func (a *App) CloseTerminal(hostID string) bool {
+func (a *App) CloseTerminal(hostID, sessionID string) bool {
 	if a.ssh == nil {
 		return false
 	}
-	if !a.ssh.ClosePTY(hostID) {
+	key := termKey(hostID, sessionID)
+	if !a.ssh.ClosePTY(key) {
 		return false
 	}
+	a.dropTermVT(key, nil)
 	a.auditLog(audit.Entry{
 		Kind:     audit.KindTerminal,
 		HostID:   hostID,
@@ -764,6 +958,46 @@ func (a *App) CloseTerminal(hostID string) bool {
 		Note:     "关闭了交互终端",
 	})
 	return true
+}
+
+// deliverSnapshot 把一帧屏幕快照送完安全管线再交给 agent 的瞬态上下文。
+//
+// 顺序不能换：先脱敏再注入检测 —— 注入话术里嵌着机密时，
+// 脱敏后的文本才是进检测器和进上下文的同一份东西。
+func (a *App) deliverSnapshot(hostID, sessionID, termID, text string, final bool) {
+	text = clipSnapshot(text)
+	known := a.v.SecretStrings()
+	clean, n := policy.Redact(text, known)
+	findings := policy.DetectInjection(clean)
+	what := "终端屏幕快照进入模型上下文"
+	if final {
+		what = "终端结束画面进入模型上下文"
+	}
+	a.auditLog(audit.Entry{
+		Kind:     audit.KindTerminal,
+		HostID:   hostID,
+		HostName: hostNameOf(a.v, hostID),
+		Decision: "human",
+		Rule:     "pty",
+		Note: fmt.Sprintf("%s（term=%s，%d 字节，脱敏 %d 处，注入告警 %d 条）",
+			what, termID, len(clean), n, len(findings)),
+	})
+	a.ag.InjectTerminalSnapshot(hostID, sessionID, termID, clean, n, findings, final)
+}
+
+// clipSnapshot 给快照封顶：可见屏幕通常几十行，但异常尺寸（512 行）
+// 不该把整篇文章塞进一次请求。裁尾 200 行 / 8KB。
+func clipSnapshot(text string) string {
+	lines := strings.Split(text, "\n")
+	if len(lines) > 200 {
+		lines = lines[len(lines)-200:]
+	}
+	out := strings.Join(lines, "\n")
+	const cap = 8 * 1024
+	if len(out) > cap {
+		out = out[len(out)-cap:]
+	}
+	return out
 }
 
 // ---- 会话（每台主机多条）----

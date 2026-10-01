@@ -48,6 +48,7 @@ func (s TerminalSize) normalized() TerminalSize {
 // 终端本来就是要一直开着的，也没有「输出总量」这个概念。
 type PTY struct {
 	hostID string
+	key    string      // 注册表键（App 侧组合 host+session）；拨号仍用 hostID
 	conn   *ssh.Client // 独占连接，见 OpenPTY
 	sess   *ssh.Session
 	stdin  io.WriteCloser
@@ -197,23 +198,23 @@ func ptyExitReason(err error) string {
 	return "终端连接中断：" + err.Error()
 }
 
-// OpenPTY 在指定主机上开一条交互式终端。
+// OpenPTY 在指定主机上按 key 开一条交互式终端（key = host+session：每任务一条，同 key 反复打开复用）。
 //
-// 已经开着且还活着时**直接复用**，不会换一条新的：调用方（界面）在切模式、
-// 切主机时会反复调这里，而用户已经 cd 过去的目录、跑着的进程都在那条会话里，
-// 悄悄重开会把它们全部丢掉，界面却以为只是「又打开了一次」。
+// 同一个 key 已经开着且还活着时**直接复用**，不会换一条新的：界面在切模式、
+// 切回同一任务时会反复调这里，而用户已经 cd 过去的目录、跑着的进程都在那条会话里，
+// 悄悄重开会把它们全部丢掉。不同 key（不同任务）则各开一条独立连接。
 //
 // onData 与 onExit 都会被在**独立 goroutine** 上调用，实现里不能假设
 // 自己在调用方的那条栈上。onExit 恰好触发一次；onData 收到的字节块
 // 调用方可以持有（内部已经复制过）。
-func (c *Client) OpenPTY(hostID, term string, size TerminalSize, onData func([]byte), onExit func(string)) (*PTY, error) {
+func (c *Client) OpenPTY(hostID, key, term string, size TerminalSize, onData func([]byte), onExit func(string)) (*PTY, error) {
 	if term == "" {
 		term = "xterm-256color"
 	}
 	size = size.normalized()
 
 	c.mu.Lock()
-	if old, ok := c.ptys[hostID]; ok && old.alive() {
+	if old, ok := c.ptys[key]; ok && old.alive() {
 		c.mu.Unlock()
 		return old, nil
 	}
@@ -231,14 +232,14 @@ func (c *Client) OpenPTY(hostID, term string, size TerminalSize, onData func([]b
 	c.mu.Unlock()
 
 	// 拨号与建会话都不持锁：可能很慢，持锁会卡住所有其他主机的操作。
-	// 代价是并发调用同一主机时可能白做一次，由下面的二次检查兜住。
-	p, err := c.openPTY(hostID, term, size, onData, onExit)
+	// 代价是并发调用同一 key 时可能白做一次，由下面的二次检查兜住。
+	p, err := c.openPTY(hostID, key, term, size, onData, onExit)
 	if err != nil {
 		return nil, err
 	}
 
 	c.mu.Lock()
-	if cur, ok := c.ptys[hostID]; ok && cur.alive() {
+	if cur, ok := c.ptys[key]; ok && cur.alive() {
 		c.mu.Unlock()
 		_ = p.Close() // 白做的那条：关掉，别泄漏一条 SSH 连接
 		return cur, nil
@@ -248,13 +249,14 @@ func (c *Client) OpenPTY(hostID, term string, size TerminalSize, onData func([]b
 		_ = p.Close()
 		return nil, fmt.Errorf("同时打开的交互终端已达上限（%d 个），请先关掉一些", MaxPTYTotal)
 	}
-	c.ptys[hostID] = p
+	c.ptys[key] = p
 	c.mu.Unlock()
 	return p, nil
 }
 
-// openPTY 真正建立终端，不碰注册表。
-func (c *Client) openPTY(hostID, term string, size TerminalSize, onData func([]byte), onExit func(string)) (*PTY, error) {
+// openPTY 真正建立终端，不碰注册表：起一个常驻 shell（命令由调用方
+// 敲进去，而不是 exec 单条 —— 控制台的命令生命周期靠 OSC 133 标记识别）。
+func (c *Client) openPTY(hostID, key, term string, size TerminalSize, onData func([]byte), onExit func(string)) (*PTY, error) {
 	// 独占一条连接，**刻意不走连接池**（用 dialRaw 而不是 dial）。
 	//
 	// 池里的连接会被 Exec 顺手关掉：命令超时、或 Wait() 报出非 ExitError 时，
@@ -296,6 +298,7 @@ func (c *Client) openPTY(hostID, term string, size TerminalSize, onData func([]b
 
 	p := &PTY{
 		hostID: hostID,
+		key:    key,
 		conn:   conn,
 		sess:   sess,
 		stdin:  stdin,
@@ -323,12 +326,12 @@ func (c *Client) openPTY(hostID, term string, size TerminalSize, onData func([]b
 	return p, nil
 }
 
-// ClosePTY 关掉某台主机的交互终端。返回 false 表示本来就没开着。
-func (c *Client) ClosePTY(hostID string) bool {
+// ClosePTY 关掉某个 key（host+session）的交互终端。返回 false 表示本来就没开着。
+func (c *Client) ClosePTY(key string) bool {
 	c.mu.Lock()
-	p, ok := c.ptys[hostID]
+	p, ok := c.ptys[key]
 	if ok {
-		delete(c.ptys, hostID)
+		delete(c.ptys, key)
 	}
 	c.mu.Unlock()
 
@@ -337,6 +340,28 @@ func (c *Client) ClosePTY(hostID string) bool {
 	}
 	_ = p.Close()
 	return true
+}
+
+// CloseHostPTYsExcept 关掉某台主机下除 keepKey 之外的所有终端，返回被关掉的 key 列表。
+// 用于「每任务独立 shell、只留当前任务」：开新任务终端前，先把同主机其它任务的 shell 关掉。
+func (c *Client) CloseHostPTYsExcept(hostID, keepKey string) []string {
+	c.mu.Lock()
+	var keys []string
+	var victims []*PTY
+	for k, p := range c.ptys {
+		if p.hostID == hostID && k != keepKey {
+			keys = append(keys, k)
+			victims = append(victims, p)
+			delete(c.ptys, k)
+		}
+	}
+	c.mu.Unlock()
+
+	for _, p := range victims {
+		// Close 会触发该 PTY 自己的 onExit（定格最后一帧 + 发 term:exit）。
+		_ = p.Close()
+	}
+	return keys
 }
 
 // closeAllPTY 关闭所有交互终端（供 Close 调用）。
@@ -367,9 +392,9 @@ func (c *Client) PTYCount() int {
 	return n
 }
 
-// PTY 返回某台主机当前开着的终端；没有则返回 nil。
-func (c *Client) PTY(hostID string) *PTY {
+// PTY 返回某个 key（host+session）当前开着的交互终端；没有则返回 nil。
+func (c *Client) PTY(key string) *PTY {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.ptys[hostID]
+	return c.ptys[key]
 }

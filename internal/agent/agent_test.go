@@ -82,6 +82,13 @@ func TestFormatResultTellsLLMAboutTTYLimitation(t *testing.T) {
 	if !strings.Contains(out, "added by the client") {
 		t.Errorf("应标明这段不是远端输出: %q", out)
 	}
+	// 客户端把命令交接到的常驻终端表面也要告诉 LLM：不然它会以为自己能看到
+	// 那块终端里的画面，或反过来再替用户安排一次「打开终端」。
+	for _, want := range []string{"常驻终端", "不会进入你的上下文"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("应告知 LLM 客户端已把命令交接到常驻终端（缺 %q）: %q", want, out)
+		}
+	}
 }
 
 // 正常结果不该带这段说明 —— 每轮都塞会浪费 token，也会稀释真正要看的内容。

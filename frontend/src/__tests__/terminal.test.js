@@ -1,4 +1,4 @@
-// 交互终端的接线测试。
+// 常驻终端表面的接线测试。
 //
 // xterm 本身在 jsdom 里跑不起来（没有布局、没有 canvas），所以
 // vitest.config.js 把 @xterm/xterm 换成了替身（见 __tests__/stubs/xterm.js）。
@@ -6,6 +6,9 @@
 //   - 实例什么时候建、建几个（建晚了会丢启动提示符，建多了会丢滚动回放）
 //   - 按键怎么送出去、尺寸变化怎么上报
 //   - 后端推来的字节有没有原样写进去（含跨块的多字节字符）
+//
+// 重构后控制台就是终端本身：选中主机、组件挂载即附着常驻 PTY，
+// 不再需要「切到交互终端模式」这一步。
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import { nextTick } from 'vue'
@@ -83,7 +86,9 @@ function makeApp(impl = {}) {
     Ask: async () => undefined,
     Approve: async () => true,
     Stop: async () => undefined,
-    RunShell: async () => ({ status: 'done', decision: 'allow', stdout: '', stderr: '', exitCode: 0, durationMs: 1 }),
+    // composer 里的 shell 行走常驻终端通道；ReportActiveSession 报当前会话。
+    RunShellInTerminal: async () => ({ status: 'done', decision: 'allow', reason: '', rule: 'auto_safe', risk: 'low' }),
+    ReportActiveSession: async () => undefined,
     ListSessions: async () => [{ id: 'default', name: '', turns: 0, archivedTurns: 0, isDefault: true }],
     CreateSession: async () => ({ id: 's1', name: '新会话', turns: 0, archivedTurns: 0, isDefault: false }),
     RenameSession: async () => undefined,
@@ -134,13 +139,22 @@ function setup(impl) {
 function withHost(id = 'h1', user = 'root', addr = '10.0.0.1') {
   store.hosts = [{ id, name: 'web', user, addr }]
   store.currentHostId = id
+  // 与真实流程对齐：refreshSessions 会把选中会话落到默认会话的真实 ID（mock 中为 'default'）。
+  // 预先置好，挂载时的 OpenTerminal/WriteTerminal 调用才能拿到确定的 sessionId。
+  store.currentSessionId = 'default'
 }
 
-// toTerminal 切到「交互终端」模式（第二个分段按钮；第一个是 Agent会话）。
-async function toTerminal() {
-  await wrapper.findAll('.seg button')[1].trigger('click')
+// 挂载即附着：onMounted 里 attachSurface 会异步把实例建起来、把 PTY 开出来。
+// flushPromises 让 nextTick + OpenTerminal 这条链跑完。
+async function attached() {
   await flushPromises()
   await nextTick()
+}
+
+// 做「原样回显」这类严格断言前先把替身已写入的内容清空，才能逐字节比对。
+// （表面按任务独立后不再预写会话分隔线，这里只是保险地清一次。）
+function clearSurface(i = 0) {
+  if (instances[i]) instances[i].written.length = 0
 }
 
 function callsOf(name) {
@@ -157,6 +171,19 @@ async function selectHost(id) {
     .findAll('.host-select .uis-item')
     .filter(w => w.text() === `${h.name} — ${h.user}@${h.addr}`)[0]
   await item.trigger('click')
+  await flushPromises()
+  await nextTick()
+}
+
+// toArchive / toSurface 切换主区：只读时间线 vs 活表面。
+// 表面用 v-show 常驻，切换不会销毁实例（滚动回放不丢）。
+async function toArchive() {
+  await wrapper.findAll('.seg button')[1].trigger('click')
+  await flushPromises()
+  await nextTick()
+}
+async function toSurface() {
+  await wrapper.findAll('.seg button')[0].trigger('click')
   await flushPromises()
   await nextTick()
 }
@@ -179,8 +206,8 @@ afterEach(() => {
 
 // ---- 建立会话的顺序与次数 ----
 
-describe('交互终端 建立会话', () => {
-  it('先建好本地实例，再开远端会话', async () => {
+describe('常驻终端表面 建立会话', () => {
+  it('挂载即附着：选中主机时无需任何点击就建实例、开远端会话', async () => {
     withHost()
     // 记录 OpenTerminal 被调用的那一刻，本地实例已经建了几个。
     // 顺序很关键：远端 shell 一启动就打印提示符，落点必须在那之前就绪，
@@ -191,114 +218,113 @@ describe('交互终端 建立会话', () => {
         instancesAtOpen = instances.length
       }
     })
-    await toTerminal()
+    await attached()
 
     expect(instancesAtOpen).toBe(1)
     expect(instances).toHaveLength(1)
+    expect(callsOf('OpenTerminal')).toHaveLength(1)
   })
 
   it('开远端会话时带上 fit 之后的行列，而不是默认的 80x24', async () => {
     withHost()
     setup()
-    await toTerminal()
+    await attached()
 
     const open = callsOf('OpenTerminal')
     expect(open).toHaveLength(1)
-    // 替身的 FitAddon 固定算出 100x30。带上真实尺寸的意义是：
-    // 远端程序第一次排版就用对了宽度，而不是先按 80 列画一遍再重画。
-    expect(open[0].args).toEqual(['h1', 100, 30])
+    // 新签名：OpenTerminal(hostId, sessionId, cols, rows)。测试里 currentSessionId 为空，
+    // bucketKey 会回退到 'default'。替身的 FitAddon 固定算出 100x30。带上真实尺寸的
+    // 意义是：远端程序第一次排版就用对宽度，而不是先按 80 列画一遍再重画。
+    expect(open[0].args).toEqual(['h1', 'default', 100, 30])
   })
 
-  it('切走再切回：复用同一个实例，也不重复开远端会话', async () => {
+  it('切到对话归档再切回：复用同一实例，也不重复开远端会话', async () => {
     withHost()
     setup()
-    await toTerminal()
+    await attached()
     const first = instances[0]
 
-    await wrapper.findAll('.seg button')[0].trigger('click') // 回 Agent
-    await flushPromises()
-    await toTerminal() // 再切回交互终端
+    await toArchive()
+    await toSurface()
 
     expect(instances).toHaveLength(1)
     expect(instances[0]).toBe(first)
-    // 远端会话是常驻的：切一次标签就重开一次的话，
+    // 远端会话是常驻的：切一次视图就重开一次的话，
     // 用户 cd 过去的目录、跑着的进程会被反复丢掉。
     expect(callsOf('OpenTerminal')).toHaveLength(1)
   })
 
-  it('切换主机各开各的，切回来不重开', async () => {
+  it('切换主机关掉上一个 shell，为新主机重开一条全新 shell（只留当前任务）', async () => {
     store.hosts = [
       { id: 'h1', name: 'web', user: 'root', addr: '10.0.0.1' },
       { id: 'h2', name: 'db', user: 'root', addr: '10.0.0.2' }
     ]
     store.currentHostId = 'h1'
     setup()
-    await toTerminal()
+    await attached()
 
     await selectHost('h2')
+    // 切走 h1：它的实例被销毁（旧现场丢弃），h2 新建一条全新实例。
     expect(instances).toHaveLength(2)
+    expect(instances[0].disposed).toBe(true)
     expect(callsOf('OpenTerminal').map(c => c.args[0])).toEqual(['h1', 'h2'])
+    expect(callsOf('CloseTerminal').map(c => c.args[0])).toContain('h1')
 
-    // 切回 h1：实例还在（滚动回放没丢），也不重开会话
+    // 切回 h1：关掉 h2，为 h1 重开一条全新 shell（不复用旧实例）。
     await selectHost('h1')
-    await flushPromises()
-    expect(instances).toHaveLength(2)
-    expect(callsOf('OpenTerminal')).toHaveLength(2)
+    expect(instances).toHaveLength(3)
+    expect(instances[1].disposed).toBe(true)
+    expect(instances[2]).not.toBe(instances[0])
+    expect(callsOf('OpenTerminal').map(c => c.args[0])).toEqual(['h1', 'h2', 'h1'])
   })
 
   it('没选主机时不去开终端，给出提示', async () => {
     setup()
-    await toTerminal()
+    await attached()
 
     expect(callsOf('OpenTerminal')).toHaveLength(0)
     expect(instances).toHaveLength(0)
     expect(wrapper.text()).toContain('请先选择一台主机')
   })
-
-  it('没进交互终端模式就不会去开终端（不能白占一条 SSH 连接）', async () => {
-    withHost()
-    setup()
-    await nextTick()
-    await flushPromises()
-
-    expect(callsOf('OpenTerminal')).toHaveLength(0)
-    expect(instances).toHaveLength(0)
-  })
 })
 
 // ---- 按键与尺寸 ----
 
-describe('交互终端 按键与尺寸', () => {
-  it('用户按键按原始字节 base64 送出去', async () => {
+describe('常驻终端表面 按键与尺寸', () => {
+  it('控制/转义按键按原始字节 base64 透传（方向键不拆散）', async () => {
     withHost()
     setup()
-    await toTerminal()
+    await attached()
 
-    instances[0].emitData('ls -l\r')
+    instances[0].emitData('\x1b[A') // 方向键上：转义序列整体透传
     await flushPromises()
 
     const w = callsOf('WriteTerminal')
     expect(w).toHaveLength(1)
     expect(w[0].args[0]).toBe('h1')
-    expect(toBytes(base64ToBytes(w[0].args[1]))).toEqual(toBytes(new TextEncoder().encode('ls -l\r')))
+    // 新签名：WriteTerminal(hostId, sessionId, dataB64)。
+    expect(w[0].args[1]).toBe('default')
+    expect(toBytes(base64ToBytes(w[0].args[2]))).toEqual(toBytes(new TextEncoder().encode('\x1b[A')))
   })
 
-  it('中文按键按 UTF-8 字节送，不会被改写成问号', async () => {
+  it('中文本地回显、回车前不写 PTY（不会被当命令发出去）', async () => {
     withHost()
     setup()
-    await toTerminal()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
 
-    instances[0].emitData('中文')
+    inst.emitData('中文')
     await flushPromises()
 
-    const w = callsOf('WriteTerminal')
-    expect(toBytes(base64ToBytes(w[0].args[1]))).toEqual(toBytes(new TextEncoder().encode('中文')))
+    expect(inst.text()).toContain('中文')
+    expect(callsOf('WriteTerminal')).toHaveLength(0)
   })
 
   it('尺寸变化上报给后端', async () => {
     withHost()
     setup()
-    await toTerminal()
+    await attached()
     const before = callsOf('ResizeTerminal').length
 
     instances[0].emitResize(132, 43)
@@ -306,13 +332,13 @@ describe('交互终端 按键与尺寸', () => {
 
     const rs = callsOf('ResizeTerminal')
     expect(rs.length).toBeGreaterThan(before)
-    expect(rs[rs.length - 1].args).toEqual(['h1', 132, 43])
+    expect(rs[rs.length - 1].args).toEqual(['h1', 'default', 132, 43])
   })
 
   it('容器尺寸变化会重新测量', async () => {
     withHost()
     setup()
-    await toTerminal()
+    await attached()
     expect(roInstances).toHaveLength(1)
     const before = callsOf('ResizeTerminal').length
 
@@ -325,11 +351,12 @@ describe('交互终端 按键与尺寸', () => {
 
 // ---- 后端推来的输出 ----
 
-describe('交互终端 输出回显', () => {
+describe('常驻终端表面 输出回显', () => {
   it('后端推来的字节原样写进终端', async () => {
     withHost()
     setup()
-    await toTerminal()
+    await attached()
+    clearSurface()
 
     const bytes = new TextEncoder().encode('hello 中文\n')
     rt.emit('term:data', { hostId: 'h1', data: bytesToBase64(bytes) })
@@ -341,7 +368,8 @@ describe('交互终端 输出回显', () => {
   it('被切成两块的汉字仍然完整 —— 这正是输出要按 base64 传的理由', async () => {
     withHost()
     setup()
-    await toTerminal()
+    await attached()
+    clearSurface()
 
     // 把「中」的三个字节拆成两块分别推：远端一次 write 的边界
     // 和字符边界毫无关系，真实场景里经常发生。
@@ -360,11 +388,12 @@ describe('交互终端 输出回显', () => {
     ]
     store.currentHostId = 'h1'
     setup()
-    await toTerminal()
+    await attached()
     await selectHost('h2')
 
     const h1 = instances[0]
     const h2 = instances[1]
+    clearSurface(1)
     rt.emit('term:data', { hostId: 'h2', data: bytesToBase64(new TextEncoder().encode('来自 h2')) })
     await nextTick()
 
@@ -372,10 +401,8 @@ describe('交互终端 输出回显', () => {
     expect(h1.text()).not.toContain('来自 h2')
   })
 
-  it('界面还没建好实例时到达的输出直接丢掉，不报错', async () => {
-    withHost()
-    setup()
-    // 还没进交互终端模式，没有任何落点
+  it('没有附着任何主机表面时到达的输出直接丢掉，不报错', async () => {
+    setup() // 没选主机 → 没有实例、没有落点
     rt.emit('term:data', { hostId: 'h1', data: bytesToBase64(new TextEncoder().encode('x')) })
     await nextTick()
 
@@ -385,11 +412,11 @@ describe('交互终端 输出回显', () => {
 
 // ---- 退出与关闭 ----
 
-describe('交互终端 退出与关闭', () => {
+describe('常驻终端表面 退出与关闭', () => {
   it('远端退出时显示原因并给出重新打开的入口', async () => {
     withHost()
     setup()
-    await toTerminal()
+    await attached()
 
     rt.emit('term:exit', { hostId: 'h1', reason: '远端 shell 已退出（退出码 0）' })
     await nextTick()
@@ -401,12 +428,12 @@ describe('交互终端 退出与关闭', () => {
   it('点「重新打开」会开一条新的，并换掉旧实例', async () => {
     withHost()
     setup()
-    await toTerminal()
+    await attached()
     const old = instances[0]
 
     rt.emit('term:exit', { hostId: 'h1', reason: '远端已断开连接' })
     await nextTick()
-    await wrapper.find('.iterm-status button').trigger('click')
+    await wrapper.find('.surface-status button').trigger('click')
     await flushPromises()
 
     expect(instances).toHaveLength(2)
@@ -418,9 +445,9 @@ describe('交互终端 退出与关闭', () => {
   it('自己点关闭会打后端并销毁本地实例', async () => {
     withHost()
     setup()
-    await toTerminal()
+    await attached()
 
-    await wrapper.find('.iterm-banner button').trigger('click')
+    await wrapper.find('.sess-banner button').trigger('click')
     await flushPromises()
 
     expect(callsOf('CloseTerminal').map(c => c.args[0])).toEqual(['h1'])
@@ -430,9 +457,9 @@ describe('交互终端 退出与关闭', () => {
   it('自己关掉的终端不再弹一条「已断开」', async () => {
     withHost()
     setup()
-    await toTerminal()
+    await attached()
 
-    await wrapper.find('.iterm-banner button').trigger('click')
+    await wrapper.find('.sess-banner button').trigger('click')
     await flushPromises()
 
     // 后端关闭会话后必然会推一次 term:exit，但那是「用户自己关的」，
@@ -446,7 +473,7 @@ describe('交互终端 退出与关闭', () => {
   it('打开失败时显示原因并给出重试', async () => {
     withHost()
     setup({ OpenTerminal: async () => { throw new Error('申请伪终端失败: 远端拒绝') } })
-    await toTerminal()
+    await attached()
 
     expect(wrapper.text()).toContain('申请伪终端失败')
     expect(wrapper.text()).toContain('重新打开')
@@ -455,15 +482,17 @@ describe('交互终端 退出与关闭', () => {
 
 // ---- 界面必须说清楚风险 ----
 
-describe('交互终端 风险提示', () => {
-  it('显眼处写明不经过策略引擎', async () => {
+describe('常驻终端表面 风险提示', () => {
+  it('显眼处写明终端内输入的分流与策略闸门', async () => {
     withHost()
     setup()
-    await toTerminal()
+    await attached()
 
-    const banner = wrapper.find('.iterm-banner')
+    const banner = wrapper.find('.sess-banner')
     expect(banner.exists()).toBe(true)
-    expect(banner.text()).toContain('不经过 LLM 与策略引擎')
+    // 输入已整体搬进终端：中文/? 交 LLM，shell 先过策略（高危需确认）。
+    expect(banner.text()).toContain('交给')
+    expect(banner.text()).toContain('先过策略')
     // 连到哪台机器也要写在旁边：终端一旦开起来就再没有别的提示符可看
     expect(banner.text()).toContain('root@10.0.0.1')
   })
@@ -497,5 +526,207 @@ describe('终端字节编解码', () => {
     expect(toBytes(base64ToBytes(textToBase64('echo 中文\r')))).toEqual(
       toBytes(new TextEncoder().encode('echo 中文\r'))
     )
+  })
+})
+
+// ---- 终端内直接输入（本地行编辑 + 回车分类）----
+
+describe('终端内直接输入自然语言', () => {
+  // 逐字符敲进终端，模拟用户在提示符下打字。
+  function type(inst, s) {
+    for (const ch of s) inst.emitData(ch)
+  }
+
+  it('中文回车 → 交给 Agent，不写进 PTY', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
+    type(inst, '磁盘满了怎么办')
+    inst.emitData('\r')
+    await flushPromises()
+    const asks = callsOf('Ask')
+    expect(asks.length).toBe(1)
+    expect(JSON.stringify(asks[0].args)).toContain('磁盘满了怎么办')
+    // 自然语言绝不该被当命令发给 shell。
+    expect(callsOf('WriteTerminal').length).toBe(0)
+    expect(callsOf('RunShellInTerminal').length).toBe(0)
+  })
+
+  it('shell 命令回车 → 走常驻终端通道（策略闸门）', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
+    type(inst, 'ls -la')
+    inst.emitData('\r')
+    await flushPromises()
+    const run = callsOf('RunShellInTerminal')
+    expect(run.length).toBe(1)
+    expect(run[0].args[0]).toBe('h1')
+    expect(run[0].args[2]).toBe('ls -la')
+    // 前端不自己往 PTY 写字节（放行后由后端写入）。
+    expect(callsOf('WriteTerminal').length).toBe(0)
+    expect(callsOf('Ask').length).toBe(0)
+  })
+
+  it('可打印字符本地回显，回车前擦除输入行（不双份、保留提示符）', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
+    inst.buffer.active.cursorX = 14 // 提示符占了 14 列
+    type(inst, 'ls')
+    expect(inst.text()).toBe('ls')
+    inst.emitData('\r')
+    // 回车用等宽空格覆盖本地回显（'ls'=2 列）再回起点，跨行折返也擦得净；
+    // 空格前后带 SGR 复位，避免继承远端残留的黑底画出一条黑带。
+    expect(inst.text()).toContain('\r\x1b[15G\x1b[0m  \x1b[0m\r\x1b[15G')
+    await flushPromises()
+  })
+
+  it('退格本地删一个字符', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
+    type(inst, 'lsx')
+    inst.emitData('\x7f') // 退格删掉 x
+    inst.emitData('\r')
+    await flushPromises()
+    const run = callsOf('RunShellInTerminal')
+    expect(run.length).toBe(1)
+    expect(run[0].args[2]).toBe('ls')
+    expect(inst.text()).toContain('\b \b')
+  })
+
+  it('全屏程序接管（备用屏幕）时原样透传，不抢键', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
+    inst.buffer.active.type = 'alternate' // 模拟进了 vim
+    inst.emitData('i')
+    await flushPromises()
+    const wt = callsOf('WriteTerminal')
+    expect(wt.length).toBe(1)
+    expect(wt[0].args[2]).toBe(textToBase64('i'))
+    expect(callsOf('Ask').length).toBe(0)
+    expect(callsOf('RunShellInTerminal').length).toBe(0)
+  })
+
+  it('procps top（不发备用屏幕）靠 term:tui 让路：q 原样透传', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
+    // top 走原地重绘，buffer 仍是 normal —— 只靠后端推来的 term:tui 识别。
+    rt.emit('term:tui', { hostId: 'h1', active: true })
+    await flushPromises()
+    inst.emitData('q')
+    await flushPromises()
+    const wt = callsOf('WriteTerminal')
+    expect(wt.length).toBe(1)
+    expect(wt[0].args[2]).toBe(textToBase64('q'))
+    expect(callsOf('Ask').length).toBe(0)
+    expect(callsOf('RunShellInTerminal').length).toBe(0)
+
+    // 退出 top 后恢复本地行编辑：可打印字符不再写 PTY。
+    rt.emit('term:tui', { hostId: 'h1', active: false })
+    await flushPromises()
+    inst.emitData('l')
+    await flushPromises()
+    expect(callsOf('WriteTerminal').length).toBe(1)
+  })
+
+  it('控制键（Tab）打断本地行编辑：缓冲连同该键交给 PTY', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
+    type(inst, 'ls')
+    inst.emitData('\t') // Tab：放弃本地编辑，透传给 shell 做补全
+    await flushPromises()
+    const wt = callsOf('WriteTerminal')
+    expect(wt.length).toBe(2)
+    expect(wt[0].args[2]).toBe(textToBase64('ls'))
+    expect(wt[1].args[2]).toBe(textToBase64('\t'))
+    // 本地缓冲已清空，后续回车不该再重复提交。
+    inst.emitData('\r')
+    await flushPromises()
+    expect(callsOf('RunShellInTerminal').length).toBe(0)
+  })
+
+  it('空回车只给 PTY 一个换行', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
+    inst.emitData('\r')
+    await flushPromises()
+    const wt = callsOf('WriteTerminal')
+    expect(wt.length).toBe(1)
+    expect(wt[0].args[2]).toBe(textToBase64('\n'))
+  })
+
+  it('多行粘贴逐行提交（onData 多字符逐字符回放）', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
+    inst.emitData('ls\rpwd\r') // 一次粘贴两行
+    await flushPromises()
+    const run = callsOf('RunShellInTerminal')
+    expect(run.map(c => c.args[2])).toEqual(['ls', 'pwd'])
+  })
+
+  it('连敲回车串行提交（不并发 runShellInTerminal）', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
+    inst.emitData('a\rb\r')
+    await flushPromises()
+    const run = callsOf('RunShellInTerminal')
+    expect(run.map(c => c.args[2])).toEqual(['a', 'b'])
+  })
+
+  it('本地编辑期间来外部输出 → flush 本地缓冲并降级透传', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
+    inst.emitData('l') // 本地缓冲 + 回显
+    // 后端推来一段输出（后台打印）：sink 发现正在本地编辑 → flush 'l' 给 PTY 并切透传。
+    rt.emit('term:data', { hostId: 'h1', data: textToBase64('X') })
+    await flushPromises()
+    inst.emitData('s') // 已降级：透传，不再本地缓冲
+    await flushPromises()
+    const wt = callsOf('WriteTerminal')
+    expect(wt.map(c => c.args[2])).toEqual([textToBase64('l'), textToBase64('s')])
+  })
+
+  it('中文按显示宽度（2 列）擦除', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
+    inst.emitData('中')
+    inst.emitData('\r')
+    // '中' 占 2 列 → 覆盖 2 个空格；startCol=0 → 定位第 1 列；同样带 SGR 复位。
+    expect(inst.text()).toContain('\r\x1b[1G\x1b[0m  \x1b[0m\r\x1b[1G')
+    await flushPromises()
   })
 })

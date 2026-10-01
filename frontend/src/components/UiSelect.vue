@@ -7,7 +7,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 // 靠近窗口底部时自动改为向上弹（如 composer 工具条里的模型选择）。
 const props = defineProps({
   modelValue: { type: [String, Number], default: '' },
-  options: { type: Array, default: () => [] }, // [{ value, label, disabled? }]
+  options: { type: Array, default: () => [] }, // [{ value, label, disabled?, badge?: { mark, color } }]
   disabled: Boolean,
   placeholder: { type: String, default: '' },
 })
@@ -17,10 +17,8 @@ const open = ref(false)
 const dropUp = ref(false)
 const root = ref(null)
 
-const current = computed(() => {
-  const hit = props.options.find(o => o.value === props.modelValue)
-  return hit ? hit.label : props.placeholder
-})
+const currentOpt = computed(() => props.options.find(o => o.value === props.modelValue) || null)
+const current = computed(() => (currentOpt.value ? currentOpt.value.label : props.placeholder))
 
 // toggle 时测量触发器到视口底部的剩余空间：装不下菜单（含 8px 余量）就向上弹。
 async function toggle() {
@@ -54,6 +52,11 @@ function onKeydown(e) {
   if (e.key === 'Escape') open.value = false
 }
 
+// 徽标样式：有 logo 时只给 color（SVG 用 currentColor），无 logo 时彩色圆 + 白字。
+function badgeStyle(b) {
+  return b.logo ? { color: b.color } : { background: b.color, color: '#fff' }
+}
+
 onMounted(() => {
   document.addEventListener('mousedown', onDocMousedown)
   document.addEventListener('keydown', onKeydown)
@@ -67,6 +70,13 @@ onBeforeUnmount(() => {
 <template>
   <div ref="root" class="uis" :class="{ open, dropup: dropUp, disabled: props.disabled }">
     <button type="button" class="uis-trigger" :disabled="props.disabled" @click="toggle">
+      <span
+        v-if="currentOpt && currentOpt.badge"
+        class="uis-badge"
+        :class="{ 'is-logo': !!currentOpt.badge.logo }"
+        :style="badgeStyle(currentOpt.badge)"
+        v-html="currentOpt.badge.logo || currentOpt.badge.mark"
+      ></span>
       <span class="uis-label" :title="current">{{ current }}</span>
       <svg class="uis-arrow" width="10" height="6" viewBox="0 0 10 6" aria-hidden="true">
         <path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.5"
@@ -82,7 +92,10 @@ onBeforeUnmount(() => {
         :aria-selected="opt.value === modelValue"
         :class="{ selected: opt.value === modelValue, disabled: opt.disabled }"
         @click="choose(opt)"
-      >{{ opt.label }}</li>
+      >
+        <span v-if="opt.badge" class="uis-badge" :class="{ 'is-logo': !!opt.badge.logo }" :style="badgeStyle(opt.badge)" v-html="opt.badge.logo || opt.badge.mark"></span>
+        <span class="uis-item-label">{{ opt.label }}</span>
+      </li>
     </ul>
   </div>
 </template>

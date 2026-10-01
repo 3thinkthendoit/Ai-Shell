@@ -122,7 +122,11 @@ var requiredMethods = []string{
 	// 保存/测试/切换/删除走下面这组；vault.SetLLM 仅剩内部与测试用途。
 	"TestLLM", "SaveLLMProfile", "TestLLMProfile",
 	"ActivateLLMProfile", "DeleteLLMProfile",
-	"SavePolicy", "Ask", "Approve", "Stop", "RunShell",
+	"SavePolicy", "Ask", "Approve", "Stop",
+	// 控制台单表面：composer 里的 shell 行走 RunShellInTerminal（写进常驻 PTY），
+	// ReportActiveSession 把「当前看着哪条会话」报给后端用于路由 PTY 定格快照。
+	// 旧的有界 RunShell 仅剩后端 agent 工具通道内部使用，前端不再直接调它。
+	"RunShellInTerminal", "ReportActiveSession",
 	"ClearSession", "CompactSession",
 	// 会话的增删改查。这四条一起构成「一台主机多条会话」的全部入口，
 	// 少任何一条，对应的界面操作就会静默失效（点了没反应）。

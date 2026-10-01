@@ -24,6 +24,10 @@ export class Terminal {
     this.openedIn = null
     this.dataHandlers = []
     this.resizeHandlers = []
+    // 真实 xterm 的缓冲区服务：type 区分主屏/备用屏（全屏程序接管），
+    // cursorX 是当前列。本地行编辑靠它做让路判定与擦除定位；
+    // 测试里直接改这两个字段就能模拟「进了 vim」或「提示符占了几列」。
+    this.buffer = { active: { type: 'normal', cursorX: 0, cursorY: 0 } }
     instances.push(this)
   }
 
@@ -41,6 +45,10 @@ export class Terminal {
     this.written.push(data)
   }
 
+  focus() {
+    this.focused = true
+  }
+
   onData(fn) {
     this.dataHandlers.push(fn)
     return { dispose() {} }
@@ -49,6 +57,10 @@ export class Terminal {
   onResize(fn) {
     this.resizeHandlers.push(fn)
     return { dispose() {} }
+  }
+
+  attachCustomKeyEventHandler(fn) {
+    this.customKeyHandler = fn
   }
 
   dispose() {

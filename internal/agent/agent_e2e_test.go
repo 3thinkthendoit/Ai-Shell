@@ -233,6 +233,9 @@ type harness struct {
 	approve  bool
 	answers  []string
 	deltas   []string
+	// toolResults 记录每次工具结果事件的载荷：前端靠其中的
+	// tty/command/hostId 把命令交接到常驻终端表面，缺了断言就只能肉眼看。
+	toolResults []map[string]any
 }
 
 // asMap 宽容地取出事件载荷里的字段。
@@ -329,6 +332,10 @@ func newHarness(t *testing.T, script []string, mode policy.Mode, autoApprove boo
 			if m, ok := asMap(payload); ok {
 				h.deltas = append(h.deltas, asString(m["text"]))
 			}
+		case EvToolResult:
+			if m, ok := asMap(payload); ok {
+				h.toolResults = append(h.toolResults, m)
+			}
 		}
 		auto := h.approve
 		var pending *ToolCallView
@@ -373,6 +380,16 @@ func (h *harness) lastAnswer() string {
 	return h.answers[len(h.answers)-1]
 }
 
+// lastToolResult 返回最后一条工具结果事件的载荷；没有则 nil。
+func (h *harness) lastToolResult() map[string]any {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.toolResults) == 0 {
+		return nil
+	}
+	return h.toolResults[len(h.toolResults)-1]
+}
+
 // ---- 测试 ----
 
 // 主流程：LLM 先列主机，再执行一条真实命令，最后给出结论。
@@ -398,6 +415,110 @@ func TestAgentEndToEndMainFlow(t *testing.T) {
 	}
 	if got := h.lastAnswer(); !strings.Contains(got, "负载正常") {
 		t.Fatalf("终局回答不符: %q", got)
+	}
+}
+
+// 命中 TTY 特征后，工具结果事件必须带上 tty/command/hostId：前端靠这三个字段
+// 把命令交接到常驻终端表面（写进那块常驻 PTY 给人看/操作，阿里云 Workbench 同款观感），
+// 缺任何一个，agent 模式下的交互式命令就只剩一条干巴巴的报错。
+func TestAgentToolResultCarriesTTYFieldsForInlineTerminal(t *testing.T) {
+	h := newHarness(t, []string{
+		respToolCall("c1", "run_command", `{"host_id":"h-test","command":"top"}`),
+		respContent("已改用快照方式取进程数据。"),
+	}, policy.ModeWhitelist, true)
+
+	if err := runDefault(h.ag, context.Background(), h.hostID, "看看进程"); err != nil {
+		t.Fatal(err)
+	}
+	tr := h.lastToolResult()
+	if tr == nil {
+		t.Fatal("应产生工具结果事件")
+	}
+	if tty, _ := tr["tty"].(bool); !tty {
+		t.Errorf("TTY 命中时 tty 应为 true，实得载荷: %v", tr)
+	}
+	if cmd, _ := tr["command"].(string); cmd != "top" {
+		t.Errorf("command 应是供常驻终端表面重跑的原命令，实得 %q", cmd)
+	}
+	if hid, _ := tr["hostId"].(string); hid != h.hostID {
+		t.Errorf("hostId 应是目标主机，实得 %q", hid)
+	}
+	// 给用户看的那份内容要同时说明「已交接到常驻终端」与「改用非交互方式」，
+	// 界面画面与模型认知才能对得上。
+	content, _ := tr["content"].(string)
+	for _, want := range []string{"常驻终端", "top -b -n 1"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("结果内容应包含 %q，实得 %q", want, content)
+		}
+	}
+}
+
+// 屏幕快照是瞬态上下文：入队后要以 system 消息进**下一次**请求，
+// 且只进一次 —— 第二轮请求里再出现，就说明它漏进了会话历史，
+// 旧屏幕会在此后每一轮阴魂不散。
+func TestTerminalSnapshotIsTransientContext(t *testing.T) {
+	h := newHarness(t, []string{
+		respContent("第一轮回答。"),
+		respContent("第二轮回答。"),
+	}, policy.ModeWhitelist, true)
+
+	h.ag.InjectTerminalSnapshot(h.hostID, "", "h-test#a1", "> load: 9.9", 1, nil, false)
+
+	if err := runDefault(h.ag, context.Background(), h.hostID, "屏幕上现在是什么"); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, m := range h.fake.messagesAt(0) {
+		if m.Role == "system" && strings.Contains(m.Content, "load: 9.9") {
+			found = true
+			if !strings.Contains(m.Content, "不可信") {
+				t.Errorf("快照应带不可信数据告诫，实得 %q", m.Content)
+			}
+			if !strings.Contains(m.Content, "已脱敏 1 处") {
+				t.Errorf("快照应带脱敏计数，实得 %q", m.Content)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("首轮请求应含屏幕快照 system 消息，实得 %v", h.fake.messagesAt(0))
+	}
+
+	if err := runDefault(h.ag, context.Background(), h.hostID, "然后呢"); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range h.fake.messagesAt(1) {
+		if strings.Contains(m.Content, "load: 9.9") {
+			t.Fatalf("快照是瞬态上下文，第二轮请求不该再出现：%.120q", m.Content)
+		}
+	}
+}
+
+// 定格帧（TUI 退出全屏/PTY 结束）与普通静止快照在头部说明上是两种
+// 语义：模型需要知道「这是结束时的画面」，而不是又一次过程观察。
+func TestTerminalFinalSnapshotHasDistinctHead(t *testing.T) {
+	h := newHarness(t, []string{
+		respContent("第一轮回答。"),
+	}, policy.ModeWhitelist, true)
+
+	h.ag.InjectTerminalSnapshot(h.hostID, "", "h-test#a1", "> load: 9.9", 0, nil, true)
+
+	if err := runDefault(h.ag, context.Background(), h.hostID, "top 退出了吗"); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, m := range h.fake.messagesAt(0) {
+		if m.Role == "system" && strings.Contains(m.Content, "load: 9.9") {
+			found = true
+			if !strings.Contains(m.Content, "结束画面") {
+				t.Errorf("定格帧的头部应写明「结束画面」，实得 %q", m.Content)
+			}
+			if strings.Contains(m.Content, "静止后的可见屏幕") {
+				t.Errorf("定格帧不该沿用静止快照的措辞，实得 %q", m.Content)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("首轮请求应含定格帧 system 消息，实得 %v", h.fake.messagesAt(0))
 	}
 }
 

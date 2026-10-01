@@ -85,11 +85,21 @@ window.go = {
       ListSessions, CreateSession, RenameSession, DeleteSession,
       SaveLLM: async () => {},
       Bootstrap: async () => ({ llm: store.llm }),
-      // 交互终端绑定：预览里不开真 PTY，点开模式时静默即可。
+      // 常驻终端绑定：预览里不开真 PTY，表面保持静态即可。
       OpenTerminal: async () => {},
       WriteTerminal: async () => {},
       ResizeTerminal: async () => {},
-      CloseTerminal: async () => true
+      CloseTerminal: async () => true,
+      // composer 里人敲的 shell 行走这条：策略闸门 + 写进常驻 PTY（无有界捕获）。
+      // 预览没有真 PTY，只回一个裁决，够验证 composer 分流与放行/拒绝注记渲染。
+      RunShellInTerminal: async (hostId, cmd) => {
+        if (/^\s*rm\s+-rf\b/.test(cmd)) {
+          return { status: 'denied', decision: 'deny', reason: '硬拒绝：递归强删', rule: 'deny_rm_rf', risk: 'high' }
+        }
+        return { status: 'done', decision: 'allow', reason: '', rule: 'auto_safe', risk: 'low' }
+      },
+      // 报告「当前看着哪条会话」，后端用它路由 PTY 定格快照。预览里静默即可。
+      ReportActiveSession: async () => {}
     }
   }
 }

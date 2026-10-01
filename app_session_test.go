@@ -93,6 +93,18 @@ func turnsOf(a *App, hostID, sessionID string) int {
 	return -1
 }
 
+// waitIdle 等这一轮对话的后台 goroutine 走完、running 归零。
+//
+// 为什么压缩/清空类用例需要它：CompactSession / ClearSession 会读 agent 的
+// running 标志做 busy 闸门（业务上「正跑着就不让压」），而 fill 是异步的 ——
+// 它返回时内容虽已落库，这一轮却可能还没走到 defer 把 running 置回 false
+// （见 fill 注释：「内容到位」与「running 归零」是两个异步点）。
+// 不等这一下，用例就会偶发撞上 busy=true、Compacted/Cleared 归零。
+func waitIdle(t *testing.T, a *App) {
+	t.Helper()
+	waitFor(t, "等这一轮跑完、running 归零", func() bool { return !a.ag.Running() })
+}
+
 // 一轮对话必须落进**指定的**那条会话。
 func TestAskBindingRoutesToTheGivenSession(t *testing.T) {
 	a := newSessionTestApp(t, newFakeLLM(t))
@@ -146,6 +158,9 @@ func TestClearSessionBindingOnlyClearsThatSession(t *testing.T) {
 	a := newSessionTestApp(t, newFakeLLM(t))
 	fill(t, a, "s1", "第一段")
 	fill(t, a, "s2", "第二段")
+	// 先让上一轮彻底结束：ClearSession 的 busy 闸门读 running，不等到归零
+	// 就可能偶发拿到 busy（见 waitIdle）。
+	waitIdle(t, a)
 
 	res := a.ClearSession("h1", "s1")
 	if res.Cleared != 1 || res.Busy {
@@ -165,6 +180,8 @@ func TestCompactSessionBindingOnlyCompactsThatSession(t *testing.T) {
 	a := newSessionTestApp(t, newFakeLLM(t))
 	fill(t, a, "s1", "第一段")
 	fill(t, a, "s2", "第二段")
+	// 同上：压缩是「花一次 API 调用」的操作，busy 闸门读 running，先等到归零。
+	waitIdle(t, a)
 
 	res, err := a.CompactSession("h1", "s1")
 	if err != nil {

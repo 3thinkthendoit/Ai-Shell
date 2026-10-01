@@ -632,3 +632,28 @@ func TestConcurrentExecAndDisconnect(t *testing.T) {
 		t.Fatalf("恢复后的结果异常: %q", res.Stdout)
 	}
 }
+
+// Exec 必须把 stdin 关死（发 EOF）：这个客户端永远不会给命令喂交互输入，
+// 那么读 stdin 的程序（无 TTY 的 vim 退化成 ex 模式等输入、裸 cat、
+// 要密码的 sudo）就该当场读到 EOF 报错退出，而不是挂满整个超时窗口。
+// 回归场景：用户跑 `vi x.txt`，等了整整 60 秒超时才看到 TTY 提示。
+func TestExecClosesStdinWithEOF(t *testing.T) {
+	srv := sshtest.Start(t)
+	v := newVault(t)
+	addPasswordHost(t, v, "heof", srv.Addr)
+	c := New(v)
+	t.Cleanup(c.Close)
+
+	start := time.Now()
+	res, err := c.Exec("heof", "hungry", 10*time.Second)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("hungry 应该读到 EOF 秒退，实得错误: %v", err)
+	}
+	if elapsed >= 10*time.Second {
+		t.Fatalf("命令是等到超时才结束的（%s）——stdin 没有发 EOF", elapsed)
+	}
+	if !strings.Contains(res.Stdout, "read 0 bytes") {
+		t.Errorf("远端应读到 0 字节（只发 EOF，不写内容），实得 %q", res.Stdout)
+	}
+}

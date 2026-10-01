@@ -1,4 +1,5 @@
 import { reactive } from 'vue'
+import * as paint from './termPaint'
 
 const api = () => window.go?.main?.App
 const rt = () => window.runtime
@@ -362,8 +363,21 @@ function liveAssistant(step) {
 const EV_NAMES = [
   'agent:delta', 'agent:message', 'agent:tool', 'agent:toolResult',
   'agent:injection', 'agent:approval', 'agent:status', 'agent:error',
-  'audit:error', 'agent:done', 'term:data', 'term:exit'
+  'audit:error', 'agent:done', 'term:data', 'term:exit', 'term:tui', 'agent:snapshot'
 ]
+
+// surfaceWrite 返回往某块终端表面（按 host+session 键）写字符串的落点（就是它
+// xterm 实例的 write）。没有实例（还没打开/已卸载）时返回 undefined —— termPaint 的
+// 每个函数都对 undefined 落点安全 no-op。
+function surfaceWrite(key) {
+  return termSinks.get(key)
+}
+
+// 事件该画到哪片表面：正在跑那一轮的任务（activeHost+activeSession），
+// 其次当前任务。与 targetKey 同源 —— 用户中途切任务也不会把输出画错地方。
+function paintHost() {
+  return targetKey()
+}
 
 export function bindEvents() {
   const r = rt()
@@ -373,31 +387,44 @@ export function bindEvents() {
 
   // 流式增量：逐字累加到「活」消息上
   r.EventsOn('agent:delta', d => {
+    const w = surfaceWrite(paintHost())
     const live = liveAssistant(d.step)
     if (live) {
       live.content += d.text
+      paint.paintAssistantDelta(w, d.text)
       return
     }
     push({ kind: 'assistant', content: d.text, stream: d.step, streaming: true })
+    paint.paintAssistantHeader(w)
+    paint.paintAssistantDelta(w, d.text)
   })
 
   r.EventsOn('agent:message', m => {
+    const w = surfaceWrite(paintHost())
     if (m.role !== 'assistant') {
       push({ kind: 'user', content: m.content })
+      paint.paintUser(w, m.content)
       return
     }
     const live = liveAssistant(m.step)
     if (live) {
       // 定稿：用后端给的完整内容覆盖一次，纠正任何在传输中丢掉的尾巴。
-      // 因为流式消息与定稿消息同源，正常情况下内容相同，覆盖是无害的。
+      // 表面上 delta 已经流式画过了，这里只补一个换行收尾，不重画全文。
       live.content = m.content
       live.streaming = false
+      paint.paintAssistantEnd(w)
       return
     }
     push({ kind: 'assistant', content: m.content })
+    paint.paintAssistantHeader(w)
+    paint.paintAssistantDelta(w, m.content)
+    paint.paintAssistantEnd(w)
   })
 
-  r.EventsOn('agent:tool', v => upsertTool(v))
+  r.EventsOn('agent:tool', v => {
+    upsertTool(v)
+    paint.paintTool(surfaceWrite(paintHost()), v)
+  })
 
   r.EventsOn('agent:toolResult', res => {
     push({
@@ -408,6 +435,16 @@ export function bindEvents() {
       redacted: res.redacted || 0,
       injection: res.injection || []
     })
+    // 双写：结果进归档时间线（上面 push）之外，也在终端表面上画一行退出码 +
+    // 截断输出，让人在同一片流里看到 agent 这条命令跑成了什么样。
+    const w = surfaceWrite(paintHost())
+    paint.paintToolResult(w, res)
+    // 命中 TTY 特征（top/vim 这类）：把命令**交接**到这条任务自己的常驻终端
+    // 表面执行 —— 与人亲手在键盘上敲同形，画面实时可见；模型看到的仍是命令
+    // 退出时定格的屏幕快照（见 agent:snapshot）。
+    if (res.tty && res.command && res.hostId) {
+      writeTerminal(res.hostId, res.sessionId, textToBase64(res.command + '\n'))
+    }
   })
 
   r.EventsOn('agent:injection', e => {
@@ -417,10 +454,13 @@ export function bindEvents() {
       command: e.command || '',
       hostName: e.hostName || ''
     })
+    paint.paintInjection(surfaceWrite(paintHost()), e)
   })
 
   r.EventsOn('agent:approval', v => {
     store.pending = v
+    // 审批条/弹窗是交互入口；表面上只补一行注记说明「为什么停住了」。
+    paint.paintApproval(surfaceWrite(paintHost()), v)
   })
 
   r.EventsOn('agent:status', s => {
@@ -433,6 +473,7 @@ export function bindEvents() {
     store.pending = null
     freezeStreams()
     push({ kind: 'error', content: e.message })
+    paint.paintError(surfaceWrite(paintHost()), e.message)
   })
 
   // 审计写入失败。这不是「本次任务失败」，而是「审计轨迹可能已不完整」，
@@ -452,7 +493,7 @@ export function bindEvents() {
   // 交互终端的输出。解成字节后直接交给 xterm ——
   // 让它的 UTF-8 解码器去处理跨块的续字节（这正是它存在的意义）。
   r.EventsOn('term:data', d => {
-    const sink = termSinks.get(d && d.hostId)
+    const sink = termSinks.get(bucketKey(d && d.hostId, d && d.sessionId))
     // 没有落点就直接丢掉：那是「界面还没建好实例」的那一小段，
     // 而终端只在用户真的打开它之后才会有输出。
     if (!sink) return
@@ -463,13 +504,40 @@ export function bindEvents() {
     }
   })
 
+  // 远端是否被全屏程序接管（vim/top/htop）。后端只在状态**变化**时发。
+  // 前端拿它给「终端内直接输入」让路：接管期间整体透传按键，绝不抢键。
+  r.EventsOn('term:tui', d => {
+    const st = termState(d && d.hostId, d && d.sessionId)
+    if (st) st.tuiActive = !!(d && d.active)
+  })
+
   r.EventsOn('term:exit', d => {
-    const st = store.terms[d && d.hostId]
+    const st = store.terms[bucketKey(d && d.hostId, d && d.sessionId)]
     // 只在「开着」的时候才认这条退出：用户自己点关闭时状态已经置回 idle，
     // 那一次退出不该再弹一条消息。
     if (!st || (st.status !== 'open' && st.status !== 'opening')) return
     st.status = 'closed'
     st.exitReason = (d && d.reason) || '终端已结束'
+  })
+
+  // 终端屏幕快照：模型看的那份净化后文本，原样落一条给人看 ——
+  // 人和模型看到同一份东西，审计才对得上。落点用后端给的
+  // hostId/sessionId 显式指定：快照属于开块那一轮，不属于「此刻在看」的会话。
+  r.EventsOn('agent:snapshot', d => {
+    push({
+      kind: 'snapshot',
+      termId: (d && d.termId) || '',
+      text: (d && d.text) || '',
+      redacted: (d && d.redacted) || 0,
+      injection: (d && d.injection) || [],
+      final: !!(d && d.final)
+    }, (d && d.hostId) || undefined, (d && d.sessionId) || undefined)
+    // 表面上只落一行注记，不重画那一帧：定格画面本来就在终端的 scrollback 里，
+    // 重画反而会打乱滚动位置。注记让人和审计对得上「这一屏已进模型上下文」。
+    // 落点按后端给的 hostId/sessionId 组合成表面键：快照属于开块那一轮的任务，
+    // 不属于「此刻在看」的会话；那塊表面已不在（切走已关）时 sink 为空，自然 no-op。
+    const snapKey = (d && d.hostId) ? bucketKey(d.hostId, d.sessionId) : paintHost()
+    paint.paintSnapshotNote(surfaceWrite(snapKey), !!(d && d.final))
   })
 }
 
@@ -577,6 +645,8 @@ export async function compactSession(hostId, sessionId) {
 // 与切主机的行为一致。禁掉反而多一个「为什么点不动」的解释负担。
 export function selectSession(sessionId) {
   store.currentSessionId = sessionId || ''
+  // 告诉后端「这台主机现在看着哪条会话」：之后常驻终端定格的快照要落到这条上。
+  reportActiveSession(store.currentHostId, store.currentSessionId)
 }
 
 // createSession 在当前主机下新建一条会话，并立刻切过去。
@@ -703,18 +773,46 @@ export async function stop() {
   }
 }
 
-// runShell：交互式会话里人敲的 shell 命令（经策略引擎，可能弹审批）。
-// 传用户原文 + cwd；包装与裁决都在后端完成。
-// busy 覆盖「等审批 + Exec」整段，避免用户连敲把后端打成并发。
-export async function runShell(hostId, command, cwd, timeoutSec) {
+// runShellInTerminal：composer 里人敲的 shell 命令，走**常驻终端**通道 ——
+// 策略闸门裁决（高危弹审批）后把这一行写进常驻 PTY，提示符回显、输出、
+// top/vim 接管全发生在同一片终端表面上，与人亲手在键盘上敲完全同形。
+//
+// 与已退役的 runShell（有界 Exec，输出喂 LLM）的差别：这里**不捕获**输出文本，
+// 模型看到的是命令结束时定格的屏幕快照（见 agent:snapshot）。
+// busy 覆盖「等审批 + 写入」整段，避免用户连敲把后端打成并发。
+export async function runShellInTerminal(hostId, sessionId, command) {
+  const key = bucketKey(hostId, sessionId)
   store.busy = true
   try {
-    return await api().RunShell(hostId, command, cwd || '~', timeoutSec || 60)
+    const res = await api().RunShellInTerminal(hostId, sessionId, command)
+    // 放行时 PTY 自己会回显命令与输出，无需多话；被拒/取消/出错才在表面上说明原因。
+    paint.paintShellVerdict(surfaceWrite(key), res)
+    return res
+  } catch (e) {
+    const msg = String(e && e.message ? e.message : e)
+    paint.paintError(surfaceWrite(key), msg)
+    push({ kind: 'error', content: '命令执行失败：' + msg })
+    return { status: 'error', error: msg }
   } finally {
     store.busy = false
     // 审批条由 agent:approval 挂上；命令结束后必须清掉，
     // 否则拒绝/超时返回后界面还挂着一张过期审批。
     store.pending = null
+  }
+}
+
+// reportActiveSession 告诉后端「这台主机现在正看着哪条会话」。
+//
+// 常驻终端的定格快照（TUI 命令结束、备用屏幕释放、PTY 退出）不带会话 ID，
+// 后端 per-host 记住这里报的值，用它给快照路由到正确的时间线 ——
+// 用户切了会话之后产生的快照，就该落进新的那条。
+// 失败静默：报不上去顶多让快照落到上一次报的会话，不该打断界面。
+export async function reportActiveSession(hostId, sessionId) {
+  if (!api() || !hostId) return
+  try {
+    await api().ReportActiveSession(hostId, sessionId || '')
+  } catch {
+    // 忽略：后端没就绪、或这台主机还没开终端时都会失败，这不是用户能处理的错误。
   }
 }
 
@@ -758,7 +856,7 @@ export function textToBase64(s) {
   return bytesToBase64(utf8.encode(s))
 }
 
-// termSinks 是「主机 → 往它的 xterm 实例里写字节」的登记表。
+// termSinks 是「终端表面（host+session 键）→ 往它的 xterm 实例里写字节」的登记表。
 //
 // 事件是后端推的，而 xterm 实例住在组件里，两者需要一个会合点。
 // 刻意**不放进 reactive**：它存的是函数，被 Vue 代理一遍没有任何意义，
@@ -767,25 +865,27 @@ const termSinks = new Map()
 
 // registerTermSink 由终端组件在**创建实例之后、调用 OpenTerminal 之前**登记。
 // 顺序不能反：远端 shell 一启动就会打印提示符，登记晚了那一段就落进虚空了。
-export function registerTermSink(hostId, fn) {
-  termSinks.set(hostId, fn)
+export function registerTermSink(hostId, sessionId, fn) {
+  termSinks.set(bucketKey(hostId, sessionId), fn)
 }
 
 // unregisterTermSink 只在当前登记的仍是自己时才删。
-// 同一台主机可能被重新挂载，晚挂上的那个不该被早先那次卸载顺手清掉。
-export function unregisterTermSink(hostId, fn) {
-  if (termSinks.get(hostId) === fn) termSinks.delete(hostId)
+// 同一块表面可能被重新挂载，晚挂上的那个不该被早先那次卸载顺手清掉。
+export function unregisterTermSink(hostId, sessionId, fn) {
+  const key = bucketKey(hostId, sessionId)
+  if (termSinks.get(key) === fn) termSinks.delete(key)
 }
 
-export function termState(hostId) {
-  if (!store.terms[hostId]) {
-    store.terms[hostId] = { status: 'idle', error: '', exitReason: '' }
+export function termState(hostId, sessionId) {
+  const key = bucketKey(hostId, sessionId)
+  if (!store.terms[key]) {
+    store.terms[key] = { status: 'idle', error: '', exitReason: '' }
   }
-  return store.terms[hostId]
+  return store.terms[key]
 }
 
-export async function openTerminal(hostId, cols, rows) {
-  const st = termState(hostId)
+export async function openTerminal(hostId, sessionId, cols, rows) {
+  const st = termState(hostId, sessionId)
   if (!api()) {
     st.status = 'error'
     st.error = '后端未就绪'
@@ -795,7 +895,7 @@ export async function openTerminal(hostId, cols, rows) {
   st.error = ''
   st.exitReason = ''
   try {
-    await api().OpenTerminal(hostId, cols || 80, rows || 24)
+    await api().OpenTerminal(hostId, sessionId, cols || 80, rows || 24)
     // 只在还停在 opening 时才改成 open：等待期间远端可能已经退出了，
     // 那一次 term:exit 把状态改成了 closed，这里再覆盖就把退出消息吞了。
     if (st.status === 'opening') st.status = 'open'
@@ -806,10 +906,10 @@ export async function openTerminal(hostId, cols, rows) {
   return st
 }
 
-export async function writeTerminal(hostId, dataB64) {
+export async function writeTerminal(hostId, sessionId, dataB64) {
   if (!api()) return
   try {
-    await api().WriteTerminal(hostId, dataB64)
+    await api().WriteTerminal(hostId, sessionId, dataB64)
   } catch (e) {
     const msg = String(e && e.message ? e.message : e)
     // 终端已经关掉时的写入失败是正常的（用户手快），不打扰用户；
@@ -820,22 +920,22 @@ export async function writeTerminal(hostId, dataB64) {
   }
 }
 
-export async function resizeTerminal(hostId, cols, rows) {
+export async function resizeTerminal(hostId, sessionId, cols, rows) {
   if (!api()) return
   try {
-    await api().ResizeTerminal(hostId, cols, rows)
+    await api().ResizeTerminal(hostId, sessionId, cols, rows)
   } catch {
     // 尺寸上报失败刻意不提示：它随每次布局变化都会重发，
     // 弹报错只会刷屏；后端在终端没开时本来就静默忽略。
   }
 }
 
-export async function closeTerminal(hostId) {
-  const st = store.terms[hostId]
+export async function closeTerminal(hostId, sessionId) {
+  const st = store.terms[bucketKey(hostId, sessionId)]
   let ok = false
   if (api()) {
     try {
-      ok = await api().CloseTerminal(hostId)
+      ok = await api().CloseTerminal(hostId, sessionId)
     } catch {
       ok = false
     }
@@ -849,3 +949,4 @@ export async function closeTerminal(hostId) {
   }
   return ok
 }
+

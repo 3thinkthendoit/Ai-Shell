@@ -105,11 +105,15 @@ type Client struct {
 	// 而那种用法在当前设计里不存在（agent 是串行的）。
 	running map[string]*runningCmd
 
-	// ptys 记录每台主机**当前开着的那条交互终端**（见 pty.go）。
+	// ptys 按 termID 记录**当前开着的交互终端**（见 pty.go）。
 	//
 	// 和 pool 分开管理，因为生命周期完全不同：pool 里的连接是短命的、
 	// 可以被 Exec 随手关掉，而终端要一直活着直到用户自己关。
 	// 每条终端自己独占一条连接，所以这里放的是终端对象而不是连接。
+	//
+	// termID 允许同一台主机上多条并存：交互终端用 hostID 当 termID
+	// （一台一条，反复打开复用）；时间线里的内联终端块各用自己的 ID
+	// （一块一条，不复用）。
 	ptys map[string]*PTY
 }
 
@@ -240,6 +244,17 @@ func (c *Client) Exec(hostID, cmd string, timeout time.Duration) (Result, error)
 	stderr.limit = MaxCaptureBytes
 	sess.Stdout = &stdout
 	sess.Stderr = &stderr
+
+	// stdin 立刻关死（只发一个 EOF）：这个客户端永远不给命令喂交互输入，
+	// 与其让 vim / cat / sudo 这类读 stdin 的程序挂到超时被杀，不如让它们
+	// 当场读到 EOF 报错退出 —— 秒级失败 + TTY 提示，而不是干等一分钟。
+	// 注意 WriteFile 不走这里：它自己管理 stdin（先写完内容再关）。
+	if stdin, perr := sess.StdinPipe(); perr != nil {
+		c.Disconnect(hostID)
+		return Result{}, fmt.Errorf("打开输入通道失败: %w", perr)
+	} else {
+		_ = stdin.Close()
+	}
 
 	start := time.Now()
 	if err := sess.Start(cmd); err != nil {

@@ -144,6 +144,24 @@ input::placeholder, textarea::placeholder { color: var(--text-3); }
 .uis.open .uis-trigger { border-color: var(--accent); }
 .uis.disabled .uis-trigger { opacity: 0.45; cursor: not-allowed; }
 .uis-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 厂商小徽标：彩色圆点 + 1~2 字标记，跟在文字前。 */
+.uis-badge {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  color: #fff;
+  letter-spacing: -0.5px;
+}
+/* logo 变体：去掉圆底，SVG 自身就是图形（颜色由 inline color 驱动）。 */
+.uis-badge.is-logo { background: none; border-radius: 0; letter-spacing: 0; }
+.uis-badge.is-logo svg { display: block; }
 .uis-arrow { flex-shrink: 0; color: var(--text-2); transition: transform 0.15s; }
 .uis.open .uis-arrow { transform: rotate(180deg); }
 .uis-menu {
@@ -168,14 +186,17 @@ input::placeholder, textarea::placeholder { color: var(--text-3); }
   bottom: calc(100% + 4px);
 }
 .uis-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   padding: 6px 10px;
   border-radius: 6px;
   font-size: 13px;
   cursor: pointer;
   overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
+.uis-item-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .uis-item:hover { background: var(--surface-2); }
 .uis-item.selected { color: var(--accent); font-weight: 600; }
 .uis-item.disabled { opacity: 0.45; cursor: not-allowed; }
@@ -213,3 +234,9 @@ pre {
 ::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 6px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* xterm.css 把 .xterm-viewport 背景硬编码成 #000，而主题背景只涂在
+   .xterm-scrollable-element（高=行数×行高，向下取整）上。视口比它高出的
+   那条缝隙就会露出纯黑横带（容器越高缝越宽）。终端主题背景与 --bg 在
+   亮/暗两套下取值完全相同，直接把视口背景覆盖成 --bg 即可隐去缝隙。 */
+div.xterm .xterm-viewport { background-color: var(--bg); }

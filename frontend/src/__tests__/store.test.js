@@ -4,15 +4,33 @@
 // (window.go / window.runtime)，然后驱动真实的事件流。
 // 目的：把「Go 发事件 -> JS 改状态 -> UI 据此渲染」这条链路里最容易出错的
 // 状态流转（审批条的生死、running 标志、并发发送）钉死。
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import {
   store, push, clearLog, clearSession, bootstrap, refreshHosts, refreshSessions, bindEvents,
-  ask, approve, stop, dismissAuditError, bucketKey
+  ask, approve, stop, dismissAuditError, bucketKey,
+  runShellInTerminal, reportActiveSession, selectSession,
+  registerTermSink, unregisterTermSink, textToBase64
 } from '../store.js'
 
 // 桶键由 bucketKey 生成，测试里不要手写 'h1\x00default' 这种字面量 ——
 // 分隔符哪天变了，手写的那些会静默指向一个空桶，断言就全成了摆设。
 const at = (hostId, sessionId) => bucketKey(hostId, sessionId)
+
+// termPaint 会在文字之间夹 ANSI SGR 转义（颜色/加粗/复位）。断言「人眼在终端上
+// 看到的文本」时先把这些转义去掉 —— 否则 '$ ls' 会被中间的 RESET 割成
+// '$ ' + 'ls'，toContain 就匹配不上了。
+const stripAnsi = s => s.replace(/\x1b\[[0-9;]*m/g, '')
+
+// 往某块终端表面（按 host+session 键）挂一个「捕获落点」：termPaint 写进来的字符串收进 got，
+// painted() 返回去掉 ANSI 后的可读文本。用完必须 unregisterTermSink 清掉 ——
+// termSinks 是模块级单例，漏清会串到下一个用例。
+// sessionId 默认取当前会话：与 paintHost()（agent 事件的落点）同源，两边键才对得上。
+function captureSink(hostId, sessionId = store.currentSessionId) {
+  const got = []
+  const fn = x => got.push(typeof x === 'string' ? x : new TextDecoder().decode(x))
+  registerTermSink(hostId, sessionId, fn)
+  return { hostId, sessionId, fn, painted: () => stripAnsi(got.join('')) }
+}
 
 // ---- 测试替身 ----
 
@@ -157,6 +175,57 @@ describe('bindEvents 事件接线', () => {
     const r = store.entries.find(e => e.kind === 'result')
     expect(r.redacted).toBe(3)
     expect(r.injection).toEqual(['忽略先前指令'])
+  })
+
+  it('agent:snapshot 落一条快照记录到归属会话的时间线', () => {
+    install({ runtime: rt, app: makeApp().app })
+    bindEvents()
+    rt.emit('agent:snapshot', {
+      hostId: 'h1', sessionId: 's1', termId: 'h1#a1',
+      text: '> load: 9.9', redacted: 2, injection: ['忽略先前指令']
+    })
+    const list = store.bySession[at('h1', 's1')] || []
+    expect(list).toHaveLength(1)
+    expect(list[0]).toMatchObject({ kind: 'snapshot', text: '> load: 9.9', redacted: 2 })
+    expect(list[0].injection).toEqual(['忽略先前指令'])
+    // 不能落进当前选中的会话：快照属于开块那一轮
+    expect(store.bySession[at('h1', '')] || []).toHaveLength(0)
+  })
+
+  it('agent:toolResult 命中 TTY 时交接到常驻终端（写进 PTY），不再 spawn 内联块', () => {
+    // WriteTerminal 必须在 impl 里：TTY 分支会调它把命令写进常驻 PTY。缺了它
+    // api().WriteTerminal 抛 TypeError，被 writeTerminal 兜住后会推一条 error 记录，
+    // 污染下面「只落一条 result」的断言。
+    const { app, calls } = makeApp({ WriteTerminal: async () => undefined })
+    install({ runtime: rt, app })
+    bindEvents()
+    // 模拟「跑到一半用户切走了」：交接必须仍归属发起那一轮的主机（h1），命令写进
+    // h1 的常驻 PTY、记录也落在 h1/s1 的时间线上，不串到用户切过去的 h2。
+    store.activeHostId = 'h1'
+    store.activeSessionId = 's1'
+    store.currentHostId = 'h2'
+    rt.emit('agent:toolResult', {
+      id: 'c1', exitCode: 1, content: 'TERM environment variable not set.',
+      tty: true, command: 'top', hostId: 'h1', sessionId: 's1'
+    })
+    // 归档时间线上只多一条 result —— 内联块已退役，不再有 'inline-term' 条目。
+    const list = store.bySession[at('h1', 's1')] || []
+    expect(list.map(e => e.kind)).toEqual(['result'])
+    // 命令被交接进 h1/s1 这条任务自己的常驻 PTY：与人亲手敲 'top' 回车同形（原文字节 + 换行）。
+    const writes = calls.filter(c => c.name === 'WriteTerminal')
+    expect(writes).toHaveLength(1)
+    expect(writes[0].args).toEqual(['h1', 's1', textToBase64('top\n')])
+    // 不能落进用户切过去的那条时间线
+    expect(store.bySession[at('h2', '')] || []).toHaveLength(0)
+  })
+
+  it('agent:toolResult 未命中 TTY 时只落 result，不做终端交接', () => {
+    install({ runtime: rt, app: makeApp().app })
+    bindEvents()
+    store.activeHostId = 'h1'
+    rt.emit('agent:toolResult', { id: 'c2', exitCode: 0, content: 'ok' })
+    const list = store.bySession[at('h1', '')] || []
+    expect(list.map(e => e.kind)).toEqual(['result'])
   })
 
   it('agent:injection 生成一条告警记录，缺字段时降级为空值而不是 undefined', () => {
@@ -774,5 +843,281 @@ describe('clearSession 清空会话上下文', () => {
     await clearSession('h2', '')
     expect(store.bySession[at('h2')].at(-1).content).toContain('已清空')
     expect(store.bySession[at('h-old')]).toBeUndefined()
+  })
+})
+
+// ---- 终端屏幕快照 ----
+
+// top/vim 这类 TUI 退出时，后端把定格的最后一帧净化成文本发上来（final=true），
+// 它既进归档时间线给人看，也进模型上下文 —— 人和模型看到同一份，审计才对得上。
+// 过程快照（final=false）是中途定格的画面，两者是同一种条目、不同标记。
+describe('终端屏幕快照', () => {
+  it('agent:snapshot 透传 final：定格帧与过程快照是两种时间线条目', () => {
+    install({ runtime: rt, app: makeApp().app })
+    bindEvents()
+    rt.emit('agent:snapshot', {
+      hostId: 'h1', sessionId: 's1', termId: 'h1#a1',
+      text: '> load: 9.9', redacted: 0, injection: [], final: true
+    })
+    rt.emit('agent:snapshot', {
+      hostId: 'h1', sessionId: 's1', termId: 'h1#a1',
+      text: '> load: 0.1', redacted: 0, injection: [], final: false
+    })
+    const list = store.bySession[at('h1', 's1')] || []
+    expect(list.map(e => e.final)).toEqual([true, false])
+  })
+
+  it('快照落到后端指定的 (主机, 会话)，不串到当前选中的会话', () => {
+    install({ runtime: rt, app: makeApp().app })
+    bindEvents()
+    store.currentHostId = 'h2'
+    rt.emit('agent:snapshot', { hostId: 'h1', sessionId: 's1', termId: 'h1#a1', text: '> load: 9.9' })
+    expect(store.bySession[at('h1', 's1')] || []).toHaveLength(1)
+    expect(store.bySession[at('h2', '')] || []).toHaveLength(0)
+  })
+
+  it('表面有落点时补一行「已进归档与模型上下文」的注记，但不重画那一帧', () => {
+    install({ runtime: rt, app: makeApp().app })
+    bindEvents()
+    const sink = captureSink('h1', 's1')
+    try {
+      rt.emit('agent:snapshot', { hostId: 'h1', sessionId: 's1', termId: 'h1#a1', text: '> load: 9.9', final: true })
+      // 注记说明这一屏的去向；帧内容本身不重画（它已经在 scrollback 里）。
+      expect(sink.painted()).toContain('终端结束画面已进归档与模型上下文')
+      expect(sink.painted()).not.toContain('> load: 9.9')
+    } finally {
+      unregisterTermSink('h1', 's1', sink.fn)
+    }
+  })
+})
+
+// ---- agent 事件双写到终端表面 ----
+
+// 单表面重构后，agent 的回复/工具/审批/错误既进 bySession（归档 + 模型视图），
+// 也由 termPaint 画到那台主机的常驻终端表面上 —— 人和模型看的是同一条流。
+// 这组测试钉住「双写」：每条事件既要落到正确的时间线，也要写进表面落点。
+describe('agent 事件双写到终端表面', () => {
+  let sink = null
+
+  // 把落点挂到 h1，并让 h1 成为当前主机：paintHost() = activeHostId || currentHostId，
+  // activeHostId 空时事件就画到 h1、记录也落进 at('h1','')，两边对齐。
+  function attach(hostId = 'h1') {
+    sink = captureSink(hostId)
+    store.currentHostId = hostId
+    return sink
+  }
+
+  beforeEach(() => {
+    // WriteTerminal 必须在：TTY 交接分支会调它，缺了会推一条 error 污染断言。
+    const { app } = makeApp({ WriteTerminal: async () => undefined })
+    install({ runtime: rt, app })
+    bindEvents()
+  })
+
+  afterEach(() => {
+    if (sink) unregisterTermSink(sink.hostId, sink.sessionId, sink.fn)
+    sink = null
+  })
+
+  it('assistant 回复既进归档时间线，也画到终端表面', () => {
+    attach('h1')
+    rt.emit('agent:message', { role: 'assistant', content: '磁盘充足' })
+
+    const msgs = store.entries.filter(e => e.kind === 'assistant')
+    expect(msgs).toHaveLength(1)
+    expect(msgs[0].content).toBe('磁盘充足')
+    // 表面上：角色抬头 + 正文
+    expect(sink.painted()).toContain('LLM ›')
+    expect(sink.painted()).toContain('磁盘充足')
+  })
+
+  it('用户那句话也画到表面（带「你 ›」抬头）', () => {
+    attach('h1')
+    rt.emit('agent:message', { role: 'user', content: 'nginx 挂了' })
+
+    expect(store.entries.map(e => e.kind)).toEqual(['user'])
+    expect(sink.painted()).toContain('你 ›')
+    expect(sink.painted()).toContain('nginx 挂了')
+  })
+
+  it('工具块画 `$ 命令`，同时 upsert 一条 tool 记录', () => {
+    attach('h1')
+    rt.emit('agent:tool', { id: 'c1', name: 'run_command', command: 'ls -l', status: 'running', decision: 'allow' })
+
+    expect(store.entries.filter(e => e.kind === 'tool')).toHaveLength(1)
+    expect(sink.painted()).toContain('$ ls -l')
+  })
+
+  it('工具结果画退出码与截断输出', () => {
+    attach('h1')
+    rt.emit('agent:toolResult', { id: 'c1', exitCode: 2, content: 'ls: /nope: No such file', hostId: 'h1' })
+
+    expect(store.entries.find(e => e.kind === 'result').exitCode).toBe(2)
+    expect(sink.painted()).toContain('退出码 2')
+    expect(sink.painted()).toContain('No such file')
+  })
+
+  it('审批与错误都画到表面：审批注记 + 错误行', () => {
+    attach('h1')
+    rt.emit('agent:approval', { id: 'a1', name: 'run_command', command: 'rm -rf /' })
+    expect(store.pending).toBeTruthy()
+    expect(sink.painted()).toContain('需要你的批准')
+    expect(sink.painted()).toContain('rm -rf /')
+
+    rt.emit('agent:error', { message: '连接超时' })
+    expect(sink.painted()).toContain('错误 ›')
+    expect(sink.painted()).toContain('连接超时')
+  })
+
+  it('TTY 结果画「已交接到这片终端表面」的注记，并把命令写进 PTY', () => {
+    attach('h1')
+    rt.emit('agent:toolResult', {
+      id: 'c1', exitCode: 1, content: 'TERM environment variable not set.',
+      tty: true, command: 'top', hostId: 'h1'
+    })
+    expect(sink.painted()).toContain('已交接到这片终端表面执行')
+  })
+
+  it('没有表面落点时事件仍进归档，且不抛异常', () => {
+    // 不 attach：termSinks 里没有 h1，surfaceWrite 返回 undefined，termPaint 全 no-op。
+    store.currentHostId = 'h1'
+    expect(() => rt.emit('agent:message', { role: 'assistant', content: '看不见的回复' })).not.toThrow()
+    expect(() => rt.emit('agent:tool', { id: 'c1', name: 'run_command', command: 'ls' })).not.toThrow()
+    expect(store.entries.filter(e => e.kind === 'assistant')).toHaveLength(1)
+  })
+
+  it('反登记落点后，事件不再画到那片表面（但仍进归档）', () => {
+    attach('h1')
+    unregisterTermSink('h1', sink.sessionId, sink.fn)
+    rt.emit('agent:message', { role: 'assistant', content: '反登记之后的回复' })
+    expect(sink.painted()).not.toContain('反登记之后的回复')
+    expect(store.entries.filter(e => e.kind === 'assistant')).toHaveLength(1)
+  })
+})
+
+// ---- 报告活动会话 ----
+
+// 常驻终端定格的快照不带会话 ID，后端 per-host 记住这里报的值，用它把快照路由到
+// 正确的时间线。用户切会话后产生的快照，就该落进新的那条。
+describe('reportActiveSession 报告活动会话', () => {
+  it('把主机与会话原样报给后端', async () => {
+    const { app, calls } = makeApp({ ReportActiveSession: async () => undefined })
+    install({ runtime: rt, app })
+    await reportActiveSession('h1', 's1')
+    expect(calls.filter(c => c.name === 'ReportActiveSession')).toHaveLength(1)
+    expect(calls[0].args).toEqual(['h1', 's1'])
+  })
+
+  it('会话 id 缺省时归一化成空串（空串=默认会话，与后端一致）', async () => {
+    const { app, calls } = makeApp({ ReportActiveSession: async () => undefined })
+    install({ runtime: rt, app })
+    await reportActiveSession('h1')
+    expect(calls[0].args).toEqual(['h1', ''])
+  })
+
+  it('没有主机 id 时不打后端（还没选主机就没有活动会话可报）', async () => {
+    const { app, calls } = makeApp({ ReportActiveSession: async () => undefined })
+    install({ runtime: rt, app })
+    await reportActiveSession('', 's1')
+    expect(calls.filter(c => c.name === 'ReportActiveSession')).toHaveLength(0)
+  })
+
+  it('后端抛异常时静默 resolves（报不上去不该打断界面）', async () => {
+    const { app } = makeApp({ ReportActiveSession: async () => { throw new Error('bridge down') } })
+    install({ runtime: rt, app })
+    await expect(reportActiveSession('h1', 's1')).resolves.toBeUndefined()
+  })
+
+  it('selectSession 切会话时顺带把新会话报给后端', () => {
+    const { app, calls } = makeApp({ ReportActiveSession: async () => undefined })
+    install({ runtime: rt, app })
+    store.currentHostId = 'h1'
+    selectSession('s2')
+    expect(store.currentSessionId).toBe('s2')
+    // selectSession 不 await reportActiveSession，但调用是同步发出的。
+    expect(calls.filter(c => c.name === 'ReportActiveSession')).toHaveLength(1)
+    expect(calls[0].args).toEqual(['h1', 's2'])
+  })
+})
+
+// ---- 常驻终端的 shell 通道 ----
+
+// composer 里人敲的 shell 行走这条通道：后端策略闸门裁决（高危弹审批）后把这一行
+// 写进常驻 PTY。放行时 PTY 自己回显，前端无需多话；被拒/取消/出错才在表面上说明。
+describe('runShellInTerminal 常驻终端 shell 通道', () => {
+  it('放行：把命令交给后端写进 PTY，返回结果并复位 busy', async () => {
+    const { app, calls } = makeApp({ RunShellInTerminal: async () => ({ status: 'done' }) })
+    install({ runtime: rt, app })
+    store.currentHostId = 'h1'
+    store.busy = true
+    const res = await runShellInTerminal('h1', 's1', 'ls -la')
+    expect(calls.filter(c => c.name === 'RunShellInTerminal')).toHaveLength(1)
+    expect(calls[0].args).toEqual(['h1', 's1', 'ls -la'])
+    expect(res.status).toBe('done')
+    expect(store.busy).toBe(false)
+  })
+
+  it('放行时不在表面上多画（PTY 的命令回显与输出就是全部）', async () => {
+    const { app } = makeApp({ RunShellInTerminal: async () => ({ status: 'done' }) })
+    install({ runtime: rt, app })
+    const sink = captureSink('h1', 's1')
+    store.currentHostId = 'h1'
+    try {
+      await runShellInTerminal('h1', 's1', 'ls -la')
+      expect(sink.painted()).toBe('')
+    } finally {
+      unregisterTermSink('h1', 's1', sink.fn)
+    }
+  })
+
+  it('被策略拒绝：在表面上说明原因，并清掉可能挂着的过期审批条', async () => {
+    const { app } = makeApp({ RunShellInTerminal: async () => ({ status: 'denied', reason: 'rm -rf 属于高危命令' }) })
+    install({ runtime: rt, app })
+    const sink = captureSink('h1', 's1')
+    store.currentHostId = 'h1'
+    store.pending = { id: 'a1' }
+    try {
+      const res = await runShellInTerminal('h1', 's1', 'rm -rf /')
+      expect(res.status).toBe('denied')
+      expect(sink.painted()).toContain('命令被策略拒绝')
+      expect(sink.painted()).toContain('rm -rf 属于高危命令')
+      expect(store.pending).toBe(null)
+      expect(store.busy).toBe(false)
+    } finally {
+      unregisterTermSink('h1', 's1', sink.fn)
+    }
+  })
+
+  it('审批超时/被中断（cancelled）也在表面上说明', async () => {
+    const { app } = makeApp({ RunShellInTerminal: async () => ({ status: 'cancelled' }) })
+    install({ runtime: rt, app })
+    const sink = captureSink('h1', 's1')
+    store.currentHostId = 'h1'
+    try {
+      const res = await runShellInTerminal('h1', 's1', 'systemctl restart nginx')
+      expect(res.status).toBe('cancelled')
+      expect(sink.painted()).toContain('审批超时或被中断')
+    } finally {
+      unregisterTermSink('h1', 's1', sink.fn)
+    }
+  })
+
+  it('后端抛异常：落一条错误记录、画到表面并复位 busy', async () => {
+    const { app } = makeApp({ RunShellInTerminal: async () => { throw new Error('bridge down') } })
+    install({ runtime: rt, app })
+    const sink = captureSink('h1', 's1')
+    store.currentHostId = 'h1'
+    store.busy = true
+    try {
+      const res = await runShellInTerminal('h1', 's1', 'ls')
+      expect(res.status).toBe('error')
+      expect(res.error).toContain('bridge down')
+      expect(store.busy).toBe(false)
+      // 错误既进归档时间线，也画到表面
+      expect(store.entries.find(e => e.kind === 'error').content).toContain('bridge down')
+      expect(sink.painted()).toContain('bridge down')
+    } finally {
+      unregisterTermSink('h1', 's1', sink.fn)
+    }
   })
 })

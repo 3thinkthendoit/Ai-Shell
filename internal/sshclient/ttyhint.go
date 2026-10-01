@@ -15,6 +15,8 @@ var ttySignatures = []string{
 	"not a tty",                                 // 通用写法
 	"must be a tty",                             // 通用写法
 	"inappropriate ioctl for device",            // tcgetattr/ioctl 失败
+	"output is not to a terminal",               // vim 在无 tty 时的警告（伴随非零退出）
+	"input is not from a terminal",              // vim 同上
 	"terminal is required to read the password", // sudo
 	"a tty is required",
 }

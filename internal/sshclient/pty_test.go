@@ -76,6 +76,10 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("等待超时：%s", what)
 }
 
+// testPTYKey 是测试里常用的一个注册表键（App 侧组合 host+session，这里是
+// 不透明字符串）。开/关/查都用同一个键才能命中同一条终端。
+const testPTYKey = "h1\x1fmain"
+
 // openTestPTY 起一个测试服务器并在 h1 上开一条终端。
 func openTestPTY(t *testing.T, term string, size TerminalSize) (*Client, *sshtest.Server, *PTY, *ptySink) {
 	t.Helper()
@@ -86,7 +90,7 @@ func openTestPTY(t *testing.T, term string, size TerminalSize) (*Client, *sshtes
 	t.Cleanup(c.Close)
 
 	sink := &ptySink{}
-	p, err := c.OpenPTY("h1", term, size, sink.write, sink.exit)
+	p, err := c.OpenPTY("h1", testPTYKey, term, size, sink.write, sink.exit)
 	if err != nil {
 		t.Fatalf("打开交互终端失败: %v", err)
 	}
@@ -147,7 +151,7 @@ func TestPTYForwardsKeystrokesAndStreamsOutput(t *testing.T) {
 		t.Fatalf("写入按键失败: %v", err)
 	}
 	waitFor(t, "收到命令执行结果", func() bool {
-		return strings.Contains(sink.output(), "got:echo hi")
+		return strings.Contains(sink.output(), "hi")
 	})
 }
 
@@ -228,7 +232,7 @@ func TestOpenPTYReusesLiveTerminal(t *testing.T) {
 		return strings.Contains(sink.output(), "sh$ ")
 	})
 
-	again, err := c.OpenPTY("h1", "", TerminalSize{}, sink.write, sink.exit)
+	again, err := c.OpenPTY("h1", testPTYKey, "", TerminalSize{}, sink.write, sink.exit)
 	if err != nil {
 		t.Fatalf("再次打开应成功: %v", err)
 	}
@@ -263,7 +267,7 @@ func TestExecFailureDoesNotKillOpenTerminal(t *testing.T) {
 		t.Fatalf("超时之后终端应仍可写入: %v", err)
 	}
 	waitFor(t, "终端在无关命令超时后仍能收到回显", func() bool {
-		return strings.Contains(sink.output(), "got:echo alive")
+		return strings.Contains(sink.output(), "alive")
 	})
 }
 
@@ -271,14 +275,96 @@ func TestExecFailureDoesNotKillOpenTerminal(t *testing.T) {
 func TestClosePTYRemovesFromRegistry(t *testing.T) {
 	c, _, _, _ := openTestPTY(t, "", TerminalSize{})
 
-	if !c.ClosePTY("h1") {
+	if !c.ClosePTY(testPTYKey) {
 		t.Error("关闭一条已开的终端应返回 true")
 	}
-	if c.ClosePTY("h1") {
+	if c.ClosePTY(testPTYKey) {
 		t.Error("再关一次应返回 false")
 	}
 	if n := c.PTYCount(); n != 0 {
 		t.Errorf("关掉之后不该还剩终端，实得 %d", n)
+	}
+}
+
+// 不同 key（不同任务）在同一主机上各开一条独立连接，互不复用。
+func TestOpenPTYDifferentKeyIsSeparatePTY(t *testing.T) {
+	srv := sshtest.Start(t)
+	v := newVault(t)
+	addPasswordHost(t, v, "h1", srv.Addr)
+	c := New(v)
+	t.Cleanup(c.Close)
+
+	sinkA := &ptySink{}
+	a, err := c.OpenPTY("h1", "h1\x1fA", "", TerminalSize{}, sinkA.write, sinkA.exit)
+	if err != nil {
+		t.Fatalf("开任务 A 终端失败: %v", err)
+	}
+	sinkB := &ptySink{}
+	b, err := c.OpenPTY("h1", "h1\x1fB", "", TerminalSize{}, sinkB.write, sinkB.exit)
+	if err != nil {
+		t.Fatalf("开任务 B 终端失败: %v", err)
+	}
+	if a == b {
+		t.Error("不同 key 应各开一条，而不是复用同一条")
+	}
+	if n := c.PTYCount(); n != 2 {
+		t.Errorf("同主机两个任务应各有 1 条（共 2 条），实得 %d", n)
+	}
+}
+
+// CloseHostPTYsExcept 落实「只留当前任务」：关掉同主机除目标外的其它终端。
+func TestCloseHostPTYsExceptKeepsOne(t *testing.T) {
+	srv := sshtest.Start(t)
+	v := newVault(t)
+	addPasswordHost(t, v, "h1", srv.Addr)
+	addPasswordHost(t, v, "h2", srv.Addr)
+	c := New(v)
+	t.Cleanup(c.Close)
+
+	keepSink := &ptySink{}
+	keep, err := c.OpenPTY("h1", "h1\x1fkeep", "", TerminalSize{}, keepSink.write, keepSink.exit)
+	if err != nil {
+		t.Fatalf("开 keep 终端失败: %v", err)
+	}
+	var victims []*PTY
+	for _, s := range []string{"old1", "old2"} {
+		P, err := c.OpenPTY("h1", "h1\x1f"+s, "", TerminalSize{}, nil, nil)
+		if err != nil {
+			t.Fatalf("开 victim %s 失败: %v", s, err)
+		}
+		victims = append(victims, P)
+	}
+	// 另一台主机的一条，不应被误关。
+	otherSink := &ptySink{}
+	other, err := c.OpenPTY("h2", "h2\x1fkeep", "", TerminalSize{}, otherSink.write, otherSink.exit)
+	if err != nil {
+		t.Fatalf("开 h2 终端失败: %v", err)
+	}
+
+	closed := c.CloseHostPTYsExcept("h1", "h1\x1fkeep")
+	if len(closed) != 2 {
+		t.Errorf("应关掉 h1 下除 keep 外的 2 条，实得 %d 条：%v", len(closed), closed)
+	}
+	for _, p := range victims {
+		if p.alive() {
+			t.Error("被选中的 victim 终端应已关闭")
+		}
+	}
+	if !keep.alive() {
+		t.Error("keep 终端不该被关")
+	}
+	if !other.alive() {
+		t.Error("另一台主机的终端不该被误关")
+	}
+	// 注册表里 h1 只剩 keep，h2 那条仍在。
+	if c.PTY("h1\x1fold1") != nil || c.PTY("h1\x1fold2") != nil {
+		t.Error("被关的终端应从注册表移除")
+	}
+	if c.PTY("h1\x1fkeep") != keep {
+		t.Error("keep 应仍在注册表")
+	}
+	if c.PTY("h2\x1fkeep") != other {
+		t.Error("h2 那条应仍在注册表")
 	}
 }
 
@@ -293,12 +379,12 @@ func TestOpenPTYEnforcesTotalCap(t *testing.T) {
 	t.Cleanup(c.Close)
 
 	for i := 0; i < MaxPTYTotal; i++ {
-		if _, err := c.OpenPTY(fmt.Sprintf("cap-%d", i), "", TerminalSize{}, nil, nil); err != nil {
+		if _, err := c.OpenPTY(fmt.Sprintf("cap-%d", i), fmt.Sprintf("cap-%d", i)+"|k", "", TerminalSize{}, nil, nil); err != nil {
 			t.Fatalf("第 %d 条终端应能打开: %v", i+1, err)
 		}
 	}
 
-	_, err := c.OpenPTY(fmt.Sprintf("cap-%d", MaxPTYTotal), "", TerminalSize{}, nil, nil)
+	_, err := c.OpenPTY(fmt.Sprintf("cap-%d", MaxPTYTotal), fmt.Sprintf("cap-%d", MaxPTYTotal)+"|k", "", TerminalSize{}, nil, nil)
 	if err == nil {
 		t.Fatal("超过上限应报错，而不是无限开连接")
 	}
@@ -312,7 +398,7 @@ func TestOpenPTYUnknownHostFails(t *testing.T) {
 	c := New(v)
 	t.Cleanup(c.Close)
 
-	if _, err := c.OpenPTY("nope", "", TerminalSize{}, nil, nil); err == nil {
+	if _, err := c.OpenPTY("nope", "nope|k", "", TerminalSize{}, nil, nil); err == nil {
 		t.Fatal("主机不存在时应当报错")
 	}
 }
@@ -350,11 +436,88 @@ func TestPTYDataChunksAreIndependentCopies(t *testing.T) {
 		t.Fatalf("写入失败: %v", err)
 	}
 	waitFor(t, "收到完整回显", func() bool {
-		return strings.Contains(sink.output(), "got:echo "+long)
+		return strings.Contains(sink.output(), long)
 	})
 
 	// 再确认一次内容没有被后续数据污染。
 	if !bytes.Contains([]byte(sink.output()), []byte(long)) {
 		t.Error("回显内容不完整，可能是数据块被复用后覆盖了")
+	}
+}
+
+// 常驻终端的核心管道：OpenPTY 开出来的 PTY，把命令敲进去，
+// 远端 shell 执行、输出原样流回 onData —— 这条链断了的话，
+// 控制台就是一个「打开了但什么都没有」的黑盒子。
+// 同一主机反复打开必须复用同一条（否则切会话/重挂载一次就多一条 SSH 连接，
+// 用户已经 cd 过去的目录、跑着的进程全丢）。
+func TestOpenPTYRunsCommandAndStreamsOutputBack(t *testing.T) {
+	srv := sshtest.Start(t)
+	v := newVault(t)
+	addPasswordHost(t, v, "h1", srv.Addr)
+	c := New(v)
+	t.Cleanup(c.Close)
+
+	sink := &ptySink{}
+	p, err := c.OpenPTY("h1", "h1\x1fmain", "xterm-256color", TerminalSize{Cols: 100, Rows: 30}, sink.write, sink.exit)
+	if err != nil {
+		t.Fatalf("打开常驻终端失败: %v", err)
+	}
+
+	// 等提示符先到：不等就写命令，两种输出可能交错（虽然字节都不会丢）。
+	waitFor(t, "收到启动提示符", func() bool {
+		return strings.Contains(sink.output(), "sh$ ")
+	})
+
+	if err := p.Write([]byte("echo hello\n")); err != nil {
+		t.Fatalf("发送命令失败: %v", err)
+	}
+	waitFor(t, "命令被执行且输出流回", func() bool {
+		return strings.Contains(sink.output(), "hello")
+	})
+
+	// 同一 key 再次打开：必须拿到同一条，而不是新开一条。
+	sink2 := &ptySink{}
+	p2, err := c.OpenPTY("h1", "h1\x1fmain", "xterm-256color", TerminalSize{Cols: 100, Rows: 30}, sink2.write, sink2.exit)
+	if err != nil {
+		t.Fatalf("再次打开失败: %v", err)
+	}
+	if p2 != p {
+		t.Error("同主机重复打开应复用同一条 PTY")
+	}
+	if n := c.PTYCount(); n != 1 {
+		t.Errorf("复用后应只有 1 条终端，实得 %d", n)
+	}
+}
+
+// 命令退出（假 shell 收到 exit）时 onExit 恰好触发一次，PTY 标记为结束、
+// Done 关闭 —— 常驻终端的「PTY 退出→定格最后一帧」链路全靠这个信号。
+func TestOpenPTYShellExitFiresOnExit(t *testing.T) {
+	srv := sshtest.Start(t)
+	v := newVault(t)
+	addPasswordHost(t, v, "h1", srv.Addr)
+	c := New(v)
+	t.Cleanup(c.Close)
+
+	sink := &ptySink{}
+	p, err := c.OpenPTY("h1", "h1\x1fmain", "xterm-256color", TerminalSize{Cols: 80, Rows: 24}, sink.write, sink.exit)
+	if err != nil {
+		t.Fatalf("打开常驻终端失败: %v", err)
+	}
+	waitFor(t, "收到启动提示符", func() bool {
+		return strings.Contains(sink.output(), "sh$ ")
+	})
+	if sink.exitCount() != 0 {
+		t.Fatal("shell 还在跑，不该有退出回调")
+	}
+
+	if err := p.Write([]byte("exit\n")); err != nil {
+		t.Fatalf("写 exit 失败: %v", err)
+	}
+	waitFor(t, "shell 退出触发 onExit", func() bool { return sink.exitCount() == 1 })
+	waitFor(t, "PTY 标记为结束", func() bool { return !p.alive() })
+	select {
+	case <-p.Done():
+	default:
+		t.Fatal("Done 应已关闭")
 	}
 }

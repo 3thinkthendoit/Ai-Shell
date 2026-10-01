@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -336,6 +337,136 @@ func (a *App) RunShell(hostID, command, cwd string, timeoutSec int) ShellResult 
 	base.Hint = hint
 	base.Truncated = res.Truncated
 	if err != nil {
+		base.Status = "error"
+		base.Error = err.Error()
+		return base
+	}
+	base.Status = "done"
+	return base
+}
+
+// RunShellInTerminal 把一条人敲的 shell 命令送进常驻终端执行：裁决仍走
+// 策略引擎（高危需确认），但执行路径改成把这一行写进常驻 PTY ——
+// 提示符回显、输出、top/vim 接管全发生在同一块表面上，与人亲手
+// 在键盘上敲完全同形。与 RunShell 的差别是没有有界捕获：输出属于
+// 终端流，模型看到的是命令退出时定格的最后一帧（见 OpenTerminal 的 VT 管线）。
+//
+// 不做存在性探测：命令不存在时 shell 自己会报 command not found，
+// 那比后端代猜一句「远端未找到」更自然，也少一次往返。
+func (a *App) RunShellInTerminal(hostID, sessionID, command string) ShellResult {
+	if err := a.ready(); err != nil {
+		return ShellResult{Status: "error", Error: err.Error()}
+	}
+	cmd := strings.TrimSpace(command)
+	if cmd == "" {
+		return ShellResult{Status: "error", Error: "命令为空"}
+	}
+	if strings.TrimSpace(hostID) == "" {
+		return ShellResult{Status: "error", Error: "请先选择一台主机"}
+	}
+
+	verdict := policy.EvaluateHuman(cmd)
+	base := ShellResult{
+		Decision: string(verdict.Decision),
+		Reason:   verdict.Reason,
+		Rule:     verdict.Rule,
+		Risk:     policy.Risk(cmd),
+	}
+
+	if verdict.Decision == policy.Deny {
+		a.auditLog(audit.Entry{
+			Kind:     audit.KindDirect,
+			HostID:   hostID,
+			HostName: hostNameOf(a.v, hostID),
+			Command:  cmd,
+			Decision: string(verdict.Decision),
+			Rule:     verdict.Rule,
+			Note:     "人工 shell 硬拒绝（常驻终端）：" + verdict.Reason,
+		})
+		base.Status = "denied"
+		return base
+	}
+
+	if verdict.Decision == policy.Confirm {
+		id := newShellID()
+		ch := a.shell.register(id)
+		a.emit(agent.EvApproval, agent.ToolCallView{
+			ID:       id,
+			Name:     "shell",
+			HostID:   hostID,
+			HostName: hostNameOf(a.v, hostID),
+			Command:  cmd,
+			Decision: verdict.Decision,
+			Reason:   verdict.Reason,
+			Rule:     verdict.Rule,
+			Risk:     base.Risk,
+			Status:   "pending",
+		})
+
+		var done <-chan struct{}
+		if a.ctx != nil {
+			done = a.ctx.Done()
+		}
+		approved, cancelled := a.shell.wait(id, ch, done)
+		if cancelled {
+			a.auditLog(audit.Entry{
+				Kind:     audit.KindDirect,
+				HostID:   hostID,
+				HostName: hostNameOf(a.v, hostID),
+				Command:  cmd,
+				Decision: string(verdict.Decision),
+				Rule:     verdict.Rule,
+				Note:     "人工 shell 审批超时或已中断（常驻终端）",
+			})
+			base.Status = "cancelled"
+			base.Error = "审批超时或已中断"
+			return base
+		}
+		if !approved {
+			denied := false
+			a.auditLog(audit.Entry{
+				Kind:     audit.KindDirect,
+				HostID:   hostID,
+				HostName: hostNameOf(a.v, hostID),
+				Command:  cmd,
+				Decision: string(verdict.Decision),
+				Rule:     verdict.Rule,
+				Approved: &denied,
+				Note:     "用户拒绝执行人工 shell 命令（常驻终端）",
+			})
+			base.Status = "denied"
+			base.Reason = "用户拒绝执行"
+			return base
+		}
+		ok := true
+		a.auditLog(audit.Entry{
+			Kind:     audit.KindDirect,
+			HostID:   hostID,
+			HostName: hostNameOf(a.v, hostID),
+			Command:  cmd,
+			Decision: string(verdict.Decision),
+			Rule:     verdict.Rule,
+			Approved: &ok,
+			Note:     "用户批准执行人工 shell 命令（常驻终端）",
+		})
+	}
+
+	p := a.ssh.PTY(termKey(hostID, sessionID))
+	if p == nil {
+		base.Status = "error"
+		base.Error = "常驻终端没有打开"
+		return base
+	}
+	a.auditLog(audit.Entry{
+		Kind:     audit.KindDirect,
+		HostID:   hostID,
+		HostName: hostNameOf(a.v, hostID),
+		Command:  cmd,
+		Decision: string(verdict.Decision),
+		Rule:     verdict.Rule,
+		Note:     "人工 shell 在常驻终端执行（经策略引擎）",
+	})
+	if err := p.Write([]byte(cmd + "\n")); err != nil && !errors.Is(err, sshclient.ErrPTYClosed) {
 		base.Status = "error"
 		base.Error = err.Error()
 		return base

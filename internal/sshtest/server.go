@@ -364,8 +364,9 @@ func readUint32(p []byte) (uint32, []byte, bool) {
 //     被前端漏掉的一段输出）；
 //  2. 把收到的字节原样回显 —— 真终端下这一步由远端的行规程完成，
 //     这里没有真 pty，只能自己来；
-//  3. 收到回车就回一行 `got:<这一行>`，让测试知道按键真的到达了远端；
-//     收到 `exit` 就正常退出，用于验证退出路径。
+//  3. 收到回车就把这一行交给 RunCommand 真执行，并在前后包上
+//     OSC 133 命令边界标记（C=开始、D;code=结束），与客户端给真 shell
+//     注入的 init 片段同一套序列；收到 `exit` 就正常退出，用于验证退出路径。
 func fakeShell(ch ssh.Channel) int {
 	const prompt = "sh$ "
 	_, _ = io.WriteString(ch, prompt)
@@ -378,11 +379,22 @@ func fakeShell(ch ssh.Channel) int {
 			switch b {
 			case '\r', '\n':
 				_, _ = io.WriteString(ch, "\r\n")
-				if strings.TrimSpace(string(line)) == "exit" {
+				cmd := strings.TrimSpace(string(line))
+				line = line[:0]
+				if cmd == "exit" {
 					return 0
 				}
-				_, _ = fmt.Fprintf(ch, "got:%s\r\n%s", line, prompt)
-				line = line[:0]
+				if cmd == "" {
+					_, _ = io.WriteString(ch, prompt)
+					continue
+				}
+				// shell integration 标记：命令边界靠 OSC 133 报给客户端的
+				// VT 模型（C=开始，D;code=结束），与真 shell 注入的
+				// init 片段同一套序列；「命令结束且全屏重绘过→定格
+				// 最后一帧」的链路要靠它端到端验证。
+				_, _ = io.WriteString(ch, "\x1b]133;C\x07")
+				code := RunCommand(cmd, ch, nil)
+				_, _ = fmt.Fprintf(ch, "\x1b]133;D;%d\x07%s", code, prompt)
 			default:
 				line = append(line, b)
 				_, _ = ch.Write([]byte{b})
@@ -603,6 +615,13 @@ func RunCommand(cmd string, ch ssh.Channel, srv *Server) int {
 	c = stripCdPrefix(c)
 
 	switch {
+	// 客户端 OpenTerminal 注入的 shell integration 行（stty 三写 + 单行片段）。
+	// 假远端接受但忽略：133 标记由 fakeShell 自己发，这里若报 unknown
+	// 会污染输出并让注入行带上 133;D;127 的假命令边界。
+	case strings.HasPrefix(c, "stty "), c == "stty",
+		strings.HasPrefix(c, "if [ -n \"$BASH_VERSION\""):
+		return 0
+
 	case strings.HasPrefix(c, "command -v"):
 		// 存在性探测：内建白名单里的算存在，刻意缺席的第三方返回 1。
 		bin := extractCommandVArg(c)
@@ -672,11 +691,42 @@ func RunCommand(cmd string, ch ssh.Channel, srv *Server) int {
 		fmt.Fprint(ch.Stderr(), "boom: something went wrong\n")
 		return 3
 
+	// 读光 stdin 再退出：用于验证客户端在 Exec 时会主动发 stdin EOF。
+	// 若客户端不发，这条命令会一直挂着等输入，直到超时被杀。
+	case c == "hungry":
+		body, _ := io.ReadAll(ch)
+		fmt.Fprintf(ch, "read %d bytes\n", len(body))
+
 	// 复刻真实主机上「需要交互式终端」的失败形态（procps 的 top 在无 PTY 时）。
 	// 有了它才能端到端验证 TTYHint 真的被接进了执行结果。
 	case strings.HasPrefix(c, "top"):
 		fmt.Fprint(ch.Stderr(), "TERM environment variable not set.\n")
 		return 1
+
+	// 模拟一个全屏 TUI（top/vim 那类）：切备用屏幕、画一帧、等键盘。
+	// 读到 q 或通道关闭就退出 —— 备用屏幕释放触发定格的链路靠它验证。
+	case strings.HasPrefix(c, "tuitop"):
+		fmt.Fprint(ch, "\x1b[?1049htop - fake\r\nload: 1.2\r\n")
+		buf := make([]byte, 64)
+		for {
+			n, err := ch.Read(buf)
+			if err != nil {
+				return 0
+			}
+			if strings.Contains(string(buf[:n]), "q") {
+				fmt.Fprint(ch, "\x1b[?1049l")
+				return 0
+			}
+		}
+
+	// 不进备用屏幕的全屏重绘 TUI（procps top 的同种）：CUP+ED 重绘三帧
+	// 就退出。top 不发 ?1049h，客户端只能靠「命令期间全屏重绘过」
+	// 识别它 —— 这个命令就是那条识别链路的端到端载体。
+	case strings.HasPrefix(c, "tuispin"):
+		for i := 1; i <= 3; i++ {
+			fmt.Fprintf(ch, "\x1b[H\x1b[2Jspin %d\r\nload: 0.%d\r\n", i, i)
+		}
+		return 0
 
 	// 大量输出，用来验证客户端的捕获上限，以及「超限后仍继续排空」这个关键行为。
 	// 若客户端在达到上限后停止读取，这里的 Write 会阻塞，命令永远不结束 ——

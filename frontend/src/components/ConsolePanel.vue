@@ -1,43 +1,414 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { Terminal } from '@xterm/xterm'
+import { FitAddon } from '@xterm/addon-fit'
+import '@xterm/xterm/css/xterm.css'
 import {
   store, ask, approve, stop, clearLog, clearSession, compactSession, push,
-  createSession, refreshSessions, runShell, switchProfile, syncWindowTitle
+  createSession, refreshSessions, runShellInTerminal, switchProfile, syncWindowTitle,
+  openTerminal, writeTerminal, resizeTerminal, closeTerminal,
+  registerTermSink, unregisterTermSink, termState, textToBase64, reportActiveSession,
+  bucketKey
 } from '../store'
 import { classifyInput } from '../inputRoute'
-import { parseBareCd, extractCwd, promptParts } from '../term'
-import InteractiveTerminal from './InteractiveTerminal.vue'
+import { providerBadge } from '../providerLogos'
+import { TERM_THEMES, currentTermTheme } from '../termTheme'
+import * as paint from '../termPaint'
 import UiSelect from './UiSelect.vue'
 
-// agent = Agent会话（终端风：自然语言→Agent，shell→策略后 Exec）
-// terminal = 完整交互终端（PTY，绕过策略）
-const mode = ref('agent')
-const draft = ref('')
+// 控制台 = 一块整幅 xterm，附着当前主机的常驻 shell PTY（阿里云 Workbench 同款）。
+// 人可以直接在表面里敲（原始按键进 PTY，不过策略）；底部 composer 走分流：
+// 中文/? → Agent，shell 行 → 策略闸门 → 写进同一片 PTY。top/vim 原生全屏接管。
+// 「对话归档」开关把主区切成只读时间线（复用 store.entries 渲染），表面用 v-show
+// 常驻不销毁 —— xterm 实例一销毁滚动回放就没了。
+
+// ---- 常驻终端表面（xterm 实例生命周期，从 InteractiveTerminal 折叠进来）----
+// 表面按「任务」组织：一块表面对应一条 (host, session)，键用 store.bucketKey。
+// 只保留当前聚焦任务的 shell：切换任务时关闭上一任务的表面/PTY，为目标任务
+// 新开一条全新 xterm（回来也是全新的，旧现场丢弃，历史仍在「对话归档」里）。
+const rootEl = ref(null)          // ResizeObserver 的观察目标（.surface）
+const openedKeys = ref([])        // 已建过容器的表面键（bucketKey）
+const surfaceEls = new Map()      // surfaceKey -> 容器元素
+const terms = new Map()           // surfaceKey -> { term, fit, sink, hostId, sessionId, ... }
+let attachedKey = ''              // 当前附着的那块表面键（切任务时据此关闭旧的）
+let ro = null
+
+// 对话归档：只读时间线开关。false = 活表面，true = 归档视图。
+const showArchive = ref(false)
+
 const logEl = ref(null)
-const inputEl = ref(null)
 
-// 每台主机独立跟踪 cwd（Exec 无状态）。切主机再切回来目录还在。
-const cwds = reactive({})
 const currentHost = computed(() => store.hosts.find(h => h.id === store.currentHostId))
-const cwd = computed(() => cwds[store.currentHostId] || '~')
-const prompt = computed(() => promptParts(currentHost.value, cwd.value))
+// 当前聚焦任务的表面键：未选主机时无表面。
+const currentKey = computed(() =>
+  store.currentHostId ? bucketKey(store.currentHostId, store.currentSessionId) : ''
+)
+const st = computed(() => (currentKey.value ? store.terms[currentKey.value] : null))
 
-const sessionLocked = computed(() => store.running || store.busy || !!store.pending)
+// 终端状态行：只在「打开中 / 已结束 / 失败」时出现，给出原因与重试入口。
+const statusLine = computed(() => {
+  const s = st.value
+  if (!s) return ''
+  if (s.status === 'opening') return '正在打开终端…'
+  if (s.status === 'closed') return s.exitReason || '终端已结束'
+  if (s.status === 'error') return '打开失败：' + s.error
+  return ''
+})
+const canRetry = computed(() => !!st.value && (st.value.status === 'closed' || st.value.status === 'error'))
+const canClose = computed(() => !!st.value && (st.value.status === 'open' || st.value.status === 'opening'))
 
-watch(() => store.currentHostId, async id => {
-  store.currentSessionId = ''
-  await refreshSessions(id)
-  await nextTick()
-  if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight
-  focusInput()
+function setSurfaceEl(key, el) {
+  if (el) surfaceEls.set(key, el)
+  else surfaceEls.delete(key)
+}
+
+// 终端配色跟随亮/暗主题；切换时同步所有已打开的实例。
+watch(() => store.theme, t => {
+  const theme = TERM_THEMES[t] || TERM_THEMES.light
+  for (const { term } of terms.values()) term.options.theme = theme
 })
 
-watch(() => store.currentSessionId, async () => {
+// doFit 只在容器**确实有尺寸**时才测量。隐藏时（切到归档、或不是当前任务）
+// 量到 0x0，fit 会算出 0 列 0 行报给远端，排版彻底乱掉且界面无异常可见。
+function doFit(key) {
+  const t = terms.get(key)
+  if (!t) return
+  const el = surfaceEls.get(key)
+  if (!el || el.clientWidth === 0 || el.clientHeight === 0) return
+  try {
+    t.fit.fit()
+  } catch {
+    // 布局还没稳定时会抛。下一次 ResizeObserver 会再试，不该变成用户可见的报错。
+  }
+}
+
+// focusTerm 把键盘焦点交给该片终端（输入已整体在终端内，composer 输入框已移除）。
+// xterm 替身可能没有 focus，包一层 try 免得主流程被带偏。
+function focusTerm(key) {
+  const t = terms.get(key)
+  if (!t) return
+  try {
+    t.term.focus()
+  } catch {
+    // 忽略：实例已销毁或替身无 focus
+  }
+}
+
+function disposeTerm(key) {
+  const t = terms.get(key)
+  if (t) {
+    unregisterTermSink(t.hostId, t.sessionId, t.sink)
+    try {
+      t.term.dispose()
+    } catch {
+      // 已经销毁过就算了
+    }
+    terms.delete(key)
+  }
+  openedKeys.value = openedKeys.value.filter(x => x !== key)
+  surfaceEls.delete(key)
+}
+
+async function ensureTerm(hostId, sessionId) {
+  if (!hostId) return
+  const key = bucketKey(hostId, sessionId)
+  const state = termState(hostId, sessionId)
+
+  if (terms.has(key)) {
+    if (state.status === 'closed' || state.status === 'error') {
+      // 上一次会话已结束：换掉旧实例，否则新画面会接在上一段后面像「重连没清屏」。
+      disposeTerm(key)
+    } else {
+      await nextTick()
+      doFit(key)
+      return
+    }
+  }
+
+  // 先把容器渲染出来再 open：xterm 在 open 那一刻就要测量容器、建渲染层。
+  // 容器不存在时量到 0x0，画布按错尺寸建，之后再 fit 也修不回来。
+  if (!openedKeys.value.includes(key)) openedKeys.value.push(key)
   await nextTick()
-  if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight
+
+  const el = surfaceEls.get(key)
+  if (!el) return
+
+  const term = new Terminal({
+    cursorBlink: true,
+    // 回放行数：给足但不无限。终端的价值一半在「翻回去看」，每行都占内存。
+    scrollback: 5000,
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+    fontSize: 12.5,
+    theme: currentTermTheme(store.theme)
+  })
+  const fit = new FitAddon()
+  term.loadAddon(fit)
+  term.open(el)
+  // 表面不再预写任何提示行：输入文案已在顶部 banner 常驻，重连也不留装饰性
+  // 空行 —— 让终端直接落到远端 shell 的提示符。
+
+  const sink = bytes => {
+    // 本地行编辑期间收到外部 PTY 输出 = 环境不安静（后台打印/提示符重绘），
+    // 此刻 startCol 已不可信：把本地缓冲 flush 给 PTY 并降级透传，避免擦错位置。
+    const st = terms.get(key)
+    if (st && st.line && !st.passthrough) {
+      flushLocalToPty(st)
+      st.passthrough = true
+    }
+    term.write(bytes)
+  }
+  // 顺序不能反：先登记落点再 OpenTerminal。远端 shell 一启动就打印提示符，
+  // 登记晚了那一段就落进虚空了。
+  registerTermSink(hostId, sessionId, sink)
+  terms.set(key, { term, fit, sink, hostId, sessionId, line: '', startCol: 0, passthrough: false })
+
+  // 用户按键 → 本地行编辑（见 onTermData）：常态下可打印字符本地回显、
+  // 回车时分类；全屏程序接管或控制键则原样透传。不再是无脑逐字符进 PTY。
+  term.onData(d => onTermData(key, d))
+  // 尺寸变化 → 后端。少了这一步远端程序会一直按初始尺寸排版。
+  term.onResize(({ cols, rows }) => {
+    resizeTerminal(hostId, sessionId, cols, rows)
+  })
+
+  doFit(key)
+  // 布局可能在 open 之后才稳定（状态行出现、工具条换行、字体度量就绪）：
+  // 再补一帧重测量，否则行数停留在偏小值，视口底部留一大段用不上的空白。
+  requestAnimationFrame(() => doFit(key))
+  await openTerminal(hostId, sessionId, term.cols, term.rows)
+}
+
+// ---- 终端内直接输入：在提示符下就地编辑、回车分类 ----
+//
+// 真 PTY 逐字符透传的话，自然语言会被 bash 当命令执行而报错。所以把
+// 「shell 提示符下等待输入一条命令」这一常态改成本地行编辑：可打印字符
+// 本地回显、退格本地删，回车时 classifyInput 决定交给 Agent 还是发回 PTY。
+//
+// 代价：提示符下的 readline 原生历史/补全改由本地接管。因此凡是控制键/转义
+// 序列（Tab、方向键、Ctrl-C、Ctrl-R、Esc…）一律原样透传给 shell；
+// 全屏程序接管（备用屏幕，vim/top/htop）时更是整体透传，绝不抢键。
+
+function isFullscreen(key) {
+  const t = terms.get(key)
+  const buf = t && t.term.buffer && t.term.buffer.active
+  if (buf && buf.type === 'alternate') return true
+  // xterm 的 buffer 只看得到「切了备用屏幕」的全屏程序（vim/htop）。
+  // procps 系的 top 走的是原地重绘、不发备用屏幕，靠后端 Screen.InTUI()
+  // 经 term:tui 推来的 tuiActive 才能识别 —— 两条都得认，否则 top 里敲
+  // q 会被本地行编辑吞掉。
+  return !!t && !!termState(t.hostId, t.sessionId).tuiActive
+}
+
+function cursorCol(t) {
+  const buf = t.term.buffer && t.term.buffer.active
+  return buf && typeof buf.cursorX === 'number' ? buf.cursorX : 0
+}
+
+// displayWidth 近似 wcwidth：CJK/全角占 2 列，其余 1 列。
+// 擦除本地回显时要按**显示宽度**补空格，中文按 1 算会擦不干净。
+function displayWidth(s) {
+  let w = 0
+  for (const ch of String(s)) {
+    const c = ch.codePointAt(0)
+    const wide = (c >= 0x1100 && c <= 0x115f) ||
+      (c >= 0x2e80 && c <= 0xa4cf) ||
+      (c >= 0xac00 && c <= 0xd7a3) ||
+      (c >= 0xf900 && c <= 0xfaff) ||
+      (c >= 0xfe30 && c <= 0xfe6f) ||
+      (c >= 0xff00 && c <= 0xff60) ||
+      (c >= 0xffe0 && c <= 0xffe6)
+    w += wide ? 2 : 1
+  }
+  return w
+}
+
+// eraseLocalLine 用等宽空格覆盖本地回显的字符（空格与回显同起点、同宽度，
+// wrap 路径一致，因此跨行折返也擦得净），再把光标移回输入起点。
+// 比「定位列 + \x1b[K 清到行尾」更能处理超长输入折行的情况。
+function eraseLocalLine(t, line) {
+  if (!line) return
+  const go = '\r\x1b[' + (t.startCol + 1) + 'G'
+  // 覆盖空格前后各补一次 SGR 复位：远端若残留黑底/反视频（某些程序退出时
+  // 不复位），裸空格会继承那个背景，擦完留下一条黑带 —— 必须强制回默认色。
+  t.term.write(go + '\x1b[0m' + ' '.repeat(displayWidth(line)) + '\x1b[0m' + go)
+}
+
+// clearLocalEcho 只擦掉本地回显并清空缓冲，**不**发给 PTY。
+// 用于全屏接管：此时 PTY 在跑 vim/top，把半截字符发过去会当成程序输入。
+function clearLocalEcho(t) {
+  if (!t.line) return
+  eraseLocalLine(t, t.line)
+  t.line = ''
+}
+
+// flushLocalToPty 擦掉本地回显后把缓冲发给 PTY（shell 空闲等输入，安全），
+// 用于控制键打断、或本地编辑期间检测到外部输出需要降级透传。
+function flushLocalToPty(t) {
+  if (!t.line) return
+  eraseLocalLine(t, t.line)
+  writeTerminal(t.hostId, t.sessionId, textToBase64(t.line))
+  t.line = ''
+}
+
+// submitQueue 让同一块表面（同一任务）的提交串行：onData 是同步回调没法 await，
+// 连敲回车会让多个 runShellInTerminal 并发（store.busy 交错、PTY 输出互踩）。
+const submitQueue = new Map()
+function enqueueSubmit(key, line) {
+  const prev = submitQueue.get(key) || Promise.resolve()
+  const next = prev.then(() => submitLine(key, line)).catch(() => {})
+  submitQueue.set(key, next)
+  return next
+}
+
+async function submitLine(key, line) {
+  const t = terms.get(key)
+  if (!t) return
+  const { hostId, sessionId } = t
+  const text = (line || '').trim()
+  if (!text) {
+    // 空回车：与 composer 同形，只给 PTY 一个换行让 shell 回显新提示符。
+    writeTerminal(hostId, sessionId, textToBase64('\n'))
+    return
+  }
+  const route = classifyInput(text)
+  if (route.kind === 'agent') {
+    if (!route.text) {
+      paint.paintSystem(surfaceWrite(key), '输入要问 Agent 的内容，或直接敲一条 shell 命令。')
+      return
+    }
+    ask(route.text)
+    return
+  }
+  // shell：交回常驻终端通道（策略闸门 + 写进 PTY，PTY 自己回显执行）。
+  await runShellInTerminal(hostId, sessionId, route.text)
+}
+
+function onTermData(key, d) {
+  const t = terms.get(key)
+  if (!t) return
+  const send = s => writeTerminal(t.hostId, t.sessionId, s)
+
+  // 已降级透传（本地编辑期间来过外部输出）：原样送 PTY（多字符也整体送），
+  // 回车后恢复本地编辑。
+  if (t.passthrough) {
+    send(textToBase64(d))
+    if (/[\r\n]/.test(d)) t.passthrough = false
+    return
+  }
+
+  // 多字符输入分三类：含换行=多行粘贴，逐字符回放让 \r 走提交分支；
+  // 转义/控制序列（方向键、功能键）=整体透传，绝不能拆散；
+  // 纯可打印（粘贴一段命令）=整体本地缓冲。
+  if (d.length > 1) {
+    if (/[\r\n]/.test(d)) {
+      for (const ch of d) onTermData(key, ch)
+      return
+    }
+    if (/[\x00-\x1f\x7f]/.test(d)) {
+      flushLocalToPty(t)
+      send(textToBase64(d))
+      return
+    }
+    if (!t.line) t.startCol = cursorCol(t)
+    t.line += d
+    t.term.write(d)
+    return
+  }
+
+  // 全屏程序接管：擦掉残留本地回显后整体透传，绝不抢键、也不污染程序输入。
+  if (isFullscreen(key)) {
+    clearLocalEcho(t)
+    send(textToBase64(d))
+    return
+  }
+
+  // 回车：提交本地缓冲的这一行（串行化，避免连敲并发）。
+  if (d === '\r' || d === '\n') {
+    const line = t.line
+    t.line = ''
+    eraseLocalLine(t, line)
+    enqueueSubmit(key, line)
+    return
+  }
+
+  // 退格：本地删一个字符。必须按**码点**删（代理对算一个字符），并按它的
+  // **显示宽度**回退擦除 —— 中文/全角占 2 列，只回退擦 1 列会留下右半、
+  // 光标错位（下一字符的 startCol 跟着错），表现为「输入自然语言时删不干净」。
+  if (d === '\x7f') {
+    if (t.line) {
+      const chars = Array.from(t.line)
+      const last = chars.pop()
+      t.line = chars.join('')
+      t.term.write('\b \b'.repeat(displayWidth(last)))
+    }
+    return
+  }
+
+  // 其它控制字符 / 转义序列（Tab、方向键、Ctrl-C、Ctrl-R、Esc…）：
+  // 放弃本地行编辑，flush 给 PTY 后透传该键，之后由 shell 处理该行。
+  if (/[\x00-\x1f\x7f]/.test(d)) {
+    flushLocalToPty(t)
+    send(textToBase64(d))
+    return
+  }
+
+  // 普通可打印字符：首次进入本行记下起始列（供擦除定位），本地回显 + 缓冲。
+  if (!t.line) t.startCol = cursorCol(t)
+  t.line += d
+  t.term.write(d)
+}
+
+// surfaceWrite 返回往某块表面（按 host+session 键）写字符串的落点，供 termPaint 画 agent 事件。
+// 实例还没建（或已销毁）时返回 undefined —— termPaint 对 undefined 落点安全 no-op。
+function surfaceWrite(key) {
+  const t = terms.get(key)
+  return t ? (s => t.term.write(s)) : undefined
+}
+
+async function onClose() {
+  const hostId = store.currentHostId
+  if (!hostId) return
+  const key = currentKey.value
+  await closeTerminal(hostId, store.currentSessionId)
+  disposeTerm(key)
+  if (attachedKey === key) attachedKey = ''
+}
+
+function onRetry() {
+  ensureTerm(store.currentHostId, store.currentSessionId)
+}
+
+// 从归档切回表面时重新测量：隐藏期间容器是 0x0，fit 一直跳过。
+watch(showArchive, async on => {
+  if (on) {
+    scrollLog()
+    return
+  }
+  await nextTick()
+  doFit(currentKey.value)
 })
+
+// 状态行出现/消失会改 surface-body 的高度，但 .surface 自身尺寸不变 ——
+// ResizeObserver 观测不到这种「内部重新分配」，补一次重测量。
+watch(statusLine, async () => {
+  await nextTick()
+  doFit(currentKey.value)
+})
+
+// ---- 归档视图派生 ----
+
+const decisionLabel = d => ({ allow: '自动放行', confirm: '需确认', deny: '硬拒绝' }[d] || d)
+const decisionClass = d => ({ allow: 'ok', confirm: 'warn', deny: 'danger' }[d] || '')
+const statusLabel = s => ({
+  pending: '待批准', running: '执行中', done: '已完成', denied: '已拒绝', error: '出错'
+}[s] || s)
 
 const streamingNow = computed(() => store.entries.some(e => e.streaming))
+
+function scrollLog() {
+  nextTick(() => {
+    if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight
+  })
+}
 
 const scrollKey = computed(() => {
   const n = store.entries.length
@@ -45,168 +416,64 @@ const scrollKey = computed(() => {
   const last = store.entries[n - 1]
   return `${n}:${last.content ? last.content.length : 0}:${last.pending ? 1 : 0}`
 })
+watch(scrollKey, () => scrollLog())
 
-const decisionLabel = d => ({ allow: '自动放行', confirm: '需确认', deny: '硬拒绝' }[d] || d)
-const decisionClass = d => ({ allow: 'ok', confirm: 'warn', deny: 'danger' }[d] || '')
+// ---- 主机 / 任务切换：只留当前任务的 shell（切走关闭、回来重开）----
 
-const statusLabel = s => ({
-  pending: '待批准', running: '执行中', done: '已完成', denied: '已拒绝', error: '出错'
-}[s] || s)
+let hostSwitching = false
 
-watch(scrollKey, async () => {
-  await nextTick()
-  if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight
-})
-
-watch(() => store.pending, async () => {
-  if (!store.pending) showCmdDetail.value = false
-  await nextTick()
-  if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight
-})
-
-function focusInput() {
-  nextTick(() => {
-    if (inputEl.value && !sessionLocked.value) inputEl.value.focus()
-  })
+// detachSurface 关闭某块表面：先关远端 PTY（closeTerminal）再销毁本地 xterm。
+// 落实「只留当前任务」：切换任务时上一任务的现场就此丢弃（回来是全新 shell）。
+async function detachSurface(key) {
+  if (!key) return
+  const t = terms.get(key)
+  if (!t) return
+  await closeTerminal(t.hostId, t.sessionId)
+  disposeTerm(key)
 }
 
-async function send() {
-  const text = draft.value.trim()
-  if (sessionLocked.value) return
-  if (!store.currentHostId) {
-    push({ kind: 'error', content: '请先选择一台主机。' })
-    return
-  }
-
-  // 空命令：像真实终端一样，回车只在时间线里刷新一个提示符（本地 no-op，exit 0），
-  // 不下发远端、不经策略引擎。空白字符同样视为空：回车即清空当前行。
-  if (!text) {
-    draft.value = ''
-    const p = prompt.value
-    push({
-      kind: 'shell',
-      cmd: '',
-      who: p.who,
-      path: p.path,
-      sym: p.sym,
-      pending: false,
-      stdout: '',
-      stderr: '',
-      exitCode: 0,
-      durationMs: 0,
-      error: '',
-      hint: '',
-      truncated: false,
-      decision: '',
-      reason: '',
-      status: 'done'
-    })
-    focusInput()
-    return
-  }
-
-  const route = classifyInput(text)
-  draft.value = ''
-
-  if (route.kind === 'agent') {
-    if (!route.text) {
-      push({ kind: 'error', content: '请输入要问 Agent 的内容（或直接敲一条 shell 命令）。' })
-      return
-    }
-    // ask() 内部会再 push user；这里不重复。
-    ask(route.text)
-    focusInput()
-    return
-  }
-
-  await execShellLine(route.text)
+// attachSurface 为目标任务拉起一条全新 shell：关掉当前附着着的其它表面，
+// 新建本任务专属表面（ensureTerm → openTerminal），并把「现在看着哪条会话」
+// 报给后端（Ask 的 Agent 上下文仍需）。不再画会话分隔线 —— 表面不再共享。
+async function attachSurface(hostId, sessionId) {
+  if (!hostId) return
+  const key = bucketKey(hostId, sessionId)
+  if (attachedKey && attachedKey !== key) await detachSurface(attachedKey)
+  await ensureTerm(hostId, sessionId)
+  attachedKey = key
+  reportActiveSession(hostId, sessionId)
+  await nextTick()
+  focusTerm(key)
 }
 
-async function execShellLine(c) {
-  const hostId = store.currentHostId
-  const p = prompt.value
-  const bare = parseBareCd(c)
-
-  if (c === 'clear') {
-    clearLog()
-    focusInput()
-    return
-  }
-
-  // push 会展开成普通对象放进时间线；必须改时间线里那一份，才能触发渲染。
-  push({
-    kind: 'shell',
-    cmd: c,
-    who: p.who,
-    path: p.path,
-    sym: p.sym,
-    pending: true,
-    stdout: '',
-    stderr: '',
-    exitCode: null,
-    durationMs: 0,
-    error: '',
-    hint: '',
-    truncated: false,
-    decision: '',
-    reason: '',
-    status: 'running'
-  })
-  const block = store.entries[store.entries.length - 1]
-
+watch(() => store.currentHostId, async id => {
+  hostSwitching = true
   try {
-    const res = await runShell(hostId, c, cwd.value, 60)
-    let stdout = res.stdout || ''
-    if (bare !== null && res.status === 'done') {
-      const ex = extractCwd(stdout)
-      stdout = ex.stdout
-      if (ex.cwd && (res.exitCode ?? 0) === 0) cwds[hostId] = ex.cwd
-    }
-    Object.assign(block, {
-      pending: false,
-      stdout,
-      stderr: res.stderr || '',
-      exitCode: res.exitCode ?? 0,
-      durationMs: res.durationMs || 0,
-      error: res.error || '',
-      hint: res.hint || '',
-      truncated: !!res.truncated,
-      decision: res.decision || '',
-      reason: res.reason || '',
-      status: res.status || 'done'
-    })
-    if (res.status === 'denied' || res.status === 'cancelled' || res.status === 'missing') {
-      block.error = block.error || res.reason || res.error || '未执行'
-    }
-  } catch (e) {
-    Object.assign(block, {
-      pending: false,
-      status: 'error',
-      error: String(e && e.message ? e.message : e)
-    })
+    store.currentSessionId = ''
+    await refreshSessions(id)
+    if (id) await attachSurface(id, store.currentSessionId)
+    scrollLog()
+  } finally {
+    hostSwitching = false
   }
-  focusInput()
-}
+})
 
-function onKeydown(e) {
-  // 输入法组词期间的 Enter 是确认候选词，不能当「发送」：
-  // 此时 draft 还没同步（Vue 在组词期间不更新 model），
-  // 误触发会把空命令/旧草稿发出去，时间线里插进多余一行。
-  // keyCode 229 是 WKWebView 等老内核上 isComposing 缺失时的兜底。
-  if (e.isComposing || e.keyCode === 229) return
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault()
-    send()
-  }
-}
+// 侧边栏切任务（主机不变）：关掉上一任务的表面、为目标任务重开全新 shell。
+// 主机切换过程中会重置会话，那条路径由上面的 watcher 统一处理，这里用
+// hostSwitching 让路避免重复。
+watch(() => store.currentSessionId, async () => {
+  if (hostSwitching) return
+  const hostId = store.currentHostId
+  if (!hostId) return
+  await attachSurface(hostId, store.currentSessionId)
+  scrollLog()
+})
 
-// 会话的切换/新建/重命名/删除都在侧边栏（SessionsSidebar.vue）完成。
+// ---- 顶栏：任务名 / 窗口标题 / 模型 ----
+
 const currentSession = computed(
   () => store.currentSessions.find(s => s.id === store.currentSessionId) || null
 )
-
-// 顶栏展示当前任务名，让用户随时知道自己在哪条任务里。
-// 默认任务没有名字：用「主机名 (user@addr)」顶替，与侧边栏列表一致。
 const currentSessionName = computed(() => {
   const s = currentSession.value
   if (!s) return ''
@@ -217,21 +484,18 @@ const currentSessionName = computed(() => {
   }
   return '未命名任务'
 })
-
 const hostOptions = computed(() =>
   store.hosts.map(h => ({ value: h.id, label: `${h.name} — ${h.user}@${h.addr}` }))
 )
-
-// 窗口标题跟随当前任务：切任务/改名后标题栏立即更新。
 watch(currentSessionName, name => syncWindowTitle(name), { immediate: true })
 
-// 模型（= LLM 方案）选择。激活项以后端 active 标记为准；
-// 会话历史与模型无关，切换不丢上下文。
-const activeProfileId = computed(() =>
-  store.llmProfiles.find(p => p.active)?.id || ''
-)
+const activeProfileId = computed(() => store.llmProfiles.find(p => p.active)?.id || '')
 const modelOptions = computed(() =>
-  store.llmProfiles.map(p => ({ value: p.id, label: `${p.name} · ${p.model}` }))
+  store.llmProfiles.map(p => ({
+    value: p.id,
+    label: `${p.name} · ${p.model}`,
+    badge: providerBadge(p)
+  }))
 )
 async function onSwitchModel(id) {
   if (!id || id === activeProfileId.value) return
@@ -246,9 +510,6 @@ async function onSwitchModel(id) {
     content: `已切换模型到「${p ? p.name : id}」，本会话上下文保留，下一轮对话生效。`
   })
 }
-
-// 会话的新建/重命名/删除已移至侧边栏（SessionsSidebar.vue），
-// 这里只保留作用于「当前会话」的两个操作：压缩与清空。
 
 async function onClearSession() {
   if (!store.currentHostId) {
@@ -266,21 +527,9 @@ async function onCompactSession() {
   await compactSession(store.currentHostId, store.currentSessionId)
 }
 
-// 新建会话（顶栏入口，参考 WorkBuddy 把主操作放在最顺手的位置）。
-// 弹应用内输入框确认 —— WKWebView 上原生 prompt/confirm 都不弹，不能用。
-const showNewModal = ref(false)
+// ---- 弹窗：新建任务 / 命令详细 ----
 
-// 审批命令详细弹窗：卡片内只做限高预览，全文（复制/细看）放弹窗
-const showCmdDetail = ref(false)
-const cmdCopied = ref(false)
-// 关闭就重置复制标记：下次打开不该残留「已复制」的假状态
-watch(showCmdDetail, v => { if (!v) cmdCopied.value = false })
-const pendingCmd = computed(() => {
-  const p = store.pending
-  if (!p) return ''
-  const raw = p.command || p.args
-  return typeof raw === 'string' ? raw : JSON.stringify(raw ?? '', null, 2)
-})
+const showNewModal = ref(false)
 const newName = ref('')
 const newEl = ref(null)
 
@@ -302,8 +551,6 @@ async function commitNewSession() {
   await createSession(name)
 }
 
-// 弹窗输入框的 Enter/Esc 与主输入框同理：输入法组词期间要让路，
-// 否则确认中文任务名候选词的那次 Enter 会把弹窗直接关掉。
 function onNewKeydown(e) {
   if (e.isComposing || e.keyCode === 229) return
   if (e.key === 'Enter') {
@@ -315,6 +562,18 @@ function onNewKeydown(e) {
   }
 }
 
+const showCmdDetail = ref(false)
+const cmdCopied = ref(false)
+watch(showCmdDetail, v => { if (!v) cmdCopied.value = false })
+watch(() => store.pending, v => { if (!v) showCmdDetail.value = false })
+
+const pendingCmd = computed(() => {
+  const p = store.pending
+  if (!p) return ''
+  const raw = p.command || p.args
+  return typeof raw === 'string' ? raw : JSON.stringify(raw ?? '', null, 2)
+})
+
 async function copyPendingCmd() {
   const text = pendingCmd.value
   if (!text) return
@@ -324,7 +583,7 @@ async function copyPendingCmd() {
     ok = true
   } catch { ok = false }
   if (!ok) {
-    // WKWebView 等环境下 clipboard API 可能不可用，退回 execCommand
+    // WKWebView 等环境下 clipboard API 可能不可用，退回 execCommand。
     const ta = document.createElement('textarea')
     ta.value = text
     ta.style.position = 'fixed'
@@ -341,13 +600,36 @@ async function copyPendingCmd() {
 }
 
 function onWinKeydown(e) {
-  // 新建任务弹窗的输入框有自己的 Esc 处理：它在顶层时这里让路，
-  // 避免一次 Esc 同时关掉两层、或把用户正编辑的任务名弹窗误关。
+  // 新建任务弹窗在顶层时这里让路，避免一次 Esc 同时关掉两层。
   if (showNewModal.value) return
   if (e.key === 'Escape' && showCmdDetail.value) showCmdDetail.value = false
 }
-onMounted(() => window.addEventListener('keydown', onWinKeydown))
-onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
+
+onMounted(async () => {
+  window.addEventListener('keydown', onWinKeydown)
+  // jsdom 里没有 ResizeObserver，测试环境不该因为这一点炸掉。
+  if (typeof ResizeObserver !== 'undefined' && rootEl.value) {
+    ro = new ResizeObserver(() => doFit(currentKey.value))
+    ro.observe(rootEl.value)
+  }
+  // 挂载时若已选中主机（App 里 ConsolePanel 常驻、bootstrap 已填好 currentHostId），
+  // watcher 不会因「无变化」触发，这里显式把当前任务的表面拉起来。
+  if (store.currentHostId) await attachSurface(store.currentHostId, store.currentSessionId)
+  focusTerm(currentKey.value)
+})
+
+onBeforeUnmount(() => {
+  if (ro) {
+    ro.disconnect()
+    ro = null
+  }
+  window.removeEventListener('keydown', onWinKeydown)
+  // 销毁本地实例（DOM 已经没了），但**不关远端终端**：卸载往往只是换视图，
+  // 用户希望切回来时 shell 还在原目录。真正的清理走「关闭终端」与切换任务；
+  // 应用退出时后端 shutdown 会关掉所有终端。
+  for (const key of [...terms.keys()]) disposeTerm(key)
+  attachedKey = ''
+})
 </script>
 
 <template>
@@ -370,8 +652,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
       </div>
 
       <div class="seg">
-        <button :class="{ on: mode === 'agent' }" @click="mode = 'agent'">Agent会话</button>
-        <button :class="{ on: mode === 'terminal' }" @click="mode = 'terminal'">交互终端</button>
+        <button :class="{ on: !showArchive }" @click="showArchive = false">终端</button>
+        <button :class="{ on: showArchive }" @click="showArchive = true">对话归档</button>
       </div>
 
       <!-- 新建任务弹窗（应用内，WKWebView 上原生 prompt 不弹） -->
@@ -393,123 +675,135 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
       </div>
     </header>
 
-    <template v-if="mode === 'agent'">
-      <!-- 风险/能力横幅：与交互终端对称，标明本模式走策略 -->
-      <div class="sess-banner">
-        <span>
-          Agent会话<span v-if="currentHost"> · <b>{{ currentHost.user }}@{{ currentHost.addr }}</b></span>
-          ｜ 中文提问交给 <b>LLM</b>，shell 命令直接执行，高危命令会先请你确认。
-          vim/top 等交互程序请用「交互终端」。
-        </span>
-      </div>
+    <!-- 能力/风险横幅：说清两条输入路径的不同风险等级 -->
+    <div class="sess-banner">
+      <span>
+        控制台<span v-if="currentHost"> · <b>{{ currentHost.user }}@{{ currentHost.addr }}</b></span>
+        ｜ 在这里可直接敲 <b>Linux 命令</b>执行（先过策略，高危会请你确认），
+        也能用<b>自然语言</b>（中文 / <span class="mono">?</span> 开头）把需求交给 <b>LLM</b>。
+        top/vim 这类程序原生全屏接管，退出后最后一帧定格进模型上下文与审计。
+      </span>
+      <button v-if="canClose" class="sm" @click="onClose">关闭终端</button>
+    </div>
 
-      <div class="log term-log" ref="logEl" @click="focusInput">
-        <div v-for="e in store.entries" :key="e.id" class="entry" :class="'entry-' + e.kind">
-          <!-- 人工 shell 回显 -->
-          <div v-if="e.kind === 'shell'" class="shell-block">
-            <div class="term-line">
-              <span class="p-who">{{ e.who }}</span><span class="p-sep">:</span><span class="p-path">{{ e.path }}</span><span class="p-sym">{{ e.sym }}</span><span class="p-cmd">{{ e.cmd }}</span>
-            </div>
-            <pre v-if="e.stdout" class="term-out">{{ e.stdout }}</pre>
-            <pre v-if="e.stderr" class="term-err">{{ e.stderr }}</pre>
-            <div v-if="e.error" class="term-err">{{ e.error }}</div>
-            <div v-if="e.truncated" class="term-hint">输出过长，只保留了开头部分。可用 head / tail / grep 缩小范围后再看。</div>
-            <div v-if="e.hint" class="term-hint">{{ e.hint }}</div>
-            <div v-if="e.pending" class="term-busy"><span class="caret"></span></div>
-            <div v-else-if="e.exitCode" class="term-fail">退出码 {{ e.exitCode }} · {{ e.durationMs }}ms</div>
-            <div v-if="e.decision && e.decision !== 'allow'" class="term-meta">
-              <span class="badge" :class="decisionClass(e.decision)">{{ decisionLabel(e.decision) }}</span>
-              <span v-if="e.reason" class="muted tiny">{{ e.reason }}</span>
-            </div>
+    <!-- 活表面：整幅 xterm，附着当前主机的常驻 shell PTY -->
+    <div class="surface" ref="rootEl" v-show="!showArchive">
+      <div v-if="!store.currentHostId" class="surface-empty">请先选择一台主机。</div>
+      <template v-else>
+        <div v-if="statusLine" class="surface-status" :class="{ bad: st && st.status === 'error' }">
+          <span>{{ statusLine }}</span>
+          <button v-if="canRetry" class="sm" @click="onRetry">重新打开</button>
+        </div>
+        <div class="surface-body">
+          <div
+            v-for="key in openedKeys"
+            :key="key"
+            class="surface-host"
+            :class="{ hidden: key !== currentKey }"
+            :ref="el => setSurfaceEl(key, el)"
+          ></div>
+        </div>
+      </template>
+    </div>
+
+    <!-- 对话归档：只读时间线（复用 store.entries 渲染，不接活事件、无交互按钮） -->
+    <div class="log archive" ref="logEl" v-show="showArchive">
+      <div v-for="e in store.entries" :key="e.id" class="entry" :class="'entry-' + e.kind">
+        <!-- 屏幕快照：模型读的那份净化文本，人看同一份，审计才对得上 -->
+        <div v-if="e.kind === 'snapshot'" class="result">
+          <div class="result-head">
+            <span v-if="e.final" class="badge warn">终端结束画面 · 进模型上下文</span>
+            <span v-else class="badge warn">终端屏幕快照 · 进模型上下文</span>
+            <span v-if="e.redacted" class="badge warn">已脱敏 {{ e.redacted }} 处</span>
+            <span class="muted tiny">{{ e.final ? '全屏 TUI 退出/终端结束时定格的最后一屏（净化文本）' : '常驻终端静止后的可见屏幕（净化文本）' }}</span>
           </div>
-
-          <div v-else-if="e.kind === 'user'" class="msg user">
-            <div class="msg-role">你</div>
-            <div class="msg-body">{{ e.content }}</div>
-          </div>
-
-          <div v-else-if="e.kind === 'assistant'" class="msg assistant">
-            <div class="msg-role">LLM</div>
-            <div class="msg-body">{{ e.content }}<span v-if="e.streaming" class="caret"></span><span v-if="!e.content && !e.streaming" class="muted tiny">（模型返回了空回复）</span></div>
-          </div>
-
-          <div v-else-if="e.kind === 'tool'" class="tool">
-            <div class="tool-head">
-              <span class="tool-name mono">{{ e.tool.name }}</span>
-              <span class="badge" :class="decisionClass(e.tool.decision)">
-                {{ decisionLabel(e.tool.decision) }}
-              </span>
-              <span class="badge neutral">{{ statusLabel(e.tool.status) }}</span>
-              <span class="muted" v-if="e.tool.hostName">@{{ e.tool.hostName }}</span>
-              <span class="muted right" v-if="e.tool.durationMs">{{ e.tool.durationMs }}ms</span>
-            </div>
-            <pre v-if="e.tool.command" class="tool-cmd">{{ e.tool.command }}</pre>
-            <div v-if="e.tool.reason" class="tool-reason">{{ e.tool.reason }}</div>
-          </div>
-
-          <div v-else-if="e.kind === 'result'" class="result">
-            <div class="result-head">
-              <span class="muted">退出码 {{ e.exitCode }}</span>
-              <span v-if="e.redacted" class="badge warn">已脱敏 {{ e.redacted }} 处</span>
-              <span class="muted tiny">原始输出 · 发给 LLM 前已脱敏并标记为不可信</span>
-            </div>
-            <pre>{{ e.content }}</pre>
-          </div>
-
-          <div v-else-if="e.kind === 'injection'" class="injection">
-            <div class="injection-title">远端输出中检测到疑似提示注入</div>
-            <div class="injection-body">命中话术：{{ e.findings.join('、') }}</div>
-            <pre v-if="e.command" class="injection-cmd">{{ e.command }}</pre>
-            <div class="injection-hint">
-              该内容来自 <span class="mono">{{ e.hostName }}</span> 的执行结果，已被标记为不可信数据，
-              不会作为指令执行。建议排查该主机上这段文本的来源。
-            </div>
-          </div>
-
-          <div v-else-if="e.kind === 'error'" class="msg error">
-            <div class="msg-role">错误</div>
-            <div class="msg-body">{{ e.content }}</div>
-          </div>
-
-          <div v-else class="msg system">
-            <div class="msg-body">{{ e.content }}</div>
+          <pre>{{ e.text }}</pre>
+          <div v-if="e.injection && e.injection.length" class="tool-reason">
+            检测到疑似提示注入：{{ e.injection.join('、') }}（内容已标记为不可信）
           </div>
         </div>
 
-        <div v-if="store.running && !store.pending && !streamingNow" class="thinking">LLM 正在思考…</div>
-
-        <!-- 内联提示符：像终端一样停在时间线末尾 -->
-        <div class="term-line term-live">
-          <span class="p-who">{{ prompt.who }}</span><span class="p-sep">:</span><span class="p-path">{{ prompt.path }}</span><span class="p-sym">{{ prompt.sym }}</span><input
-            ref="inputEl"
-            v-model="draft"
-            class="term-input"
-            :disabled="!store.currentHostId || sessionLocked"
-            :placeholder="store.currentHostId ? (sessionLocked ? '等待中…' : 'shell 命令，或中文/? 问 Agent') : '请先选择一台主机'"
-            spellcheck="false"
-            autocomplete="off"
-            @keydown="onKeydown"
-          />
+        <div v-else-if="e.kind === 'user'" class="msg user">
+          <div class="msg-role">你</div>
+          <div class="msg-body">{{ e.content }}</div>
         </div>
-      </div>
 
-      <div v-if="store.pending" class="approval">
-        <div class="approval-head">
-          <span class="badge warn">需要你的批准</span>
-          <span class="mono">{{ store.pending.name }}</span>
-          <span class="muted" v-if="store.pending.hostName">@{{ store.pending.hostName }}</span>
-          <button class="sm right" @click="showCmdDetail = true">详细</button>
+        <div v-else-if="e.kind === 'assistant'" class="msg assistant">
+          <div class="msg-role">LLM</div>
+          <div class="msg-body">{{ e.content }}<span v-if="e.streaming" class="caret"></span><span v-if="!e.content && !e.streaming" class="muted tiny">（模型返回了空回复）</span></div>
         </div>
-        <pre class="approval-cmd">{{ store.pending.command || store.pending.args }}</pre>
-        <div class="approval-reason">{{ store.pending.reason }}</div>
-        <div class="row" style="margin-top: 10px">
-          <button class="ok" @click="approve(true)">批准执行</button>
-          <button class="danger" @click="approve(false)">拒绝</button>
+
+        <div v-else-if="e.kind === 'tool'" class="tool">
+          <div class="tool-head">
+            <span class="tool-name mono">{{ e.tool.name }}</span>
+            <span class="badge" :class="decisionClass(e.tool.decision)">
+              {{ decisionLabel(e.tool.decision) }}
+            </span>
+            <span class="badge neutral">{{ statusLabel(e.tool.status) }}</span>
+            <span class="muted" v-if="e.tool.hostName">@{{ e.tool.hostName }}</span>
+            <span class="muted right" v-if="e.tool.durationMs">{{ e.tool.durationMs }}ms</span>
+          </div>
+          <pre v-if="e.tool.command" class="tool-cmd">{{ e.tool.command }}</pre>
+          <div v-if="e.tool.reason" class="tool-reason">{{ e.tool.reason }}</div>
+        </div>
+
+        <div v-else-if="e.kind === 'result'" class="result">
+          <div class="result-head">
+            <span class="muted">退出码 {{ e.exitCode }}</span>
+            <span v-if="e.redacted" class="badge warn">已脱敏 {{ e.redacted }} 处</span>
+            <span class="muted tiny">原始输出 · 发给 LLM 前已脱敏并标记为不可信</span>
+          </div>
+          <pre>{{ e.content }}</pre>
+        </div>
+
+        <div v-else-if="e.kind === 'injection'" class="injection">
+          <div class="injection-title">远端输出中检测到疑似提示注入</div>
+          <div class="injection-body">命中话术：{{ e.findings.join('、') }}</div>
+          <pre v-if="e.command" class="injection-cmd">{{ e.command }}</pre>
+          <div class="injection-hint">
+            该内容来自 <span class="mono">{{ e.hostName }}</span> 的执行结果，已被标记为不可信数据，
+            不会作为指令执行。建议排查该主机上这段文本的来源。
+          </div>
+        </div>
+
+        <div v-else-if="e.kind === 'error'" class="msg error">
+          <div class="msg-role">错误</div>
+          <div class="msg-body">{{ e.content }}</div>
+        </div>
+
+        <div v-else class="msg system">
+          <div class="msg-body">{{ e.content }}</div>
         </div>
       </div>
 
-      <div class="composer-bar">
-        <label class="inline-label">模型</label>
+      <div v-if="!store.entries.length" class="archive-empty">
+        这条会话还没有归档记录。切到「终端」直接输入提问 / 敲命令。
+      </div>
+    </div>
+
+    <!-- 审批条：overlay 在表面之上，交互入口照旧 -->
+    <div v-if="store.pending" class="approval">
+      <div class="approval-head">
+        <span class="badge warn">需要你的批准</span>
+        <span class="mono">{{ store.pending.name }}</span>
+        <span class="muted" v-if="store.pending.hostName">@{{ store.pending.hostName }}</span>
+        <button class="sm right" @click="showCmdDetail = true">详细</button>
+      </div>
+      <pre class="approval-cmd">{{ store.pending.command || store.pending.args }}</pre>
+      <div class="approval-reason">{{ store.pending.reason }}</div>
+      <div class="row" style="margin-top: 10px">
+        <button class="ok" @click="approve(true)">批准执行</button>
+        <button class="danger" @click="approve(false)">拒绝</button>
+      </div>
+    </div>
+
+    <!-- 底部 composer：输入框 + 工具条 -->
+    <div class="composer-bar">
+      <div class="composer-tools">
+        <span
+          v-if="store.running && !store.pending && !streamingNow"
+          class="thinking-inline"
+        >LLM 正在思考…</span>
         <UiSelect
           class="model-select"
           :model-value="activeProfileId"
@@ -530,11 +824,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
         <span class="composer-sep"></span>
         <button class="sm" @click="clearLog" :disabled="store.running || store.busy">清空记录</button>
         <button v-if="store.running || store.busy" class="sm danger" @click="stop">中断</button>
-        <span class="muted tiny grow-hint">Enter 发送 · 加 <span class="mono">?</span> 开头强制由 Agent 回答</span>
       </div>
-    </template>
-
-    <InteractiveTerminal v-show="mode === 'terminal'" :active="mode === 'terminal'" />
+    </div>
 
     <!-- 命令详细弹窗：审批卡内只做预览，超长命令在这里看全文 -->
     <div v-if="showCmdDetail" class="overlay" @click.self="showCmdDetail = false">
@@ -556,6 +847,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
   flex-direction: column;
   height: 100%;
   overflow: hidden;
+  position: relative;
 }
 
 .bar {
@@ -571,7 +863,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
 .host-select { max-width: 420px; }
 .new-session-btn { flex-shrink: 0; white-space: nowrap; font-size: 13px; }
 
-/* 新建会话弹窗（应用内，与侧边栏删除确认同风格） */
+/* 弹窗（应用内，与侧边栏删除确认同风格） */
 .overlay {
   position: fixed;
   inset: 0;
@@ -593,7 +885,6 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
 .modal-hint { font-size: 11px; color: var(--text-3); margin-top: 6px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 
-/* 命令详细弹窗：宽一些，命令块内部滚动 */
 .cmd-modal { width: min(760px, calc(100% - 60px)); }
 .cmd-detail {
   margin: 0;
@@ -612,7 +903,6 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
 
 .seg { display: flex; gap: 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
 .seg button {
-  flex: 1;
   border: none;
   border-radius: 0;
   min-height: 34px;
@@ -623,10 +913,14 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
   color: var(--text-2);
 }
 .seg button.on { background: var(--accent-bg); color: var(--accent); font-weight: 500; }
-.model-select { flex: 0 1 280px; min-width: 190px; }
+.model-select { flex: 0 1 300px; min-width: 200px; }
 
 .sess-banner {
   flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   padding: 8px 16px;
   background: var(--warn-bg);
   color: var(--warn);
@@ -634,8 +928,37 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
   line-height: 1.55;
   border-bottom: 1px solid var(--border);
 }
+.sess-banner .sm { flex-shrink: 0; }
 
-.term-log {
+/* ---- 活表面 ---- */
+.surface {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+.surface-empty { padding: 24px 16px; color: var(--text-3); font-size: 13px; }
+.surface-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 14px;
+  font-size: 12.5px;
+  color: var(--text-2);
+  background: var(--surface-2);
+  flex-shrink: 0;
+}
+.surface-status.bad { color: var(--danger); background: var(--danger-bg); }
+.surface-body { position: relative; flex: 1; min-height: 0; }
+/* 每个主机一个容器，全部叠在同一处，只显示当前主机那个。容器必须一直留在
+   DOM 里：xterm 实例绑在它的元素上，元素被移除实例就废了，滚动回放也跟着没。 */
+.surface-host { position: absolute; inset: 8px; }
+.surface-host.hidden { display: none; }
+.surface-host :deep(.xterm) { height: 100%; }
+
+/* ---- 对话归档（只读时间线）---- */
+.log {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
@@ -647,59 +970,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
   font-family: var(--mono);
   font-size: 12.5px;
   line-height: 1.6;
-  cursor: text;
 }
-
-.shell-block { margin-bottom: 2px; }
-/* 连续的终端回显行要像真实终端一样紧贴：
-   容器 gap(10px) + 块内下边距(2px) 全部抵消，只留行高。 */
-.entry-shell + .entry-shell { margin-top: -12px; }
-.entry-shell + .term-live { margin-top: -12px; }
-.term-line { white-space: pre-wrap; word-break: break-word; }
-.p-who { color: var(--ok); }
-.p-sep { color: var(--text-3); }
-.p-path { color: var(--purple); }
-.p-sym { color: var(--text-3); margin-right: 8px; }
-.p-cmd { color: var(--text); }
-.term-out { color: var(--text); margin: 0; white-space: pre-wrap; word-break: break-word; }
-.term-err { color: var(--danger); margin: 0; white-space: pre-wrap; word-break: break-word; }
-.term-busy { color: var(--text-3); }
-.term-fail { color: var(--danger); font-size: 11.5px; }
-.term-meta { margin-top: 4px; display: flex; align-items: center; gap: 8px; }
-.term-hint {
-  color: var(--warn);
-  font-size: 11.5px;
-  line-height: 1.6;
-  margin: 2px 0;
-  padding-left: 8px;
-  border-left: 2px solid var(--warn);
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-/* 不用 align-items: baseline：WKWebView 里 <input> 在 flex 中的基线
-   由边框盒合成，会和旁边 span 的文字错开半行（输入内容整体偏高）。
-   prompt span 与 input 行高同为 12.5px×1.6，居中对齐即基线对齐。 */
-.term-live { display: flex; align-items: center; margin-top: 4px; }
-.term-live > span { flex-shrink: 0; white-space: pre; }
-.term-input {
-  flex: 1;
-  width: auto;
-  min-width: 0;
-  border: none;
-  border-radius: 0;
-  background: transparent;
-  padding: 0;
-  margin: 0;
-  font-family: var(--mono);
-  font-size: 12.5px;
-  line-height: 1.6;
-  color: var(--text);
-  caret-color: var(--text);
-}
-.term-input:focus { border: none; outline: none; }
-.term-input:disabled { background: transparent; opacity: 1; color: var(--text-3); }
-.term-input::placeholder { color: var(--text-3); }
+.archive-empty { color: var(--text-3); font-size: 12.5px; padding: 8px 2px; }
 
 .msg { display: flex; gap: 10px; font-family: var(--font, inherit); }
 .msg-role {
@@ -710,12 +982,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
   padding-top: 3px;
   text-align: right;
 }
-.msg-body {
-  flex: 1;
-  line-height: 1.7;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
+.msg-body { flex: 1; line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
 .msg.user .msg-body {
   background: var(--accent-bg);
   border-radius: var(--radius);
@@ -723,6 +990,13 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
   color: var(--accent);
 }
 .msg.assistant .msg-body { padding: 3px 0; }
+.msg.error .msg-body {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border-radius: 8px;
+  padding: 9px 12px;
+}
+.msg.system .msg-body { color: var(--text-3); font-size: 12px; }
 
 .caret {
   display: inline-block;
@@ -733,19 +1007,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
   background: var(--text-2);
   animation: caret-blink 1s steps(2, start) infinite;
 }
-@keyframes caret-blink {
-  to { visibility: hidden; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .caret { animation: none; }
-}
-.msg.error .msg-body {
-  background: var(--danger-bg);
-  color: var(--danger);
-  border-radius: 8px;
-  padding: 9px 12px;
-}
-.msg.system .msg-body { color: var(--text-3); font-size: 12px; }
+@keyframes caret-blink { to { visibility: hidden; } }
+@media (prefers-reduced-motion: reduce) { .caret { animation: none; } }
 
 .tool {
   border: 1px solid var(--border);
@@ -757,12 +1020,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
 .tool-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .tool-name { font-weight: 500; color: var(--purple); }
 .right { margin-left: auto; }
-.tool-cmd {
-  margin-top: 8px;
-  background: var(--surface-2);
-  border-radius: 7px;
-  padding: 8px 10px;
-}
+.tool-cmd { margin-top: 8px; background: var(--surface-2); border-radius: 7px; padding: 8px 10px; }
 .tool-reason { margin-top: 6px; font-size: 12px; color: var(--text-3); }
 
 .badge {
@@ -776,13 +1034,9 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
 .badge.danger { background: var(--danger-bg); color: var(--danger); }
 .badge.neutral { background: var(--surface-2); color: var(--text-2); }
 
-.result {
-  border-left: 2px solid var(--border);
-  padding-left: 12px;
-  font-family: var(--font, inherit);
-}
+.result { border-left: 2px solid var(--border); padding-left: 12px; font-family: var(--font, inherit); }
 .result-head { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
-.result pre { color: var(--text-2); }
+.result pre { color: var(--text-2); white-space: pre-wrap; word-break: break-word; }
 .tiny { font-size: 11px; }
 
 .injection {
@@ -803,8 +1057,6 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
 }
 .injection-hint { font-size: 12px; color: var(--text-2); margin-top: 7px; line-height: 1.65; }
 
-.thinking { color: var(--text-3); font-size: 12px; padding-left: 54px; font-family: var(--font, inherit); }
-
 .approval {
   margin: 0 18px 10px;
   border: 1px solid var(--warn);
@@ -812,7 +1064,6 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
   border-radius: var(--radius);
   padding: 12px 14px;
   flex-shrink: 0;
-  /* 卡片整体不超过面板剩余高度，避免底部按钮被 overflow:hidden 裁掉 */
   max-height: 70%;
   display: flex;
   flex-direction: column;
@@ -823,7 +1074,6 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
   border-radius: 7px;
   padding: 8px 10px;
   color: var(--text);
-  /* 卡片内只做预览：限高裁剪，全文走「详细」弹窗 */
   max-height: 168px;
   overflow: hidden;
 }
@@ -836,16 +1086,12 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onWinKeydown))
   background: var(--surface);
   padding: 8px 18px;
   display: flex;
-  align-items: center;
+  flex-direction: column;
   gap: 8px;
 }
-/* 「清空记录」与上下文操作之间的竖分隔线 */
-.composer-sep {
-  width: 1px;
-  height: 18px;
-  background: var(--border);
-  margin: 0 4px;
-  flex-shrink: 0;
-}
+.thinking-inline { color: var(--text-3); font-size: 12px; white-space: nowrap; flex-shrink: 0; }
+
+.composer-tools { display: flex; align-items: center; gap: 8px; }
+.composer-sep { width: 1px; height: 18px; background: var(--border); margin: 0 4px; flex-shrink: 0; }
 .grow-hint { margin-left: auto; }
 </style>
