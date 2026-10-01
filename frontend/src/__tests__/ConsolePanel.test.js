@@ -327,19 +327,19 @@ describe('ConsolePanel 运行指示', () => {
     expect(wrapper.text()).toContain('中断')
   })
 
-  it('运行中且无审批时显示「LLM 正在思考」', async () => {
+  it('运行中且无审批时显示「Thinking」', async () => {
     store.running = true
     setup()
     await nextTick()
-    expect(wrapper.text()).toContain('LLM 正在思考')
+    expect(wrapper.text()).toContain('Thinking')
   })
 
-  it('等待审批时不显示「正在思考」（此时在等人，不是在算）', async () => {
+  it('等待审批时不显示「Thinking」（此时在等人，不是在算）', async () => {
     store.running = true
     store.pending = { id: 'a1', name: 'run_command', command: 'ls' }
     setup()
     await nextTick()
-    expect(wrapper.text()).not.toContain('LLM 正在思考')
+    expect(wrapper.text()).not.toContain('Thinking')
   })
 })
 
@@ -373,7 +373,7 @@ describe('ConsolePanel 表面渲染', () => {
     await setupAttached()
     rt.emit('agent:message', { role: 'assistant', content: '我来看一下 nginx 的状态' })
     await nextTick()
-    expect(surfaceText()).toContain('LLM ›')
+    expect(surfaceText()).toContain('●')
     expect(surfaceText()).toContain('我来看一下 nginx 的状态')
   })
 
@@ -382,7 +382,7 @@ describe('ConsolePanel 表面渲染', () => {
     rt.emit('agent:delta', { step: 0, text: '磁盘' })
     rt.emit('agent:delta', { step: 0, text: '充足' })
     await nextTick()
-    expect(surfaceText()).toContain('LLM ›')
+    expect(surfaceText()).toContain('●')
     expect(surfaceText()).toContain('磁盘充足')
   })
 
@@ -495,6 +495,32 @@ describe('ConsolePanel 本地行编辑退格', () => {
     term.emitData('\x7f') // 缓冲已空 → 退格应为 no-op
     // 旧 slice(0,-1) 只去掉半个代理项，缓冲残留孤立高位代理→第二次退格还会再擦
     expect(term.written.length).toBe(afterFirst)
+  })
+
+  // 按方向键/Tab 等控制键会先把本地缓冲 flush 给远端，这一行从此由 shell 接管。
+  // 此时本地缓冲已空，退格必须转发给 PTY，否则会被 if (t.line) 吞掉 → 删不动。
+  it('控制键把整行交回远端后，退格转发给 PTY', async () => {
+    await setupAttached()
+    const term = instances[0]
+    for (const ch of 'rm -rf tex') term.emitData(ch) // 全本地缓冲，未发 PTY
+    expect(calls.filter(c => c.name === 'WriteTerminal')).toHaveLength(0)
+    term.emitData('\x1b[D') // 左方向键：flush 整行 + 交回 shell（降级透传）
+    const before = calls.filter(c => c.name === 'WriteTerminal').length
+    term.emitData('\x7f') // 退格：本地缓冲已空 → 应转发给远端
+    const writes = calls.filter(c => c.name === 'WriteTerminal')
+    expect(writes.length).toBeGreaterThan(before)
+    expect(writes[writes.length - 1].args[2]).toBe(textToBase64('\x7f'))
+  })
+
+  it('Ctrl-C 中断该行后回到本地编辑（后续输入不再转发）', async () => {
+    await setupAttached()
+    const term = instances[0]
+    for (const ch of 'ls') term.emitData(ch)
+    term.emitData('\x03') // Ctrl-C：中断、远端回到空提示符 → 不降级透传
+    const afterCtrlC = calls.filter(c => c.name === 'WriteTerminal').length
+    term.emitData('x') // 应回到本地行编辑：本地回显，不发 PTY
+    expect(calls.filter(c => c.name === 'WriteTerminal')).toHaveLength(afterCtrlC)
+    expect(term.written).toContain('x')
   })
 })
 
@@ -650,19 +676,19 @@ describe('ConsolePanel 流式输出', () => {
     expect(wrapper.find('.msg.assistant .caret').exists()).toBe(false)
   })
 
-  it('正在逐字输出时不显示「LLM 正在思考」（此时在输出，不是在算）', async () => {
+  it('正在逐字输出时不显示「Thinking」（此时在输出，不是在算）', async () => {
     store.running = true
     setup()
     push({ kind: 'assistant', content: '输出中', stream: 0, streaming: true })
     await nextTick()
-    expect(wrapper.text()).not.toContain('LLM 正在思考')
+    expect(wrapper.text()).not.toContain('Thinking')
   })
 
-  it('思考阶段（还没有任何增量）仍显示「LLM 正在思考」', async () => {
+  it('思考阶段（还没有任何增量）仍显示「Thinking」', async () => {
     store.running = true
     setup()
     await nextTick()
-    expect(wrapper.text()).toContain('LLM 正在思考')
+    expect(wrapper.text()).toContain('Thinking')
   })
 
   it('生成过程中内容增长会触发自动滚动', async () => {

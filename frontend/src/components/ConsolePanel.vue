@@ -287,11 +287,12 @@ function onTermData(key, d) {
   if (!t) return
   const send = s => writeTerminal(t.hostId, t.sessionId, s)
 
-  // 已降级透传（本地编辑期间来过外部输出）：原样送 PTY（多字符也整体送），
-  // 回车后恢复本地编辑。
+  // 已降级透传（本地编辑期间来过外部输出，或本地缓冲已被控制键 flush 给远端）：
+  // 原样送 PTY（多字符也整体送）。回车（这一行交回 shell 处理完）或 Ctrl-C
+  // （中断、回到空提示符）后恢复本地编辑。
   if (t.passthrough) {
     send(textToBase64(d))
-    if (/[\r\n]/.test(d)) t.passthrough = false
+    if (/[\r\n\x03]/.test(d)) t.passthrough = false
     return
   }
 
@@ -306,6 +307,9 @@ function onTermData(key, d) {
     if (/[\x00-\x1f\x7f]/.test(d)) {
       flushLocalToPty(t)
       send(textToBase64(d))
+      // 整段控制序列（方向键/粘贴含控制符等）同样把这一行交回 shell 接管：
+      // 缓冲已 flush 给远端，不置透传则后续退格会因本地缓冲已空而被吞掉。
+      t.passthrough = !d.includes('\x03')
       return
     }
     if (!t.line) t.startCol = cursorCol(t)
@@ -344,10 +348,15 @@ function onTermData(key, d) {
   }
 
   // 其它控制字符 / 转义序列（Tab、方向键、Ctrl-C、Ctrl-R、Esc…）：
-  // 放弃本地行编辑，flush 给 PTY 后透传该键，之后由 shell 处理该行。
+  // 放弃本地行编辑，把缓冲 flush 给 PTY 后透传该键 —— 从这一下起这一行交给
+  // shell，后续按键（含退格、方向键）原样进 PTY，直到回车再回到本地行编辑。
+  // 关键：必须置 passthrough，否则退格会因本地缓冲已被 flush 清空而被吞掉，
+  // 表现为「按方向键/Tab 编辑一行后删不动」。Ctrl-C 例外：它中断并清空该行，
+  // 远端回到空提示符，故留在本地编辑态。
   if (/[\x00-\x1f\x7f]/.test(d)) {
     flushLocalToPty(t)
     send(textToBase64(d))
+    t.passthrough = !d.includes('\x03')
     return
   }
 
@@ -803,7 +812,19 @@ onBeforeUnmount(() => {
         <span
           v-if="store.running && !store.pending && !streamingNow"
           class="thinking-inline"
-        >LLM 正在思考…</span>
+          aria-live="polite"
+        >
+          <svg class="thinking-icon" width="14" height="14" viewBox="0 0 24 24" aria-hidden="true">
+            <g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" />
+              <path d="M21 3v5h-5" />
+              <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" />
+              <path d="M8 16H3v5" />
+            </g>
+            <path class="thinking-spark" d="M19 1.6l.7 1.9 1.9.7-1.9.7-.7 1.9-.7-1.9-1.9-.7 1.9-.7z" fill="currentColor" stroke="none" />
+          </svg>
+          Thinking
+        </span>
         <UiSelect
           class="model-select"
           :model-value="activeProfileId"
@@ -1089,7 +1110,23 @@ onBeforeUnmount(() => {
   flex-direction: column;
   gap: 8px;
 }
-.thinking-inline { color: var(--text-3); font-size: 12px; white-space: nowrap; flex-shrink: 0; }
+.thinking-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-3);
+  font-size: 12px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  animation: thinking-breathe 1.8s ease-in-out infinite;
+}
+.thinking-icon { flex-shrink: 0; display: block; }
+.thinking-spark { transform-origin: 19px 5px; animation: thinking-spark 1.8s ease-in-out infinite; }
+@keyframes thinking-breathe { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
+@keyframes thinking-spark { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  .thinking-inline, .thinking-spark { animation: none; opacity: .8; }
+}
 
 .composer-tools { display: flex; align-items: center; gap: 8px; }
 .composer-sep { width: 1px; height: 18px; background: var(--border); margin: 0 4px; flex-shrink: 0; }

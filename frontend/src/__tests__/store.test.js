@@ -926,17 +926,17 @@ describe('agent 事件双写到终端表面', () => {
     const msgs = store.entries.filter(e => e.kind === 'assistant')
     expect(msgs).toHaveLength(1)
     expect(msgs[0].content).toBe('磁盘充足')
-    // 表面上：角色抬头 + 正文
-    expect(sink.painted()).toContain('LLM ›')
+    // 表面上：符号抬头● + 正文
+    expect(sink.painted()).toContain('●')
     expect(sink.painted()).toContain('磁盘充足')
   })
 
-  it('用户那句话也画到表面（带「你 ›」抬头）', () => {
+  it('用户那句话也画到表面（带「❯」符号）', () => {
     attach('h1')
     rt.emit('agent:message', { role: 'user', content: 'nginx 挂了' })
 
     expect(store.entries.map(e => e.kind)).toEqual(['user'])
-    expect(sink.painted()).toContain('你 ›')
+    expect(sink.painted()).toContain('❯')
     expect(sink.painted()).toContain('nginx 挂了')
   })
 

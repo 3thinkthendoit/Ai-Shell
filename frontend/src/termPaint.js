@@ -55,17 +55,18 @@ export function paintSessionDivider(write, label) {
 }
 
 // 人在 composer 里交给 agent 的那句话（shell 行不画：它由 PTY 自己回显）。
+// 用纯符号提示符❯（蓝）代替文字称呼，更像 shell、更省地方。
 export function paintUser(write, text) {
   if (!write) return
   nl(write, '')
-  nl(write, BLUE + BOLD + '你 › ' + RESET + String(text == null ? '' : text))
+  nl(write, BLUE + BOLD + '❯ ' + RESET + String(text == null ? '' : text))
 }
 
-// agent 回复的开头：先落一个角色抬头，随后 delta 逐字接在后面。
+// agent 回复的开头：先落一个符号抬头●（绿），随后 delta 逐字接在后面。
 export function paintAssistantHeader(write) {
   if (!write) return
   nl(write, '')
-  write(GREEN + BOLD + 'LLM › ' + RESET)
+  write(GREEN + BOLD + '● ' + RESET)
 }
 
 // 流式增量：原样追加，不加行尾换行（模型自己会发 \n）。
