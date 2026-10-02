@@ -78,6 +78,14 @@ export function paintAssistantDelta(write, text) {
   write(String(text == null ? '' : text).replace(/\r?\n/g, '\r\n'))
 }
 
+// 思考增量：弱化灰字，样式自包含（每段自带 DIM…RESET），
+// 后续正文另起一行落●抬头时天然回到正常样式。终端表面无法折叠，
+// 思考全程平铺，与 Claude Code 等终端工具的观感一致。
+export function paintAssistantReasoning(write, text) {
+  if (!write) return
+  write(DIM + String(text == null ? '' : text).replace(/\r?\n/g, '\r\n') + RESET)
+}
+
 // 回复定稿：补一个换行，把光标停在新一行行首。
 export function paintAssistantEnd(write) {
   if (!write) return

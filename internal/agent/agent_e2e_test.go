@@ -89,6 +89,7 @@ func writeSSEFromResponse(w http.ResponseWriter, resp string) {
 		Choices []struct {
 			Message struct {
 				Content   string `json:"content"`
+				Reasoning string `json:"reasoning_content"`
 				ToolCalls []struct {
 					ID       string `json:"id"`
 					Type     string `json:"type"`
@@ -121,6 +122,10 @@ func writeSSEFromResponse(w http.ResponseWriter, resp string) {
 	}
 
 	msg := cr.Choices[0].Message
+	// 思考先于正文到达（推理型模型的真实时序），同样按 3 字符一组拆开
+	for _, part := range splitRunes(msg.Reasoning, 3) {
+		send(map[string]any{"reasoning_content": part})
+	}
 	// 正文按 3 个字符一组拆开，制造真实的碎片化到达
 	for _, part := range splitRunes(msg.Content, 3) {
 		send(map[string]any{"content": part})
@@ -196,6 +201,19 @@ func respContent(text string) string {
 	b, _ := json.Marshal(map[string]any{
 		"choices": []any{map[string]any{
 			"message": map[string]any{"role": "assistant", "content": text},
+		}},
+	})
+	return string(b)
+}
+
+// respReasoning 构造一个带思考内容（reasoning_content）的回复，
+// 模拟 DeepSeek-R1 这类推理型模型的输出形状。
+func respReasoning(reason, content string) string {
+	b, _ := json.Marshal(map[string]any{
+		"choices": []any{map[string]any{
+			"message": map[string]any{
+				"role": "assistant", "content": content, "reasoning_content": reason,
+			},
 		}},
 	})
 	return string(b)
@@ -935,6 +953,66 @@ func TestAgentEmptyReplyDoesNotRetryNonStream(t *testing.T) {
 	}
 	if !h.hasEvent(EvError) {
 		t.Fatal("应向界面发出 agent:error 事件，而不是静默结束")
+	}
+}
+
+// 推理型模型（DeepSeek-R1 等）的思考内容必须以 agent:reasoning 事件
+// 透传给界面，否则用户只看到模型「卡住」再突然蹦出答案，看不到思考过程。
+// 思考内容只进展示：不得回传 API、不得写入会话历史。
+func TestAgentStreamsReasoningToUI(t *testing.T) {
+	h := newHarness(t, []string{
+		respReasoning("先看 docker 服务状态。", "Docker 正常。"),
+	}, policy.ModeWhitelist, true)
+
+	if err := runDefault(h.ag, context.Background(), h.hostID, "本机 docker 正常么"); err != nil {
+		t.Fatalf("运行失败: %v", err)
+	}
+	if !h.hasEvent(EvReasoning) {
+		t.Fatal("思考内容应通过 agent:reasoning 事件上报给界面")
+	}
+
+	// 思考内容不进历史：历史里那条 assistant 只有正文
+	hist := histDefault(h.ag, h.hostID)
+	var last llm.Message
+	for _, m := range hist {
+		if m.Role == "assistant" {
+			last = m
+		}
+	}
+	if last.Content != "Docker 正常。" {
+		t.Fatalf("历史中的终局回答不符: %q", last.Content)
+	}
+
+	// 下一轮请求里也不得携带 reasoning_content（部分服务端拒绝这种输入）
+	if msgs := h.fake.messagesAt(h.fake.requestCount() - 1); len(msgs) > 0 {
+		for _, m := range msgs {
+			if m.Reasoning != "" {
+				t.Fatalf("回传 API 的消息不应携带思考内容: %q", m.Reasoning)
+			}
+		}
+	}
+}
+
+// 系统提示必须声明会话绑定的主机：用户口中的「本机」「这台机器」才有唯一定义。
+// 不声明的话模型只能从主机清单里猜，猜不中就反问「本机是哪台？」——
+// 一次简单的排查被硬拆成两轮对话（线上实测反复出现）。
+// 同时：已绑定主机时不应再要求「先调 list_hosts」——那是白费一步。
+func TestSystemPromptNamesTheSessionHost(t *testing.T) {
+	h := newHarness(t, []string{respContent("好的")}, policy.ModeWhitelist, true)
+
+	if err := runDefault(h.ag, context.Background(), h.hostID, "本机 docker 正常么"); err != nil {
+		t.Fatalf("运行失败: %v", err)
+	}
+
+	sys := h.fake.messagesAt(0)[0].Content
+	if !strings.Contains(sys, "prod-web") || !strings.Contains(sys, "id=h-test") {
+		t.Fatalf("系统提示应声明会话绑定的主机（名称+id），实得: %.200s", sys)
+	}
+	if !strings.Contains(sys, "本机") {
+		t.Fatal("系统提示应说明「本机」等称呼指会话所属主机")
+	}
+	if strings.Contains(sys, "先调用 list_hosts") {
+		t.Fatal("已绑定主机的会话不应再要求先调 list_hosts 绕路")
 	}
 }
 

@@ -457,6 +457,22 @@ describe('ConsolePanel 表面渲染', () => {
     await nextTick()
     expect(surfaceText()).toContain('连接超时')
   })
+
+  it('思考增量画进表面，正文开始时另起一行落新抬头', async () => {
+    await setupAttached()
+    // 思考先于正文到达（推理型模型的真实时序），先由思考建出这条消息
+    rt.emit('agent:reasoning', { step: 0, text: '先看服务状态' })
+    rt.emit('agent:delta', { step: 0, text: 'Docker 正常。' })
+    await nextTick()
+    // 思考与正文都上屏，且正文另起一行有自己的●抬头
+    expect(surfaceText()).toContain('先看服务状态')
+    expect(surfaceText()).toContain('Docker 正常。')
+    expect(surfaceText().split('●').length - 1).toBe(2)
+    // 归档时间线里挂到同一条消息上，思考不混进正文
+    const msg = store.entries.filter(e => e.kind === 'assistant').pop()
+    expect(msg.reasoning).toBe('先看服务状态')
+    expect(msg.content).toBe('Docker 正常。')
+  })
 })
 
 // ---- 本地行编辑的退格 ----
@@ -703,6 +719,63 @@ describe('ConsolePanel 流式输出', () => {
     await nextTick()
     await nextTick()
     expect(log.scrollTop).toBe(1234)
+  })
+})
+
+// ---- 思考过程（推理型模型） ----
+
+describe('ConsolePanel 思考过程', () => {
+  // 思考区渲染在「对话归档」时间线里（活表面是 xterm），可见性断言先切过去
+  async function toArchive() {
+    await wrapper.findAll('.seg button').find(b => b.text() === '对话归档').trigger('click')
+    await nextTick()
+  }
+
+  it('思考中显示「思考中…」且默认展开，点击可折叠', async () => {
+    setup()
+    await toArchive()
+    push({ kind: 'assistant', content: '', stream: 0, streaming: true, reasoning: '先看服务状态', reasoningOpen: true })
+    await nextTick()
+
+    const head = wrapper.find('.reasoning-head')
+    expect(head.exists()).toBe(true)
+    expect(head.text()).toContain('思考中')
+    expect(wrapper.find('.reasoning-body').isVisible()).toBe(true)
+    expect(wrapper.find('.reasoning-body').text()).toContain('先看服务状态')
+
+    await head.trigger('click')
+    await nextTick()
+    expect(wrapper.find('.reasoning-body').isVisible()).toBe(false)
+  })
+
+  it('正文到达后标题变「思考过程」，默认收起但可再展开', async () => {
+    setup()
+    await toArchive()
+    push({ kind: 'assistant', content: '', stream: 0, streaming: true, reasoning: '先看服务状态', reasoningOpen: true })
+    await nextTick()
+
+    // 定稿：store.js 的 agent:message 处理器会把 reasoningOpen 收起
+    store.entries[0].content = 'Docker 正常。'
+    store.entries[0].streaming = false
+    store.entries[0].reasoningOpen = false
+    await nextTick()
+
+    expect(wrapper.find('.reasoning-head').text()).toContain('思考过程')
+    expect(wrapper.find('.reasoning-head').text()).not.toContain('思考中')
+    expect(wrapper.find('.reasoning-body').isVisible()).toBe(false)
+
+    await wrapper.find('.reasoning-head').trigger('click')
+    await nextTick()
+    expect(wrapper.find('.reasoning-body').isVisible()).toBe(true)
+    expect(wrapper.text()).toContain('Docker 正常。')
+  })
+
+  it('有思考内容的消息不显示「空回复」占位符', async () => {
+    setup()
+    await toArchive()
+    push({ kind: 'assistant', content: '', stream: 0, streaming: false, reasoning: '想了很多', reasoningOpen: false })
+    await nextTick()
+    expect(wrapper.text()).not.toContain('模型返回了空回复')
   })
 })
 

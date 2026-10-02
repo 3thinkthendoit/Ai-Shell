@@ -739,7 +739,16 @@ onBeforeUnmount(() => {
 
         <div v-else-if="e.kind === 'assistant'" class="msg assistant">
           <div class="msg-role">LLM</div>
-          <div class="msg-body">{{ e.content }}<span v-if="e.streaming" class="caret"></span><span v-if="!e.content && !e.streaming" class="muted tiny">（模型返回了空回复）</span></div>
+          <div class="msg-body">
+            <div v-if="e.reasoning" class="reasoning">
+              <div class="reasoning-head" @click="e.reasoningOpen = !e.reasoningOpen">
+                {{ e.streaming && !e.content ? '思考中…' : '思考过程' }}
+                <span class="reasoning-arrow">{{ e.reasoningOpen ? '▾' : '▸' }}</span>
+              </div>
+              <div v-show="e.reasoningOpen" class="reasoning-body">{{ e.reasoning }}</div>
+            </div>
+            {{ e.content }}<span v-if="e.streaming" class="caret"></span><span v-if="!e.content && !e.reasoning && !e.streaming" class="muted tiny">（模型返回了空回复）</span>
+          </div>
         </div>
 
         <div v-else-if="e.kind === 'tool'" class="tool">
@@ -1011,6 +1020,27 @@ onBeforeUnmount(() => {
   color: var(--accent);
 }
 .msg.assistant .msg-body { padding: 3px 0; }
+
+/* 思考过程：弱化的折叠块，思考中自动展开，回答开始后收起 */
+.reasoning { margin: 2px 0 6px; border-left: 2px solid var(--border); padding-left: 8px; }
+.reasoning-head {
+  font-size: 11px;
+  color: var(--text-3);
+  cursor: pointer;
+  user-select: none;
+  line-height: 1.8;
+}
+.reasoning-head:hover { color: var(--text-2); }
+.reasoning-arrow { font-size: 10px; margin-left: 4px; }
+.reasoning-body {
+  font-size: 12px;
+  color: var(--text-3);
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow-y: auto;
+}
 .msg.error .msg-body {
   background: var(--danger-bg);
   color: var(--danger);

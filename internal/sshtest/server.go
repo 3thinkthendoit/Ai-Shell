@@ -97,6 +97,10 @@ type PTYRequest struct {
 	Term string
 	Cols int
 	Rows int
+	// Modes 是 pty-req 载荷里的 POSIX 终端模式（opcode → 值，TTY_OP_END 截止）。
+	// 客户端靠初始 ECHO=0 做到 shell integration 零回显注入（见 sshclient.OpenPTY
+	// 与 app.injectShellIntegration），这条约定必须能从报文层面钉住。
+	Modes map[uint8]uint32
 }
 
 // Size 是一次终端尺寸（列、行）。
@@ -317,11 +321,32 @@ func parsePTYRequest(p []byte) (PTYRequest, bool) {
 	if !ok {
 		return PTYRequest{}, false
 	}
-	rows, _, ok := readUint32(rest)
+	rows, rest, ok := readUint32(rest)
 	if !ok {
 		return PTYRequest{}, false
 	}
-	return PTYRequest{Term: term, Cols: int(cols), Rows: int(rows)}, true
+	// 宽度（像素）、高度（像素）：本服务端不关心，但必须消费掉才能读到模式
+	if _, rest, ok = readUint32(rest); !ok {
+		return PTYRequest{}, false
+	}
+	if _, rest, ok = readUint32(rest); !ok {
+		return PTYRequest{}, false
+	}
+	// 终端模式：重复的 (opcode byte, uint32 值)，以 opcode 0（TTY_OP_END）结束
+	modes := map[uint8]uint32{}
+	for len(rest) >= 5 {
+		op := rest[0]
+		if op == 0 {
+			break
+		}
+		v, r, ok := readUint32(rest[1:])
+		if !ok {
+			break
+		}
+		modes[op] = v
+		rest = r
+	}
+	return PTYRequest{Term: term, Cols: int(cols), Rows: int(rows), Modes: modes}, true
 }
 
 // parseWindowChange 解析 window-change：uint32 宽（列）、uint32 高（行）。

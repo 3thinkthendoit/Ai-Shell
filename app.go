@@ -824,28 +824,18 @@ const shellIntegration = `if [ -n "$BASH_VERSION" ]; then trap 'printf "\033]133
 
 // injectShellIntegration 把 shell integration 片段送进刚开好的 shell。
 //
-// 先 stty -echo 再送片段：远端 shell 会把写进去的东西原样回显，
-// 不关回显的话用户第一屏会看到一行 trap/PROMPT_COMMAND 天书。
+// 回显问题在**申请伪终端时**就已解决：openPTY 的初始终端模式带 ECHO=0（见
+// sshclient），注入的每一行都不会被远端行规程回显。因此这里不需要旧实现那套
+// 「stty -echo + printf 自擦除 + 固定 sleep」的时序把戏 —— 那套做法依赖
+// 「shell 已就绪、提示符已打出」：shell 启动慢于写入时（登录横幅还没打完），
+// 命令的回显先于横幅出现在屏幕上，等 shell 执行到 printf 时光标早已被推下去，
+// 擦错行，用户第一屏就留下了 `stty -echo;printf ...` 天书。
 //
-// 关键：不能把三行连着一次性写出去。远端 tty 的 ECHO 是在**收到输入时**就回显，
-// 而不是等 shell 执行；若片段和「stty -echo」挤在同一次输入里，tty 会在 ECHO 关掉前
-// 把三行**全部**回显出来（表现为片段也显示在屏幕上），而且第一行的自擦除会因光标已
-// 移到下方而擦错行。所以先单独发「关回显」（并让它擦掉自己那行回显），等一下让远端真正
-// 执行完 stty -echo，再发片段 —— 此时 ECHO 已关，片段不再被回显。
-// 只保留当前任务、终端刚开时屏上本就没有用户内容，擦掉这一行不影响登录横幅（MOTD）。
+// 现在两行一次性写入，在远端输入缓冲里按序执行；shell 何时就绪都无所谓：
+// 注入零回显，执行完 `stty echo` 恢复正常回显，屏幕上不留任何痕迹。
 func (a *App) injectShellIntegration(p *sshclient.PTY) {
-	// 关回显；命令很短（单行不换行），末尾拼一段 printf 输出「光标上移一行 + 清除整行」
-	// 的 ANSI 序列，正好抹掉「stty -echo…」这一行自身的回显。
-	_ = p.Write([]byte("stty -echo;printf '\\033[1A\\033[2K'\n"))
-	// 给远端一个往返的时间执行 stty -echo，避免片段与它挤进同一次输入被一次性回显。
-	time.Sleep(shellIntegrationEchoDelay)
-	_ = p.Write([]byte(shellIntegration + "\n"))
-	_ = p.Write([]byte("stty echo\n"))
+	_ = p.Write([]byte(shellIntegration + "\nstty echo\n"))
 }
-
-// shellIntegrationEchoDelay 是「关回显」与「送片段」之间的缓冲：确保远端已把 ECHO
-// 关掉，片段才不会作为输入被 tty 回显出来。取值兼顾慢速链路的往返与终端打开的延迟。
-const shellIntegrationEchoDelay = 250 * time.Millisecond
 
 // ReportActiveSession 前端报告「某台主机上正在看哪条会话」。
 // 常驻终端的定格快照要落到人正在看的那条时间线上，后端自己

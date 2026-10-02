@@ -20,11 +20,12 @@ import (
 
 // Message 是一条对话消息。
 type Message struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content,omitempty"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	Name       string     `json:"name,omitempty"`
+	Role      string `json:"role"`
+	Content   string `json:"content,omitempty"`
+	Reasoning string `json:"reasoning_content,omitempty"` // 推理型模型的思考内容（仅展示用，不入上下文）
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string `json:"tool_call_id,omitempty"`
+	Name      string `json:"name,omitempty"`
 }
 
 // ToolCall 是模型请求调用某个工具。
@@ -118,6 +119,10 @@ type streamChunk struct {
 	Choices []struct {
 		Delta struct {
 			Content   string `json:"content"`
+			// 推理型模型的思考增量：DeepSeek 用 reasoning_content，
+			// OpenRouter 等用 reasoning —— 两个都收，谁有值用谁。
+			ReasoningContent string `json:"reasoning_content"`
+			Reasoning        string `json:"reasoning"`
 			ToolCalls []struct {
 				Index    int    `json:"index"`
 				ID       string `json:"id"`
@@ -136,9 +141,10 @@ type streamChunk struct {
 	} `json:"error"`
 }
 
-// Delta 是流式响应的一段正文增量。
+// Delta 是流式响应的一段增量。
 type Delta struct {
-	Content string
+	Content   string
+	Reasoning string
 }
 
 // EmptyReplyError 表示模型成功返回但内容为空。
@@ -380,8 +386,13 @@ func (c *Client) ChatStream(ctx context.Context, msgs []Message, tools []Tool, o
 		if err := emptyReplyErr(msg, cr.Choices[0].FinishReason); err != nil {
 			return Message{}, err
 		}
-		if onDelta != nil && msg.Content != "" {
-			onDelta(Delta{Content: msg.Content})
+		if onDelta != nil {
+			if msg.Reasoning != "" {
+				onDelta(Delta{Reasoning: msg.Reasoning})
+			}
+			if msg.Content != "" {
+				onDelta(Delta{Content: msg.Content})
+			}
 		}
 		return msg, nil
 	}
@@ -427,8 +438,16 @@ func (c *Client) consumeSSE(ctx context.Context, body io.Reader, onDelta func(De
 			}
 			if d := choice.Delta.Content; d != "" {
 				content.WriteString(d)
-				if onDelta != nil {
-					onDelta(Delta{Content: d})
+			}
+			// 推理增量不进正文聚合，只透传给界面
+			r := choice.Delta.ReasoningContent
+			if r == "" {
+				r = choice.Delta.Reasoning
+			}
+			if onDelta != nil {
+				d := Delta{Content: choice.Delta.Content, Reasoning: r}
+				if d.Content != "" || d.Reasoning != "" {
+					onDelta(d)
 				}
 			}
 			for _, tc := range choice.Delta.ToolCalls {

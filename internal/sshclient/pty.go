@@ -275,9 +275,13 @@ func (c *Client) openPTY(hostID, key, term string, size TerminalSize, onData fun
 	}
 
 	modes := ssh.TerminalModes{
-		// ECHO=1：让远端的行规程回显用户输入。这是真终端的行为 ——
-		// 关掉它用户就看不见自己敲了什么。
-		ssh.ECHO:          1,
+		// ECHO=0：**初始关回显**。终端打开后 app 会立即注入 shell integration
+		// 片段（见 app.go 的 injectShellIntegration），注入期间任何回显都会
+		// 留在用户第一屏上——旧实现靠「stty -echo + printf 自擦除 + 固定 sleep」
+		// 的时序把戏隐藏，但远端 shell 启动慢于写入时（横幅/提示符还没打出）
+		// 会擦错行，屏幕上留下 `stty -echo;printf ...` 天书。从申请伪终端起就
+		// 关掉回显，注入全程零残留；注入完由 app 写 `stty echo` 恢复正常回显。
+		ssh.ECHO:          0,
 		ssh.TTY_OP_ISPEED: 14400,
 		ssh.TTY_OP_OSPEED: 14400,
 	}

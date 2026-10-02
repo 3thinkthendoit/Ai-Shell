@@ -361,7 +361,7 @@ function liveAssistant(step) {
 // 表现是终端里「ls 变成 lllsss」、对话消息重复三份。
 // 因此每次先 EventsOff 清掉同名旧监听，再重新注册：调用多少次都只挂一份。
 const EV_NAMES = [
-  'agent:delta', 'agent:message', 'agent:tool', 'agent:toolResult',
+  'agent:delta', 'agent:message', 'agent:reasoning', 'agent:tool', 'agent:toolResult',
   'agent:injection', 'agent:approval', 'agent:status', 'agent:error',
   'audit:error', 'agent:done', 'term:data', 'term:exit', 'term:tui', 'agent:snapshot'
 ]
@@ -391,12 +391,37 @@ export function bindEvents() {
     const live = liveAssistant(d.step)
     if (live) {
       live.content += d.text
+      // 思考已先画到表面上：正文另起一行再落一个●抬头，别和思考挤在同一行
+      if (!live.contentPainted) {
+        live.contentPainted = true
+        if (live.reasoningPainted) {
+          paint.paintAssistantEnd(w)
+          paint.paintAssistantHeader(w)
+        }
+      }
       paint.paintAssistantDelta(w, d.text)
       return
     }
     push({ kind: 'assistant', content: d.text, stream: d.step, streaming: true })
     paint.paintAssistantHeader(w)
     paint.paintAssistantDelta(w, d.text)
+  })
+
+  // 推理型模型的思考增量：挂到同一条「活」消息的思考区（归档视图里可折叠），
+  // 同时以弱化灰字画进终端表面——那是主视图，思考过程必须当场可见。
+  // 思考先于正文到达，往往还要先由它建出这条消息。
+  r.EventsOn('agent:reasoning', d => {
+    const w = surfaceWrite(paintHost())
+    let live = liveAssistant(d.step)
+    if (!live) {
+      push({ kind: 'assistant', content: '', stream: d.step, streaming: true, reasoning: '', reasoningOpen: true })
+      live = liveAssistant(d.step)
+      paint.paintAssistantHeader(w)
+    }
+    live.reasoning = (live.reasoning || '') + d.text
+    live.reasoningOpen = true
+    live.reasoningPainted = true
+    paint.paintAssistantReasoning(w, d.text)
   })
 
   r.EventsOn('agent:message', m => {
@@ -412,6 +437,8 @@ export function bindEvents() {
       // 表面上 delta 已经流式画过了，这里只补一个换行收尾，不重画全文。
       live.content = m.content
       live.streaming = false
+      // 回答已开始：默认收起思考区，长思考不该一直把正文顶出屏幕，需要时可手动展开
+      live.reasoningOpen = false
       paint.paintAssistantEnd(w)
       return
     }

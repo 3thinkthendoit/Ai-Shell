@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"ai-shell/internal/sshtest"
+	"golang.org/x/crypto/ssh"
 )
 
 // 本文件是交互终端（PTY）的端到端测试。
@@ -134,6 +135,23 @@ func TestOpenPTYDefaultsTerminalType(t *testing.T) {
 	got, _ := srv.LastPTY()
 	if got.Term == "" {
 		t.Error("未指定 TERM 时应兜一个默认值，不能发空串")
+	}
+}
+
+// pty-req 的初始终端模式必须带 ECHO=0：shell integration 的注入靠它做到
+// 零回显（app.go 的 injectShellIntegration），否则终端打开的第一屏会留下
+// 注入命令的回显。恢复回显由注入片段末尾的 `stty echo` 负责 —— 两端任何
+// 一处单独改动都会破坏这条配合，所以从报文层面钉死。
+func TestOpenPTYRequestsEchoOffInitially(t *testing.T) {
+	_, srv, _, _ := openTestPTY(t, "", TerminalSize{Cols: 80, Rows: 24})
+
+	waitFor(t, "服务器收到 pty-req", func() bool {
+		_, ok := srv.LastPTY()
+		return ok
+	})
+	got, _ := srv.LastPTY()
+	if got.Modes[ssh.ECHO] != 0 {
+		t.Errorf("初始 ECHO 应为 0（注入零回显），实得 %d", got.Modes[ssh.ECHO])
 	}
 }
 

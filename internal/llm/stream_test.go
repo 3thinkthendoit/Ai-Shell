@@ -448,6 +448,95 @@ func TestChatStreamRequiresConfig(t *testing.T) {
 	}
 }
 
+// ---- 推理型模型的思考增量 ----
+
+// DeepSeek-R1 风格的 reasoning_content 增量必须原样透传给界面，
+// 且不得混进正文聚合——思考是展示用元信息，不是回答的一部分。
+func TestChatStreamForwardsReasoningDeltas(t *testing.T) {
+	reason := func(s string) string {
+		b, _ := json.Marshal(map[string]any{
+			"choices": []any{map[string]any{"delta": map[string]any{"reasoning_content": s}}},
+		})
+		return "data: " + string(b) + "\n\n"
+	}
+	srv := sseServer(t, []string{
+		reason("先看"), reason("服务状态"),
+		delta("Docker 正常。"),
+		`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}` + "\n\n",
+		"data: [DONE]\n\n",
+	})
+	c := newTestClient(t, srv)
+
+	var reasoning, content []string
+	msg, err := c.ChatStream(context.Background(), nil, nil, func(d Delta) {
+		if d.Reasoning != "" {
+			reasoning = append(reasoning, d.Reasoning)
+		}
+		if d.Content != "" {
+			content = append(content, d.Content)
+		}
+	})
+	if err != nil {
+		t.Fatalf("流式调用失败: %v", err)
+	}
+	if got := strings.Join(reasoning, ""); got != "先看服务状态" {
+		t.Fatalf("思考增量透传不符: %q", got)
+	}
+	if msg.Content != "Docker 正常。" {
+		t.Fatalf("正文聚合被思考污染: %q", msg.Content)
+	}
+	if strings.Contains(strings.Join(content, ""), "先看") {
+		t.Fatal("思考内容混进了正文增量")
+	}
+}
+
+// OpenRouter 风格的 reasoning 字段同样要透传。
+func TestChatStreamForwardsOpenRouterReasoningField(t *testing.T) {
+	b, _ := json.Marshal(map[string]any{
+		"choices": []any{map[string]any{"delta": map[string]any{"reasoning": "想想"}}},
+	})
+	srv := sseServer(t, []string{
+		"data: " + string(b) + "\n\n",
+		delta("答案"),
+		`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}` + "\n\n",
+		"data: [DONE]\n\n",
+	})
+	c := newTestClient(t, srv)
+
+	var got []string
+	msg, err := c.ChatStream(context.Background(), nil, nil, func(d Delta) {
+		if d.Reasoning != "" {
+			got = append(got, d.Reasoning)
+		}
+	})
+	if err != nil {
+		t.Fatalf("流式调用失败: %v", err)
+	}
+	if strings.Join(got, "") != "想想" {
+		t.Fatalf("reasoning 字段未透传: %v", got)
+	}
+	if msg.Content != "答案" {
+		t.Fatalf("正文不符: %q", msg.Content)
+	}
+}
+
+// 非流式响应里的 reasoning_content 同样要带回（chatOnce 的退回路径靠它补发思考）。
+func TestChatReturnsReasoningFromNonStreamResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"答案","reasoning_content":"思考"}}]}`)
+	}))
+	defer srv.Close()
+
+	msg, err := newTestClient(t, srv).Chat(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatalf("非流式调用失败: %v", err)
+	}
+	if msg.Reasoning != "思考" || msg.Content != "答案" {
+		t.Fatalf("解析不符: reasoning=%q content=%q", msg.Reasoning, msg.Content)
+	}
+}
+
 // ---- 空回复必须显式报错 ----
 
 // 模型成功返回（HTTP 200）但正文为空时，绝不能当成合法的空回答放行：
