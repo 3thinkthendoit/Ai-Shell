@@ -8,7 +8,7 @@ import {
   createSession, refreshSessions, runShellInTerminal, switchProfile, syncWindowTitle,
   openTerminal, writeTerminal, resizeTerminal, closeTerminal,
   registerTermSink, unregisterTermSink, termState, textToBase64, reportActiveSession,
-  bucketKey
+  bucketKey, isPtyDirty
 } from '../store'
 import { classifyInput } from '../inputRoute'
 import { providerBadge } from '../providerLogos'
@@ -95,6 +95,12 @@ function focusTerm(key) {
 }
 
 function disposeTerm(key) {
+  const pending = pendingResize.get(key)
+  if (pending) {
+    clearTimeout(pending)
+    pendingResize.delete(key)
+  }
+  lastSentSize.delete(key)
   const t = terms.get(key)
   if (t) {
     unregisterTermSink(t.hostId, t.sessionId, t.sink)
@@ -107,6 +113,31 @@ function disposeTerm(key) {
   }
   openedKeys.value = openedKeys.value.filter(x => x !== key)
   surfaceEls.delete(key)
+}
+
+// ---- 尺寸上报：防抖 + 去重 ----
+//
+// 为什么不能「一变就发」：每次 window-change 都会让远端 shell 收到 SIGWINCH，
+// readline 会重绘当前提示符行。空提示符下「重绘」就是把提示符再打一遍，而
+// 光标正好停在上一遍的末尾 —— 拖动窗口、归档切换引发的连续 resize 会在同一行
+// 叠出「[root@host ~]# [root@host ~]# [root@host ~]#」。
+// 防抖把风暴合并成一次（取最新尺寸）；同尺寸重测（归档切回、状态行增减）
+// 直接不发 —— 后端 PTY 创建时就带着当前尺寸，重复 window-change 没有信息量。
+const pendingResize = new Map() // key -> timer
+const lastSentSize = new Map()  // key -> 'cols x rows'
+const RESIZE_DEBOUNCE_MS = 150
+
+function reportResize(key, hostId, sessionId, cols, rows) {
+  const size = cols + 'x' + rows
+  if (lastSentSize.get(key) === size) return
+  const prev = pendingResize.get(key)
+  if (prev) clearTimeout(prev)
+  const timer = setTimeout(() => {
+    pendingResize.delete(key)
+    lastSentSize.set(key, size)
+    resizeTerminal(hostId, sessionId, cols, rows)
+  }, RESIZE_DEBOUNCE_MS)
+  pendingResize.set(key, timer)
 }
 
 async function ensureTerm(hostId, sessionId) {
@@ -160,14 +191,14 @@ async function ensureTerm(hostId, sessionId) {
   // 顺序不能反：先登记落点再 OpenTerminal。远端 shell 一启动就打印提示符，
   // 登记晚了那一段就落进虚空了。
   registerTermSink(hostId, sessionId, sink)
-  terms.set(key, { term, fit, sink, hostId, sessionId, line: '', startCol: 0, passthrough: false })
+  terms.set(key, { term, fit, sink, hostId, sessionId, line: '', startCol: 0, passthrough: false, lineSynthetic: false })
 
   // 用户按键 → 本地行编辑（见 onTermData）：常态下可打印字符本地回显、
   // 回车时分类；全屏程序接管或控制键则原样透传。不再是无脑逐字符进 PTY。
   term.onData(d => onTermData(key, d))
   // 尺寸变化 → 后端。少了这一步远端程序会一直按初始尺寸排版。
   term.onResize(({ cols, rows }) => {
-    resizeTerminal(hostId, sessionId, cols, rows)
+    reportResize(key, hostId, sessionId, cols, rows)
   })
 
   doFit(key)
@@ -310,6 +341,8 @@ function onTermData(key, d) {
       // 整段控制序列（方向键/粘贴含控制符等）同样把这一行交回 shell 接管：
       // 缓冲已 flush 给远端，不置透传则后续退格会因本地缓冲已空而被吞掉。
       t.passthrough = !d.includes('\x03')
+      // 这一行交还 shell 后，行首的合成提示符不再是「我们的」——不能在回车时整行擦除
+      t.lineSynthetic = false
       return
     }
     if (!t.line) t.startCol = cursorCol(t)
@@ -321,6 +354,7 @@ function onTermData(key, d) {
   // 全屏程序接管：擦掉残留本地回显后整体透传，绝不抢键、也不污染程序输入。
   if (isFullscreen(key)) {
     clearLocalEcho(t)
+    t.lineSynthetic = false
     send(textToBase64(d))
     return
   }
@@ -329,7 +363,14 @@ function onTermData(key, d) {
   if (d === '\r' || d === '\n') {
     const line = t.line
     t.line = ''
-    eraseLocalLine(t, line)
+    if (t.lineSynthetic) {
+      // 这一行开头的 ❯ 是界面补的合成提示符，不是远端画的：整行清掉，
+      // agent 分支由 paintUser 重画提问行，shell 分支由 PTY 回显命令与真提示符。
+      t.lineSynthetic = false
+      t.term.write('\r\x1b[2K')
+    } else {
+      eraseLocalLine(t, line)
+    }
     enqueueSubmit(key, line)
     return
   }
@@ -357,6 +398,8 @@ function onTermData(key, d) {
     flushLocalToPty(t)
     send(textToBase64(d))
     t.passthrough = !d.includes('\x03')
+    // 这一行交还 shell 后，行首的合成提示符不再是「我们的」——不能在回车时整行擦除
+    t.lineSynthetic = false
     return
   }
 
@@ -394,6 +437,20 @@ watch(showArchive, async on => {
   }
   await nextTick()
   doFit(currentKey.value)
+})
+
+// agent 回合结束 → 回到输入态。提问不走 PTY，远端 shell 不会打印新提示符；
+// 若本轮 PTY 一次都没被写过（纯问答），表面补一个合成 ❯ 提示符，
+// 否则光标悬在空行上，看起来像「回复完没回到命令输入行」。
+// PTY 有写入（top 交接 / shell 命令）时 shell 自己会回到提示符，不补。
+watch(() => store.running, (v, ov) => {
+  if (ov !== true || v) return
+  const key = currentKey.value
+  const t = terms.get(key)
+  if (!t || t.passthrough || t.line || t.lineSynthetic) return
+  if (isPtyDirty(t.hostId, t.sessionId)) return
+  paint.paintInputPrompt(surfaceWrite(key))
+  t.lineSynthetic = true
 })
 
 // 状态行出现/消失会改 surface-body 的高度，但 .surface 自身尺寸不变 ——

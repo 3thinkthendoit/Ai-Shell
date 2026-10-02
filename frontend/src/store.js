@@ -592,6 +592,9 @@ export async function ask(prompt) {
   // 用户中途切了主机或会话也不会把输出写错地方。
   store.activeHostId = store.currentHostId
   store.activeSessionId = store.currentSessionId
+  // 本轮 PTY 写入标记从零计数：上一轮结束时已消费，期间的零星写入
+  // （如空回车让 shell 打新提示符）不代表「本轮 shell 自己打印过提示符」。
+  ptyDirty.delete(bucketKey(store.activeHostId, store.activeSessionId))
   store.running = true
   try {
     await api().Ask(store.currentHostId, store.currentSessionId, prompt)
@@ -812,7 +815,9 @@ export async function runShellInTerminal(hostId, sessionId, command) {
   store.busy = true
   try {
     const res = await api().RunShellInTerminal(hostId, sessionId, command)
-    // 放行时 PTY 自己会回显命令与输出，无需多话；被拒/取消/出错才在表面上说明原因。
+    // 放行时 PTY 自己会回显命令与输出；命令跑完提示一句「输出可以直接问 LLM」。
+    // 被拒/取消/出错由 paintShellVerdict 说明原因，不再叠加提示。
+    if (res.status === 'done') paint.paintLLMHint(surfaceWrite(key))
     paint.paintShellVerdict(surfaceWrite(key), res)
     return res
   } catch (e) {
@@ -933,8 +938,20 @@ export async function openTerminal(hostId, sessionId, cols, rows) {
   return st
 }
 
+// ptyDirty 记录「哪块表面在本轮 agent 运行期间被写过 PTY 输入」。
+// 纯问答轮（提问没走 PTY）结束时远端 shell 不会打印新提示符，
+// 界面要补一个本地输入提示符；而 top 交接、shell 命令这类写入会让
+// shell 自己回到提示符，就不该再补。见 agent:done 处理与 ConsolePanel。
+const ptyDirty = new Set()
+
+// isPtyDirty 供界面在回合结束时判断要不要补输入提示符。
+export function isPtyDirty(hostId, sessionId) {
+  return ptyDirty.has(bucketKey(hostId, sessionId))
+}
+
 export async function writeTerminal(hostId, sessionId, dataB64) {
   if (!api()) return
+  ptyDirty.add(bucketKey(hostId, sessionId))
   try {
     await api().WriteTerminal(hostId, sessionId, dataB64)
   } catch (e) {

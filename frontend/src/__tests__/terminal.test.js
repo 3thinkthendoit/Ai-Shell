@@ -321,18 +321,57 @@ describe('常驻终端表面 按键与尺寸', () => {
     expect(callsOf('WriteTerminal')).toHaveLength(0)
   })
 
-  it('尺寸变化上报给后端', async () => {
+  // 开表面时的首测（含 rAF 补测）有自己的防抖节奏：先等它尘埃落定，
+  // 再触发测试自己的 resize，否则 stub 的固定 100x30 会覆盖刚排上的新尺寸。
+  async function settleResize() {
+    await new Promise(r => setTimeout(r, 300))
+  }
+
+  it('尺寸变化上报给后端（防抖 150ms 后取最新尺寸）', async () => {
     withHost()
     setup()
     await attached()
+    await settleResize()
     const before = callsOf('ResizeTerminal').length
 
     instances[0].emitResize(132, 43)
-    await flushPromises()
+    await new Promise(r => setTimeout(r, 250))
 
     const rs = callsOf('ResizeTerminal')
     expect(rs.length).toBeGreaterThan(before)
     expect(rs[rs.length - 1].args).toEqual(['h1', 'default', 132, 43])
+  })
+
+  it('连续 resize 合并为一次上报，取最新尺寸', async () => {
+    withHost()
+    setup()
+    await attached()
+    await settleResize()
+    const before = callsOf('ResizeTerminal').length
+
+    instances[0].emitResize(120, 40)
+    instances[0].emitResize(132, 43)
+    await new Promise(r => setTimeout(r, 250))
+
+    const rs = callsOf('ResizeTerminal').slice(before)
+    expect(rs).toHaveLength(1)
+    expect(rs[0].args).toEqual(['h1', 'default', 132, 43])
+  })
+
+  it('同尺寸重测不再上报（避免重复 window-change 引发 SIGWINCH 重绘提示符）', async () => {
+    withHost()
+    setup()
+    await attached()
+    await settleResize()
+    instances[0].emitResize(132, 43)
+    await new Promise(r => setTimeout(r, 250))
+    const after = callsOf('ResizeTerminal').length
+    expect(after).toBeGreaterThan(0)
+
+    // 归档切回会触发重测：尺寸没变就不该再发 window-change
+    instances[0].emitResize(132, 43)
+    await new Promise(r => setTimeout(r, 250))
+    expect(callsOf('ResizeTerminal').length).toBe(after)
   })
 
   it('容器尺寸变化会重新测量', async () => {
@@ -343,7 +382,7 @@ describe('常驻终端表面 按键与尺寸', () => {
     const before = callsOf('ResizeTerminal').length
 
     roInstances[0].cb()
-    await flushPromises()
+    await new Promise(r => setTimeout(r, 250))
 
     expect(callsOf('ResizeTerminal').length).toBeGreaterThan(before)
   })

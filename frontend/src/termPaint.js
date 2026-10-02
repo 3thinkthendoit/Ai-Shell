@@ -164,8 +164,27 @@ export function paintShellVerdict(write, res) {
   nl(write, RED + '  ⤷ ' + msg + RESET)
 }
 
+// 人工命令跑完后的一句话提示：很多人不知道输出可以直接丢给 LLM 分析。
+// 只在命令真正执行完（done）后出现 —— 被拒/取消/出错各有各的说法，不再叠加。
+export function paintLLMHint(write) {
+  if (!write) return
+  nl(write, DIM + '· 想分析这段输出？直接用中文问 LLM，如「这个报错是什么意思」。' + RESET)
+}
+
 // 系统提示（切换模型、清空上下文等界面动作的回执）。
 export function paintSystem(write, text) {
   if (!write) return
   nl(write, DIM + '· ' + String(text == null ? '' : text) + RESET)
+}
+
+// agent 轮次结束后的本地输入提示符。
+//
+// 为什么需要它：提问不走 PTY，远端 shell 不会打印新提示符——纯问答轮结束后
+// 光标悬在空行上，用户不知道该在哪输入（本地行编辑会在光标处回显，功能上
+// 没坏，但看起来像「没回到输入行」）。这里补一个与 paintUser 同款的 ❯，
+// 后续输入落在它后面。本轮若发生过 PTY 写入（top 交接、shell 命令），
+// shell 会自己打印真实提示符，调用方就不该再补（见 store 的 isPtyDirty）。
+export function paintInputPrompt(write) {
+  if (!write) return
+  write(BLUE + BOLD + '❯ ' + RESET)
 }

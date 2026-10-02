@@ -1043,7 +1043,8 @@ describe('reportActiveSession 报告活动会话', () => {
 // ---- 常驻终端的 shell 通道 ----
 
 // composer 里人敲的 shell 行走这条通道：后端策略闸门裁决（高危弹审批）后把这一行
-// 写进常驻 PTY。放行时 PTY 自己回显，前端无需多话；被拒/取消/出错才在表面上说明。
+// 写进常驻 PTY。放行时 PTY 自己回显命令与输出，前端只补一句「可问 LLM」的提示；
+// 被拒/取消/出错才在表面上说明原因。
 describe('runShellInTerminal 常驻终端 shell 通道', () => {
   it('放行：把命令交给后端写进 PTY，返回结果并复位 busy', async () => {
     const { app, calls } = makeApp({ RunShellInTerminal: async () => ({ status: 'done' }) })
@@ -1057,14 +1058,15 @@ describe('runShellInTerminal 常驻终端 shell 通道', () => {
     expect(store.busy).toBe(false)
   })
 
-  it('放行时不在表面上多画（PTY 的命令回显与输出就是全部）', async () => {
+  it('放行后画一句「可问 LLM」提示（这是 done 路径唯一的额外输出）', async () => {
     const { app } = makeApp({ RunShellInTerminal: async () => ({ status: 'done' }) })
     install({ runtime: rt, app })
     const sink = captureSink('h1', 's1')
     store.currentHostId = 'h1'
     try {
       await runShellInTerminal('h1', 's1', 'ls -la')
-      expect(sink.painted()).toBe('')
+      expect(sink.painted()).toContain('想分析这段输出')
+      expect(sink.painted()).toContain('直接用中文问 LLM')
     } finally {
       unregisterTermSink('h1', 's1', sink.fn)
     }
@@ -1081,6 +1083,8 @@ describe('runShellInTerminal 常驻终端 shell 通道', () => {
       expect(res.status).toBe('denied')
       expect(sink.painted()).toContain('命令被策略拒绝')
       expect(sink.painted()).toContain('rm -rf 属于高危命令')
+      // 没执行过的命令不该出现「分析输出」提示
+      expect(sink.painted()).not.toContain('想分析这段输出')
       expect(store.pending).toBe(null)
       expect(store.busy).toBe(false)
     } finally {

@@ -10,7 +10,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import { nextTick } from 'vue'
 import ConsolePanel from '../components/ConsolePanel.vue'
-import { store, push, textToBase64, bindEvents } from '../store.js'
+import { store, push, textToBase64, bindEvents, writeTerminal, isPtyDirty, ask } from '../store.js'
 import { instances, resetInstances } from './stubs/xterm.js'
 
 // ---- Wails 运行时与后端替身 ----
@@ -472,6 +472,27 @@ describe('ConsolePanel 表面渲染', () => {
     const msg = store.entries.filter(e => e.kind === 'assistant').pop()
     expect(msg.reasoning).toBe('先看服务状态')
     expect(msg.content).toBe('Docker 正常。')
+  })
+
+  it('纯问答轮结束后补回输入提示符 ❯（提问没走 PTY，shell 不会打印新提示符）', async () => {
+    await setupAttached()
+    // 走真实 ask()：回合开始清零 PTY 写入标记（之前测试留下的标记不代表本轮）
+    await ask('本机 docker 正常么')
+    await nextTick()
+    rt.emit('agent:done', {})
+    await nextTick()
+    expect(surfaceText()).toContain('❯')
+  })
+
+  it('本轮 PTY 有写入（如 top 交接）时 shell 自己回到提示符，不补 ❯', async () => {
+    await setupAttached()
+    await ask('看看负载')
+    await nextTick()
+    // 回合中发生过 PTY 写入（TTY 交接把 top 写进常驻终端）
+    await writeTerminal('h1', 'default', textToBase64('q'))
+    rt.emit('agent:done', {})
+    await nextTick()
+    expect(surfaceText()).not.toContain('❯')
   })
 })
 
