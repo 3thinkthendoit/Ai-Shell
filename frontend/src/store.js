@@ -192,6 +192,15 @@ export function clearLog() {
   store.pending = null
 }
 
+// isHumanShellApproval 判断挂起的审批是否是「人敲命令」的审批
+// （composer/终端里敲的 shell 行经策略闸门弹出的确认）。
+// 它与 agent 工具审批共用 store.pending，但生命周期不同：
+// agent 工具审批随回合收场；人敲审批由后端 shellGate 单独等待，
+// 只属于它自己（批准 / 拒绝 / 5 分钟超时 / 中断）。
+function isHumanShellApproval(p) {
+  return !!(p && p.name === 'shell')
+}
+
 function upsertTool(v) {
   const list = targetEntries()
   const found = list.find(e => e.kind === 'tool' && e.toolId === v.id)
@@ -496,8 +505,11 @@ export function bindEvents() {
 
   r.EventsOn('agent:error', e => {
     store.running = false
-    // 出错即本轮已终止，挂着审批条只会把输入框锁死 —— 必须一并清掉。
-    store.pending = null
+    // 出错即本轮已终止，agent 自己的工具审批条要一并清掉，否则输入框锁死。
+    // 但人敲命令的审批（name=shell）不属于 agent 回合：它由 shellGate 在后端
+    // 单独等待（见 app_shell.go），清掉会让审批条凭空消失、后端还在等
+    // （最长 5 分钟），期间回车提交全部排队 —— 表现为「控制台无法输入」。
+    if (!isHumanShellApproval(store.pending)) store.pending = null
     freezeStreams()
     push({ kind: 'error', content: e.message })
     paint.paintError(surfaceWrite(paintHost()), e.message)
@@ -513,7 +525,9 @@ export function bindEvents() {
 
   r.EventsOn('agent:done', () => {
     store.running = false
-    store.pending = null
+    // 同 agent:error：人敲命令的审批（name=shell）不随 agent 回合收场。
+    // agent 自己的工具审批在回合结束时必须清掉（回合已终止，批准无意义）。
+    if (!isHumanShellApproval(store.pending)) store.pending = null
     freezeStreams()
   })
 

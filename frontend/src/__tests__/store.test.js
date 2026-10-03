@@ -256,6 +256,28 @@ describe('bindEvents 事件接线', () => {
     expect(store.running).toBe(false)
     expect(store.pending).toBe(null)
   })
+
+  // 人敲命令的审批由后端 shellGate 单独等待：agent 回合结束/出错若把它一并清掉，
+  // 审批条凭空消失、后端还在等（最长 5 分钟），期间回车提交全部排队，
+  // 表现为「控制台无法输入」。只有 agent 自己的工具审批才随回合收场。
+  it('人敲命令的审批（name=shell）不随 agent:done / agent:error 收场', () => {
+    install({ runtime: rt, app: makeApp().app })
+    bindEvents()
+    store.pending = { id: 'shell-1', name: 'shell', command: 'systemctl restart nginx' }
+
+    rt.emit('agent:done', {})
+    expect(store.pending).not.toBe(null)
+    expect(store.pending.id).toBe('shell-1')
+
+    rt.emit('agent:error', { message: '连接断了' })
+    expect(store.pending).not.toBe(null)
+    expect(store.pending.id).toBe('shell-1')
+
+    // agent 自己的工具审批照旧随回合收场
+    store.pending = { id: 'a2', name: 'run_command', command: 'rm -rf /tmp/x' }
+    rt.emit('agent:done', {})
+    expect(store.pending).toBe(null)
+  })
 })
 
 // ---- 审计日志写入失败 ----
