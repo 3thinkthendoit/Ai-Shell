@@ -43,6 +43,11 @@ type App struct {
 	mu         sync.Mutex
 	termVT     map[string]*termVTState
 	activeSess map[string]string // hostID → 前端正在看的会话（Ask 上下文路由用）
+
+	// bgWg 跟踪后台杂务（目前只有 shell integration 注入）。它的存在是为了
+	// shutdown 时能等它们收尾：注入是分三步、带间隔的异步写入，进程先退出
+	// 会让最后一步落空，留下一个还没恢复 PS1 的空提示符。
+	bgWg sync.WaitGroup
 }
 
 // termKeySep 是组合 host+session 成终端注册表键的分隔符（不可打印，避免与
@@ -140,6 +145,11 @@ func (a *App) auditLog(e audit.Entry) {
 }
 
 func (a *App) shutdown(_ context.Context) {
+	// 先等后台注入收尾，再关 SSH：顺序不能反 —— Close 之后 PTY 已关，
+	// 注入剩下的步骤会写进一条死掉的通道，PS1 停在空值上。
+	// 等待是有界的：注入全程约 240ms，用户关应用时最多多等这一下。
+	a.bgWg.Wait()
+
 	// 会话在每次变更时就已经落盘了，这里是**兜底**而不是主路径：
 	// 万一某条写入路径漏了 flush，关一次应用能把它补上。
 	// 代价是退出时多写一次文件，可以忽略。
@@ -178,7 +188,13 @@ type BootstrapInfo struct {
 	LLM         vault.LLMSettingsView  `json:"llm"`
 	LLMProfiles []vault.LLMProfileView `json:"llmProfiles"`
 	Policy      vault.PolicySettings   `json:"policy"`
-	Error       string                 `json:"error"`
+	// MaxTransferBytes 是文件管理上传/下载的大小上限。
+	//
+	// 由后端下发而不是前端写死：这个数只有后端一处说了算（它同时用于
+	// 上传校验和下载截断判定），前端再抄一份迟早会漂移 —— 漂移的后果是
+	// 「界面放行、后端拒绝」或提示的数值与实际行为不符，两种都很难查。
+	MaxTransferBytes int64  `json:"maxTransferBytes"`
+	Error            string `json:"error"`
 }
 
 // Bootstrap 返回启动信息。
@@ -196,10 +212,11 @@ func (a *App) Bootstrap() BootstrapInfo {
 			HostCount:     len(hosts),
 			Degraded:      a.v.Protection() == vault.ProtectionKeyFile,
 		},
-		Hosts:       hosts,
-		LLM:         a.v.LLMSettingsView(),
-		LLMProfiles: a.v.LLMProfiles(),
-		Policy:      a.v.Policy(),
+		Hosts:            hosts,
+		LLM:              a.v.LLMSettingsView(),
+		LLMProfiles:      a.v.LLMProfiles(),
+		Policy:           a.v.Policy(),
+		MaxTransferBytes: sshclient.MaxTransferBytes,
 	}
 }
 
@@ -671,6 +688,14 @@ const (
 	// EvTermTUI 报告远端是否被全屏程序接管（vim/top/htop）。前端终端内
 	// 直接输入据此让路：接管中不本地缓冲按键，原样透传，避免吞键。
 	EvTermTUI = "term:tui"
+	// EvTermCwd 报告远端 shell 的当前工作目录（来自 OSC 7）。
+	//
+	// 必须由后端推、而不是前端猜：目录状态住在远端那条 shell 里，
+	// 前端只看得见一串已经渲染好的字符（`cd /var/log` 这行字里没有任何
+	// 可信信号说明它成功了）。后端在 VT 解析时从控制序列里拿到的是
+	// shell 自己用 $PWD 报的真实值 —— 唯一不会骗人的来源。
+	// 文件管理弹窗打开时就直接读它，不必再问一次。
+	EvTermCwd = "term:cwd"
 )
 
 // termDataPayload 构造 term:data 的事件载荷。
@@ -740,6 +765,12 @@ func (a *App) OpenTerminal(hostID, sessionID string, cols, rows int) error {
 	// lastTui 记录上一次上报的全屏接管状态，只在**变化**时发 term:tui，
 	// 避免每个输出块都推一条事件把前端淹掉。
 	lastTui := false
+	// lastCwd 记录上一次通知前端的目录：提示符每次刷新都会带一条 OSC 7，
+	// 而绝大多数时候目录根本没变（敲一条命令就报一次）。不做去重的话，
+	// 每敲一条命令都会推一条 term:cwd，前端跟着重渲染一次文件列表 ——
+	// 纯属浪费，且会让列表滚动位置在用户没做任何事时自己跳。
+	// 只在上报**变化时**发（"目录变了"才是事件，"目录还是这个"不是）。
+	lastCwd := ""
 
 	before := a.ssh.PTY(key)
 	p, err := a.ssh.OpenPTY(hostID, key, "xterm-256color", sshclient.TerminalSize{Cols: cols, Rows: rows},
@@ -752,6 +783,13 @@ func (a *App) OpenTerminal(hostID, sessionID string, cols, rows int) error {
 			if tui := screen.InTUI(); tui != lastTui {
 				lastTui = tui
 				a.emit(EvTermTUI, map[string]any{"hostId": hostID, "sessionId": sessionID, "active": tui})
+			}
+			// 目录上报放在 TUI 判断之后：全屏程序（vim/top）接管期间用户
+			// 并没有"当前目录"可言，那时也不会有提示符更不会有 OSC 7，
+			// 这里天然不会误报。
+			if cwd := screen.Cwd(); cwd != "" && cwd != lastCwd {
+				lastCwd = cwd
+				a.emit(EvTermCwd, map[string]string{"hostId": hostID, "sessionId": sessionID, "cwd": cwd})
 			}
 			a.emit(EvTermData, termDataPayload(hostID, sessionID, b))
 		},
@@ -794,7 +832,16 @@ func (a *App) OpenTerminal(hostID, sessionID string, cols, rows int) error {
 		}
 		a.termVT[key] = vt
 		a.mu.Unlock()
-		a.injectShellIntegration(p)
+		// 后台注入，不阻塞打开：注入分三步、步间要留间隔（见
+		// injectShellIntegration），同步做会让「打开终端」凭空慢 240ms，
+		// 而这个延迟对用户没有任何可见收益 —— 他不需要等 integration 装好
+		// 才能敲命令。注入与用户操作天然不冲突：注入走的是「不打印提示符」
+		// 的静默窗口。
+		a.bgWg.Add(1)
+		go func() {
+			defer a.bgWg.Done()
+			a.injectShellIntegration(p)
+		}()
 		a.auditLog(audit.Entry{
 			Kind:     audit.KindTerminal,
 			HostID:   hostID,
@@ -820,22 +867,77 @@ func (a *App) OpenTerminal(hostID, sessionID string, cols, rows int) error {
 // bash 虽不走 elif 分支，但要**解析**整个 if/elif/fi —— 少了那个 `;`，`}` 会被当成
 // printf 的参数、花括号组永不闭合，bash 一路读到 `fi` 报「syntax error near
 // unexpected token `fi`」，连 bash 分支的 trap/PROMPT_COMMAND 也一并没装上。
-const shellIntegration = `if [ -n "$BASH_VERSION" ]; then trap 'printf "\033]133;C\007"' DEBUG; PROMPT_COMMAND='printf "\033]133;D;%s\007" "$?"'; elif [ -n "$ZSH_VERSION" ]; then precmd() { printf "\033]133;D;%s\007" "$?"; }; preexec() { printf "\033]133;C\007"; }; fi`
+//
+// 除命令边界（133）之外还上报**当前目录**（OSC 7，`file://host$PWD`）。
+// 这是文件管理弹窗「默认定位到控制台当前目录」的唯一可靠来源：SSH 的 Exec 是
+// 另开连接、cwd 恒为家目录，问不出用户此刻在哪；只有这条常驻 shell 自己知道，
+// 而它每次印提示符都会走这里。用 $PWD 而不是 $(pwd)：前者是 bash 内建变量，
+// 读它不起子进程 —— 这段代码在**每一次**命令结束后都会执行，多一个 fork
+// 就是给每条命令平白加上一次进程创建开销。
+const shellIntegration = `if [ -n "$BASH_VERSION" ]; then trap 'printf "\033]133;C\007"' DEBUG; PROMPT_COMMAND='printf "\033]133;D;%s\007" "$?"; printf "\033]7;file://%s%s\007" "$HOSTNAME" "$PWD"'; elif [ -n "$ZSH_VERSION" ]; then precmd() { printf "\033]133;D;%s\007" "$?"; printf "\033]7;file://%s%s\007" "$HOST" "$PWD"; }; preexec() { printf "\033]133;C\007"; }; fi`
 
 // injectShellIntegration 把 shell integration 片段送进刚开好的 shell。
 //
 // 回显问题在**申请伪终端时**就已解决：openPTY 的初始终端模式带 ECHO=0（见
 // sshclient），注入的每一行都不会被远端行规程回显。因此这里不需要旧实现那套
-// 「stty -echo + printf 自擦除 + 固定 sleep」的时序把戏 —— 那套做法依赖
-// 「shell 已就绪、提示符已打出」：shell 启动慢于写入时（登录横幅还没打完），
-// 命令的回显先于横幅出现在屏幕上，等 shell 执行到 printf 时光标早已被推下去，
-// 擦错行，用户第一屏就留下了 `stty -echo;printf ...` 天书。
+// 「stty -echo + printf 自擦除 + 固定 sleep」的时序把戏。
 //
-// 现在两行一次性写入，在远端输入缓冲里按序执行；shell 何时就绪都无所谓：
-// 注入零回显，执行完 `stty echo` 恢复正常回显，屏幕上不留任何痕迹。
+// 提示符问题则靠**注入期把 PS1 置空**解决：
+//
+//	bash 每执行完一条命令都会打印一次新提示符。旧实现两行一次性写入，于是
+//	启动时屏幕上必然依次出现 —— bash 启动的真提示符、执行 integration 片段
+//	后的提示符、执行 `stty echo` 后的提示符 —— 三个提示符叠在一行，看起来
+//	像终端抽风（实测抓包：块1 真提示符，块2/块3 各带一个提示符）。
+//
+//	现在分三步、每步之间留一点间隔（PTY.Write 是网络写，不等待远端执行，
+//	连续写入会让多行挤在同一个输入缓冲里、来不及生效）：
+//
+//	  1. PS1=            —— 之后所有注入命令都不打印提示符
+//	  2. 装 integration   —— DEBUG trap + PROMPT_COMMAND 上钩
+//	  3. 恢复 PS1         —— 但不能直接 PS1='\u@\h:\w\$ '：那一步自己的
+//	                        结尾提示符照样会打印（自指陷阱）。改成把恢复
+//	                        动作挂进一次性的 PROMPT_COMMAND —— 它在印提示符
+//	                        **之前**执行，先 `\r\033[K` 擦掉这一行再设 PS1，
+//	                        于是这最后一个提示符自己把自己抹掉了。
+//
+// 三步走完屏幕上只留 bash 启动时的第一个提示符。zsh 走同一套 PS1/PROMPT_COMMAND
+// 时序（zsh 也认 PROMPT_COMMAND 的一次性赋值惯用法）；其它 shell 不注入时
+// 也会执行同样的三步，PS1= 与恢复对 POSIX shell 同样有效，无害。
 func (a *App) injectShellIntegration(p *sshclient.PTY) {
-	_ = p.Write([]byte(shellIntegration + "\nstty echo\n"))
+	// 第一步：静默。
+	_ = p.Write([]byte("PS1=\n"))
+	sleepBriefly()
+
+	// 第二步：装 shell integration（此刻 PS1 为空，不打印提示符）。
+	_ = p.Write([]byte(shellIntegration + "\n"))
+	sleepBriefly()
+
+	// 第三步：挂一次性钩子 —— 印提示符前擦掉该行、恢复 PS1，再恢复回显。
+	_ = p.Write([]byte(promptRestore + "\nstty echo\n"))
 }
+
+// promptRestore 是「恢复提示符」的一行命令。拆成单独常量是为了让它和
+// shellIntegration 各自可读 —— 两者的引号层级都比较绕，混在一起更难核对。
+//
+// 引号分层：外层用双引号包住整条 PROMPT_COMMAND（bash 里 `VAR="..."` 的
+// 惯用法），因此内部的 printf 格式串与 PS1 值都要用反斜杠转义的双引号。
+//
+// 两处细节都由实测确定，改错任何一处都会留下一个擦不掉的提示符：
+//   - printf 格式串开头的 `\r` 在 Go 里是**真实回车字节**，不是反斜杠加 r：
+//     远端拿到的格式串必须是「回车 + ESC[K」这个真正的控制序列。写成 `\\r`
+//     的话远端 printf 会原样打印一个 `r`，清行失效。
+//   - `\\033` / `\\u` / `\\w` / `\\$` 则必须是**反斜杠字面量**：它们由远端
+//     printf 与 PS1 解释，Go 这一层不能先把反斜杠吃掉。
+const promptRestore = `PROMPT_COMMAND="printf \"\r\033[K\"; PS1=\"\\u@\\h:\\w\\$ \""`
+
+// sleepBriefly 让注入的三步之间留出间隔。
+//
+// 为什么必须等：PTY.Write 只是把字节塞进 SSH 通道（stdinPipe.Write），
+// 不等远端执行。三步个位数毫秒内连发时，远端可能只读到第一行就开始
+// 按空 PS1 运行，后面两行落进同一输入缓冲 —— 实测表现为 PS1 没恢复，
+// 用户看到一个空提示符。这个延迟是**为了顺序**，不是「等 shell 就绪」，
+// 所以固定值即可；shell 真启动慢时多行仍在缓冲里按序执行，最终一致。
+func sleepBriefly() { time.Sleep(120 * time.Millisecond) }
 
 // ReportActiveSession 前端报告「某台主机上正在看哪条会话」。
 // 常驻终端的定格快照要落到人正在看的那条时间线上，后端自己

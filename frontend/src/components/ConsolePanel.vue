@@ -8,13 +8,15 @@ import {
   createSession, refreshSessions, runShellInTerminal, switchProfile, syncWindowTitle,
   openTerminal, writeTerminal, resizeTerminal, closeTerminal,
   registerTermSink, unregisterTermSink, termState, textToBase64, reportActiveSession,
-  bucketKey, isPtyDirty
+  openFileManager, closeFileManager,
+  bucketKey, isPtyDirty, backendAPI
 } from '../store'
-import { classifyInput } from '../inputRoute'
+import { resolveInput } from '../inputRoute'
 import { providerBadge } from '../providerLogos'
 import { TERM_THEMES, currentTermTheme } from '../termTheme'
 import * as paint from '../termPaint'
 import UiSelect from './UiSelect.vue'
+import FileManagerModal from './FileManagerModal.vue'
 
 // 控制台 = 一块整幅 xterm，附着当前主机的常驻 shell PTY（阿里云 Workbench 同款）。
 // 人可以直接在表面里敲（原始按键进 PTY，不过策略）；底部 composer 走分流：
@@ -29,6 +31,11 @@ import UiSelect from './UiSelect.vue'
 const rootEl = ref(null)          // ResizeObserver 的观察目标（.surface）
 const openedKeys = ref([])        // 已建过容器的表面键（bucketKey）
 const surfaceEls = new Map()      // surfaceKey -> 容器元素
+const hintedKeys = new Set()      // 已画过欢迎引导的表面键（见 paintWelcomeHintIfNeeded）
+
+// 欢迎引导比真提示符晚多久出现。远端 shell 从握手到打印提示符约 500ms
+// （ptyprobe 抓包实测），这里取 700ms 留出余量，保证引导落在提示符**之后**。
+const WELCOME_HINT_DELAY_MS = 700
 const terms = new Map()           // surfaceKey -> { term, fit, sink, hostId, sessionId, ... }
 let attachedKey = ''              // 当前附着的那块表面键（切任务时据此关闭旧的）
 let ro = null
@@ -113,6 +120,8 @@ function disposeTerm(key) {
   }
   openedKeys.value = openedKeys.value.filter(x => x !== key)
   surfaceEls.delete(key)
+  // 这一条生命周期结束了：清掉去重标记，下次打开（或切回来重建）时重新提示。
+  hintedKeys.delete(key)
 }
 
 // ---- 尺寸上报：防抖 + 去重 ----
@@ -134,6 +143,12 @@ function reportResize(key, hostId, sessionId, cols, rows) {
   if (prev) clearTimeout(prev)
   const timer = setTimeout(() => {
     pendingResize.delete(key)
+    // PTY 还在创建中（opening）：此刻的尺寸是布局稳定期的中间态，发出去必是
+    // 冗余 window-change。慢连接下防抖（150ms）会在 OpenTerminal 返回前到期，
+    // 只靠「打开完成后作废」拦不住 —— 必须在到期那一刻再查一次状态。
+    // 打开完成后 statusLine watcher 必然再 doFit 一次，真实变了尺寸会重新
+    // 走到这里（那时已不是 opening，照常发送）。
+    if (termState(hostId, sessionId).status === 'opening') return
     lastSentSize.set(key, size)
     resizeTerminal(hostId, sessionId, cols, rows)
   }, RESIZE_DEBOUNCE_MS)
@@ -166,6 +181,12 @@ async function ensureTerm(hostId, sessionId) {
 
   const term = new Terminal({
     cursorBlink: true,
+    // 光标样式：默认是**块状**（一个实心方块盖住整个字符格），在等宽中文字体下
+    // 那个方块格外厚重，看着像「有个字符被反白了」。改成竖线（bar），紧跟字符
+    // 右缘，与编辑器里的手感一致。宽度 2px：1px 在非整数缩放屏上会被渲染成
+    // 半透明灰边，反而糊。
+    cursorStyle: 'bar',
+    cursorWidth: 2,
     // 回放行数：给足但不无限。终端的价值一半在「翻回去看」，每行都占内存。
     scrollback: 5000,
     fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
@@ -182,6 +203,10 @@ async function ensureTerm(hostId, sessionId) {
     // 本地行编辑期间收到外部 PTY 输出 = 环境不安静（后台打印/提示符重绘），
     // 此刻 startCol 已不可信：把本地缓冲 flush 给 PTY 并降级透传，避免擦错位置。
     const st = terms.get(key)
+    // 远端又画了东西：屏幕已经不是我们离开时那一屏了，占位符的列位置随之作废。
+    // 这里**只作废标记、不试图擦除** —— 行的内容已被远端改写，按旧列号擦会
+    // 误伤真实输出。提示被盖住就盖住了，下次切回会重新提示。
+    if (st) st.hintCols = 0
     if (st && st.line && !st.passthrough) {
       flushLocalToPty(st)
       st.passthrough = true
@@ -191,7 +216,11 @@ async function ensureTerm(hostId, sessionId) {
   // 顺序不能反：先登记落点再 OpenTerminal。远端 shell 一启动就打印提示符，
   // 登记晚了那一段就落进虚空了。
   registerTermSink(hostId, sessionId, sink)
-  terms.set(key, { term, fit, sink, hostId, sessionId, line: '', startCol: 0, passthrough: false, lineSynthetic: false })
+  terms.set(key, {
+    term, fit, sink, hostId, sessionId,
+    line: '', startCol: 0, passthrough: false, lineSynthetic: false,
+    hintCols: 0, hintPromptCols: 0 // 欢迎占位符的宽度与它起点列（见 clearWelcomeHint）
+  })
 
   // 用户按键 → 本地行编辑（见 onTermData）：常态下可打印字符本地回显、
   // 回车时分类；全屏程序接管或控制键则原样透传。不再是无脑逐字符进 PTY。
@@ -205,14 +234,71 @@ async function ensureTerm(hostId, sessionId) {
   // 布局可能在 open 之后才稳定（状态行出现、工具条换行、字体度量就绪）：
   // 再补一帧重测量，否则行数停留在偏小值，视口底部留一大段用不上的空白。
   requestAnimationFrame(() => doFit(key))
+  // 先记下申请 PTY 用的尺寸：下面 await 期间 RAF 的重测可能已把 xterm 改成别的尺寸。
+  const createdSize = term.cols + 'x' + term.rows
   await openTerminal(hostId, sessionId, term.cols, term.rows)
+  // PTY 已按 createdSize 创建。布局稳定前（状态行出现/消失、字体就绪）积攒的
+  // 待发 resize 一律作废，并把创建尺寸登记为「已发送」：否则打开后必然补发
+  // 一次同尺寸 window-change，SIGWINCH 让 bash 在原地重绘空提示符，与启动的
+  // 那一遍叠成「[root@host ~]# [root@host ~]# [root@host ~]#」。
+  // 之后若真实尺寸又变（拖窗口、归档切换），reportResize 的去重不再命中，照常发出。
+  const pending = pendingResize.get(key)
+  if (pending) {
+    clearTimeout(pending)
+    pendingResize.delete(key)
+  }
+  lastSentSize.set(key, createdSize)
+
+  // 欢迎引导要等真提示符先出来：远端 shell 从登录到打印提示符有几百毫秒
+  // （实测 ~500ms，见 ptyprobe 抓包），立刻画会被后面的横幅/提示符压过去。
+  // 这一行只是「说明文字」，晚一点出现不影响使用，所以用固定延迟等着，
+  // 而不是去嗅探输出里有没有提示符（那要解析 ANSI，得不偿失）。
+  const created = terms.get(key)
+  setTimeout(() => {
+    // 期间用户可能已经切走/关了，或关掉后重开了一条新实例：只有当前登记的
+    // 仍是创建时那一条才画 —— 否则会把引导写进一条已经作废的实例里。
+    if (terms.get(key) !== created) return
+    paintWelcomeHintIfNeeded(key)
+  }, WELCOME_HINT_DELAY_MS)
+}
+
+// 欢迎引导的绘制时机与去重。
+//
+// 「每次打开或回到控制台都要提示」这条需求的难点是**去重的粒度**：
+// ensureTerm 在切任务回来、重试、布局重测时都会被调到，而它内部会复用活着的
+// 那条终端（提前 return）。若只在建实例时画，切走再切回来就看不到了；若每次
+// 调 ensureTerm 都画，同一屏会叠出好几行。所以用集合按「表面键」记，在
+// disposeTerm（关终端/切走）时清掉 —— 于是 ensureTerm 这条路径的语义是：
+//
+//   一次「打开 → 关闭」的生命周期里只提示一次，重新打开会再提示一次。
+//
+// force=true 用于「从归档切回」：那条路径不重建实例，但用户视线刚落到 shell
+// 上，正是提示有效的时刻，且**每次切回都该提示**（这是需求的原话），
+// 所以绕过集合直接画。
+function paintWelcomeHintIfNeeded(key, force = false) {
+  if (!key) return
+  if (!force && hintedKeys.has(key)) return
+  const t = terms.get(key)
+  if (!t) return
+  hintedKeys.add(key)
+  // 占位符只该在「空提示符、没有本地缓冲」时出现：用户已经打了一半字再切回
+  // 归档，回来时把那半行盖掉会很突兀。
+  if (t.line || t.passthrough || t.lineSynthetic) return
+  if (isFullscreen(key)) return
+  // 提示符末尾的列号必须**在写占位符之前**取。
+  // 写占位符的最后一步是 ESC[<n>G（把光标移到提示文字起点），真实 xterm 会
+  // 因此把 cursorX 改掉 —— 事后再读就拿到提示文字的位置了，擦除会从错误的
+  // 列开始，把提示符一起覆盖掉。测试替身不模拟 ESC[G 的副作用，所以这个顺序
+  // 错了在单测里看不出来，只有真机才会露馅。
+  t.hintPromptCols = cursorCol(t)
+  t.hintCols = paint.paintWelcomeHint(surfaceWrite(key), t.hintPromptCols) || 0
 }
 
 // ---- 终端内直接输入：在提示符下就地编辑、回车分类 ----
 //
 // 真 PTY 逐字符透传的话，自然语言会被 bash 当命令执行而报错。所以把
 // 「shell 提示符下等待输入一条命令」这一常态改成本地行编辑：可打印字符
-// 本地回显、退格本地删，回车时 classifyInput 决定交给 Agent 还是发回 PTY。
+// 本地回显、退格本地删，回车时 resolveInput 决定交给 Agent 还是发回 PTY。
 //
 // 代价：提示符下的 readline 原生历史/补全改由本地接管。因此凡是控制键/转义
 // 序列（Tab、方向键、Ctrl-C、Ctrl-R、Esc…）一律原样透传给 shell；
@@ -300,7 +386,28 @@ async function submitLine(key, line) {
     writeTerminal(hostId, sessionId, textToBase64('\n'))
     return
   }
-  const route = classifyInput(text)
+  // 分流要问一次后端「首词是不是命令」（见 inputRoute.resolveInput）：
+  //   `你是什么模型`  不是命令 → Agent，不弹
+  //   `echo 你好`     是命令   → shell，不弹（中文只是参数）
+  // 只有首词是陌生素词（`foobar --help`）才 uncertain，问用户一次。
+  const route = await resolveInput(text, backendAPI())
+  if (route.uncertain) {
+    pendingRoute.value = { key, text }
+    return
+  }
+  await dispatchLine(key, text, route)
+}
+
+// dispatchLine 真正把一行交出去：agent 走 ask，shell 走策略闸门 + PTY。
+// 从 submitLine 里拆出来，是因为「二选一弹窗」选完之后要能直接复用这一段，
+// 而不能再走一遍 resolveInput（否则会再次弹窗，永远出不去）。
+//
+// route 由调用方传入（已经判过一次），不在这里重判 —— 重判就是又一轮
+// 跨进程往返，且可能与调用方的判断不一致。
+async function dispatchLine(key, text, route) {
+  const t = terms.get(key)
+  if (!t) return
+  const { hostId, sessionId } = t
   if (route.kind === 'agent') {
     if (!route.text) {
       paint.paintSystem(surfaceWrite(key), '输入要问 Agent 的内容，或直接敲一条 shell 命令。')
@@ -317,6 +424,24 @@ function onTermData(key, d) {
   const t = terms.get(key)
   if (!t) return
   const send = s => writeTerminal(t.hostId, t.sessionId, s)
+
+  // agent 正在跑：此刻的按键不属于任何命令行，**必须丢掉**。
+  //
+  // 为什么不能攒进本地缓冲：攒下来的半截字符在回合结束时会让
+  // 「补 ❯ 提示符」的 watcher 认为「用户已经打了一半」（见下方 t.line 判断），
+  // 于是不补提示符 —— 用户看到的就是「LLM 答完了却没回到命令输入行」。
+  // 更糟的是这一行会在下一次回车时被当成提问发出去，凭空多跑一轮 LLM。
+  //
+  // Ctrl-C 是例外：它是「等不下去了，中断」唯一的键盘出口，放行给 stop()。
+  if (store.running || store.busy) {
+    if (d.includes('\x03')) stop()
+    return
+  }
+
+  // 占位符撤退：用户开始操作了，先把提示擦干净再走后续分支。
+  // 放在最前面（而不是各分支里各擦一次）是因为每个分支都会往屏幕上写字，
+  // 漏掉任何一条都会让提示文字和真实输入混在同一行。
+  clearWelcomeHint(t)
 
   // 已降级透传（本地编辑期间来过外部输出，或本地缓冲已被控制键 flush 给远端）：
   // 原样送 PTY（多字符也整体送）。回车（这一行交回 shell 处理完）或 Ctrl-C
@@ -416,6 +541,22 @@ function surfaceWrite(key) {
   return t ? (s => t.term.write(s)) : undefined
 }
 
+// clearWelcomeHint 把欢迎占位符从屏幕上撤走，留下干净的「提示符 + 光标」。
+//
+// 光标此刻停在提示符与占位符之间（paintWelcomeHint 写完后用 ESC[<n>G 移回来了），
+// 所以要先把光标**移到占位符起点**，再用等宽空格覆盖它 —— 不能用 \r ESC[2K 清整行：
+// 那会把远端画的提示符也一起清掉，而提示符文本我们手里没有，清掉就再也画不回来了。
+// 覆盖后光标自然停在提示符末尾，后续回显（本地行编辑或 PTY 输出）落位正确。
+function clearWelcomeHint(t) {
+  if (!t || !t.hintCols) return
+  const n = t.hintCols
+  const col = t.hintPromptCols || 0
+  t.hintCols = 0
+  t.hintPromptCols = 0
+  // 移到占位符起点（提示符末尾）：列号从 1 起，故 +1。
+  t.term.write('\x1b[' + (col + 1) + 'G' + ' '.repeat(n) + '\x1b[' + (col + 1) + 'G')
+}
+
 async function onClose() {
   const hostId = store.currentHostId
   if (!hostId) return
@@ -430,6 +571,9 @@ function onRetry() {
 }
 
 // 从归档切回表面时重新测量：隐藏期间容器是 0x0，fit 一直跳过。
+// 顺带重画一次欢迎引导：用户切走又回来，视线重新落到这个 shell 上，
+// 此刻提示「这里能说人话」正是有效时机（whyHintShown 的「每次回来都提示」
+// 语义就落在这一句上）。
 watch(showArchive, async on => {
   if (on) {
     scrollLog()
@@ -437,18 +581,29 @@ watch(showArchive, async on => {
   }
   await nextTick()
   doFit(currentKey.value)
+  paintWelcomeHintIfNeeded(currentKey.value, true)
 })
 
 // agent 回合结束 → 回到输入态。提问不走 PTY，远端 shell 不会打印新提示符；
 // 若本轮 PTY 一次都没被写过（纯问答），表面补一个合成 ❯ 提示符，
 // 否则光标悬在空行上，看起来像「回复完没回到命令输入行」。
 // PTY 有写入（top 交接 / shell 命令）时 shell 自己会回到提示符，不补。
+//
+// 「回到控制台」必须是**必达**的，所以这里只保留两类真的不能补的情况：
+//   - passthrough：本轮把控制权交给了远端程序（top/vim 等还在跑），
+//     补 ❯ 会插进那个程序的界面里。
+//   - isPtyDirty：本轮 shell 命令让远端自己打印了真提示符。
+// 曾经还有一条 `t.line`（本地缓冲非空就跳过）—— 那是错的：运行期间敲的键
+// 已经不再进缓冲（见 onTermData 的 running 分支），而任何残留的半截字符都不该
+// 变成「所以不给你提示符」的理由。用户要的是每次答完都回到命令行。
 watch(() => store.running, (v, ov) => {
   if (ov !== true || v) return
   const key = currentKey.value
   const t = terms.get(key)
-  if (!t || t.passthrough || t.line || t.lineSynthetic) return
+  if (!t || t.passthrough) return
   if (isPtyDirty(t.hostId, t.sessionId)) return
+  // 已有合成 ❯（上一轮补的、用户还没敲）就不重复补。
+  if (t.lineSynthetic) return
   paint.paintInputPrompt(surfaceWrite(key))
   t.lineSynthetic = true
 })
@@ -469,6 +624,54 @@ const statusLabel = s => ({
 }[s] || s)
 
 const streamingNow = computed(() => store.entries.some(e => e.streaming))
+
+// ---- 审批倒计时 ----
+//
+// 后端把失效时刻（deadlineMs）随审批一起下发，这里只做**显示**：
+// 每秒重算一次剩余秒数。判断「是否已失效」不在这里做 —— 后端超时后会发
+// approval:expired，由 store 清掉这条。前端若自己判定过期就收起，
+// 会因为时钟漂移出现「界面说没了、后端还在等」的错位（见 ToolCallView.DeadlineMs）。
+const nowTick = ref(Date.now())
+let tickTimer = null
+
+// 剩余秒数；没有 deadline（0/缺省）时返回 null，界面就不显示倒计时。
+const approvalRemainSec = computed(() => {
+  const dl = store.pending && store.pending.deadlineMs
+  if (!dl) return null
+  const left = Math.ceil((dl - nowTick.value) / 1000)
+  return left > 0 ? left : 0
+})
+
+// 倒计时文案：>1 分钟显示 m:ss（更好读），否则显示秒。
+const approvalCountdown = computed(() => {
+  const s = approvalRemainSec.value
+  if (s === null) return ''
+  if (s >= 60) {
+    const m = Math.floor(s / 60)
+    const r = s % 60
+    return `${m}:${String(r).padStart(2, '0')}`
+  }
+  return `${s} 秒`
+})
+
+// 计时器只在有 pending 且带 deadline 时跑：没审批时白转一秒一次是浪费。
+watch(
+  () => {
+    const p = store.pending
+    return p && p.deadlineMs ? p.id : null
+  },
+  id => {
+    if (tickTimer) {
+      clearInterval(tickTimer)
+      tickTimer = null
+    }
+    if (!id) return
+    nowTick.value = Date.now()
+    tickTimer = setInterval(() => {
+      nowTick.value = Date.now()
+    }, 1000)
+  }
+)
 
 function scrollLog() {
   nextTick(() => {
@@ -593,7 +796,28 @@ async function onCompactSession() {
   await compactSession(store.currentHostId, store.currentSessionId)
 }
 
-// ---- 弹窗：新建任务 / 命令详细 ----
+// ---- 弹窗：新建任务 / 命令详细 / 输入去向 ----
+
+// pendingRoute 非空时说明用户敲了一行「首词不认识」的输入，正等他选「给谁」。
+// 值是 { key, text } —— key 是那块表面（选完要往正确的那块发），
+// text 是原始输入（不能只存 trim 后的，命令原文要保留）。
+const pendingRoute = ref(null)
+
+// 选完即发。两个动作都清 pendingRoute：不清的话弹窗不关，用户被卡在里面 ——
+// 这正是这次要修的那类「进得去出不来」。
+async function chooseRoute(kind) {
+  const p = pendingRoute.value
+  pendingRoute.value = null
+  if (!p) return
+  // 直接构造 route，不再借 `?` / `!` 前缀绕 —— 前缀是给用户输入的语法，
+  // 内部调用没必要模拟一遍，也避免 dispatchLine 的签名被前缀语义再次污染。
+  if (kind === 'agent') {
+    await dispatchLine(p.key, p.text, { kind: 'agent', text: p.text })
+    return
+  }
+  // 给 shell：不论首词认不认识，用户已经明确表态了，直接当命令发。
+  await dispatchLine(p.key, p.text, { kind: 'shell', text: p.text })
+}
 
 const showNewModal = ref(false)
 const newName = ref('')
@@ -665,9 +889,33 @@ async function copyPendingCmd() {
   }
 }
 
+// openFiles 打开文件管理弹窗，定位到当前终端表面所在的远端目录。
+//
+// 传的是「这块表面」而不是「当前主机」：一台主机可以有多条任务，
+// 各自停在不同目录（每任务一条独立 shell），用主机作键会打开到别人的目录。
+function openFiles() {
+  if (!store.currentHostId) {
+    push({ kind: 'error', content: '请先选择一台主机。' })
+    return
+  }
+  openFileManager(store.currentHostId, store.currentSessionId)
+}
+
 function onWinKeydown(e) {
   // 新建任务弹窗在顶层时这里让路，避免一次 Esc 同时关掉两层。
   if (showNewModal.value) return
+  // 输入去向弹窗同样必须能用 Esc 退出：它拦住了一次提交，
+  // 若只能点按钮，键盘用户会觉得「敲什么都不对」。
+  if (e.key === 'Escape' && pendingRoute.value) {
+    pendingRoute.value = null
+    return
+  }
+  // 文件管理弹窗最外层优先：它盖住整个界面，Esc 应该先关它。
+  // 删除确认是它内部的一层，由组件自己处理（见 FileManagerModal）。
+  if (e.key === 'Escape' && store.fileManager.open) {
+    closeFileManager()
+    return
+  }
   if (e.key === 'Escape' && showCmdDetail.value) showCmdDetail.value = false
 }
 
@@ -688,6 +936,12 @@ onBeforeUnmount(() => {
   if (ro) {
     ro.disconnect()
     ro = null
+  }
+  // 倒计时计时器必须显式停：它挂在组件外的 setInterval 上，
+  // 不停就是卸载后每秒还在改一个已销毁组件的 ref。
+  if (tickTimer) {
+    clearInterval(tickTimer)
+    tickTimer = null
   }
   window.removeEventListener('keydown', onWinKeydown)
   // 销毁本地实例（DOM 已经没了），但**不关远端终端**：卸载往往只是换视图，
@@ -715,6 +969,14 @@ onBeforeUnmount(() => {
           title="为当前主机新建一条任务"
           @click="startNewSession"
         >＋ 新建任务</button>
+        <!-- 文件管理：默认打开当前终端所在的远端目录（目录由那条 shell
+             通过 OSC 7 上报，见 store 的 term:cwd 处理）。 -->
+        <button
+          class="sm new-session-btn"
+          :disabled="!store.currentHostId"
+          title="浏览当前终端所在目录，支持上传/下载/删除"
+          @click="openFiles"
+        >文件</button>
       </div>
 
       <div class="seg">
@@ -862,13 +1124,25 @@ onBeforeUnmount(() => {
         <span class="badge warn">需要你的批准</span>
         <span class="mono">{{ store.pending.name }}</span>
         <span class="muted" v-if="store.pending.hostName">@{{ store.pending.hostName }}</span>
+        <!-- 倒计时：告诉用户「不回答的代价」是什么。没有它，用户以为可以
+             无限期挂起，实际上后端 5 分钟后就放弃了。 -->
+        <span
+          v-if="approvalCountdown"
+          class="muted approval-countdown"
+          :class="{ urgent: approvalRemainSec !== null && approvalRemainSec <= 30 }"
+        >{{ approvalCountdown }} 后失效</span>
         <button class="sm right" @click="showCmdDetail = true">详细</button>
       </div>
       <pre class="approval-cmd">{{ store.pending.command || store.pending.args }}</pre>
       <div class="approval-reason">{{ store.pending.reason }}</div>
       <div class="row" style="margin-top: 10px">
         <button class="ok" @click="approve(true)">批准执行</button>
+        <!-- 拒绝与跳过在后端是同一个动作（不执行），差别只在**语义**：
+             「拒绝」读起来像在否决 Agent 的判断，用户不确定拒绝了要不要
+             给个理由；「跳过」是中性词，不想回答这条就直接跳过。
+             两个按钮并存是为了让「不想回答」有一个心理成本最低的出口。 -->
         <button class="danger" @click="approve(false)">拒绝</button>
+        <button class="sm" @click="approve(false)">跳过</button>
       </div>
     </div>
 
@@ -914,6 +1188,27 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
+    <!-- 输入去向确认：含中文且没表态的一行交给谁。
+         这次不确定就当场问清楚，比默默替你决定安全 —— 猜错的话
+         轻则白跑一轮 LLM，重则把中文当命令发给远端。 -->
+    <div v-if="pendingRoute" class="overlay" @click.self="pendingRoute = null">
+      <div class="modal route-modal">
+        <h3>这一行交给谁？</h3>
+        <pre class="route-text">{{ pendingRoute.text }}</pre>
+        <div class="modal-hint">
+          第一个词不是认识的命令，判断不出你想当命令跑还是当问题问。选一个：
+        </div>
+        <div class="modal-actions">
+          <button class="sm" @click="pendingRoute = null">取消</button>
+          <button class="sm" @click="chooseRoute('shell')">当 shell 命令</button>
+          <button class="sm primary" @click="chooseRoute('agent')">问 LLM</button>
+        </div>
+        <div class="modal-hint">
+          下次想省这一步：<code>?</code> 开头 = 问 LLM，<code>!</code> 开头 = 当命令。
+        </div>
+      </div>
+    </div>
+
     <!-- 命令详细弹窗：审批卡内只做预览，超长命令在这里看全文 -->
     <div v-if="showCmdDetail" class="overlay" @click.self="showCmdDetail = false">
       <div class="modal cmd-modal">
@@ -925,6 +1220,10 @@ onBeforeUnmount(() => {
         </div>
       </div>
     </div>
+
+    <!-- 文件管理弹窗。状态在 store 里（见 fileManager），组件只负责渲染 ——
+         term:cwd 事件到达时 store 要能直接更新它，状态在组件内部就够不着。 -->
+    <FileManagerModal />
   </div>
 </template>
 
@@ -973,6 +1272,25 @@ onBeforeUnmount(() => {
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 
 .cmd-modal { width: min(760px, calc(100% - 60px)); }
+
+/* 输入去向确认：原文要能看清（用户据此决定给谁），所以用与命令预览同款的
+   等宽内嵌块，而不是一行小字。 */
+.route-text {
+  margin: 0;
+  max-height: 30vh;
+  overflow: auto;
+  background: var(--inset-bg);
+  border-radius: 7px;
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.route-modal code {
+  background: var(--inset-bg);
+  border-radius: 4px;
+  padding: 1px 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
 .cmd-detail {
   margin: 0;
   max-height: 55vh;
@@ -1187,6 +1505,10 @@ onBeforeUnmount(() => {
 }
 .approval-reason { font-size: 12px; color: var(--warn); margin-top: 6px; flex-shrink: 0; }
 .approval .row { flex-shrink: 0; }
+/* 倒计时靠右推到头（右邻的「详细」按钮自带 right 推开，这里只需跟它并行不挤压）。
+   紧迫态（≤30 秒）用警示色加粗：时间不多了这件事必须跳出来。 */
+.approval-countdown { font-size: 12px; white-space: nowrap; }
+.approval-countdown.urgent { color: var(--warn); font-weight: 600; }
 
 .composer-bar {
   flex-shrink: 0;

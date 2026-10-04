@@ -7,6 +7,7 @@ import SettingsPanel from './components/SettingsPanel.vue'
 import PolicyPanel from './components/PolicyPanel.vue'
 import AuditPanel from './components/AuditPanel.vue'
 import SessionsSidebar from './components/SessionsSidebar.vue'
+import logoSrc from './assets/logo.svg'
 
 const tab = ref('console')
 
@@ -38,8 +39,11 @@ onMounted(async () => {
   <div class="layout">
     <aside class="sidebar">
       <div class="brand">
-        <div class="brand-title">Ai-Shell</div>
-        <div class="brand-sub">Linux 智能运维台</div>
+        <img class="brand-mark" :src="logoSrc" alt="Ai-Shell" />
+        <div>
+          <div class="brand-title">Ai-Shell</div>
+          <div class="brand-sub">Linux 智能运维台</div>
+        </div>
       </div>
 
       <nav>
@@ -119,6 +123,19 @@ onMounted(async () => {
   gap: 18px;
 }
 
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+/* 图标自带深色底与留白，不跟随主题变色，保证在浅/暗两套主题下都清晰。 */
+.brand-mark {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  flex-shrink: 0;
+  display: block;
+}
 .brand-title {
   font-size: 16px;
   font-weight: 600;

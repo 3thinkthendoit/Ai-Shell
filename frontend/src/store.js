@@ -4,6 +4,11 @@ import * as paint from './termPaint'
 const api = () => window.go?.main?.App
 const rt = () => window.runtime
 
+// 后端绑定对象（Wails 注入 window.go.main.App）。
+// 导出给组件用，是为了让「要调后端」的判断不绕过 store 直接摸全局 ——
+// 一处退化（浏览器裸跑 dev server 时 window.go 为空）只在一个地方处理。
+export const backendAPI = api
+
 // ---- 会话时间线的桶键 ----
 //
 // 桶键 = 主机 ID + \x00 + 会话 ID。
@@ -44,6 +49,12 @@ export const store = reactive({
   // llmProfiles 是全部 LLM 配置方案（每项含 active 标记，不含密钥）。
   // 当前使用哪一套以每项的 active 为准，不另存副本 —— 两份数据迟早不一致。
   llmProfiles: [],
+  // maxTransferBytes 是文件管理上传/下载的大小上限，来自 Bootstrap。
+  //
+  // 与 policy 那几个占位值同一个模式：这里只是 Bootstrap 回来之前的默认值，
+  // 真实值以后端为准。前端**不自己定义**这个数 —— 它同时决定后端的校验
+  // 与拒绝文案，两处各写一份迟早漂移成「界面放行、后端拒绝」。
+  maxTransferBytes: 32 * 1024 * 1024,
   // 会话上下文的三项上限与后端默认值保持一致（8 / 8KiB / 256KiB）。
   // 这里只是 Bootstrap 回来之前的占位值，真实值以 Bootstrap 为准。
   policy: {
@@ -78,6 +89,32 @@ export const store = reactive({
   // 这里再抄一份只会多出一份迟早会不一致的副本。
   // status 取值：idle（没开）/ opening（正在开）/ open / closed（远端退出）/ error。
   terms: {},
+
+  // termCwd 记录每块终端表面（bucketKey）的远端当前目录，来自后端的
+  // term:cwd 事件（OSC 7 上报）。文件管理弹窗默认定位到它。
+  // 拿不到时的兜底由组件负责（要家目录）—— 后端 ListRemoteDir 收空路径
+  // 会自动回落到家目录，所以这里存空串是安全的。
+  termCwd: {},
+
+  // fileManager 是文件管理弹窗的状态。
+  // 刻意放在 store 而不是组件内部 ref：终端在用户 cd 之后会推 term:cwd，
+  // store 的事件处理需要知道「弹窗是否开着、看着哪块表面」才能决定要不要
+  // 跟着更新目录 —— 状态在组件里的话，事件处理器够不着它。
+  fileManager: {
+    open: false,
+    key: '',        // 当前服务的那块终端表面（bucketKey）
+    hostId: '',
+    sessionId: '',
+    cwd: '',        // 当前浏览的目录（绝对路径）
+    parent: '',     // 上一级目录（根目录时等于 cwd）
+    entries: [],    // 目录条目
+    loading: false,
+    error: '',
+    // busy 表示有一次上传/下载/删除正在进行：期间禁用按钮，
+    // 避免同一个文件被并发删两次之类。
+    busy: false,
+    notice: ''      // 操作成功的短暂提示
+  },
 
   // bySession 是「每台主机的每条会话各一条独立时间线」：桶键 → 对话记录。
   //
@@ -255,6 +292,7 @@ export async function bootstrap() {
     store.llm = info.llm || store.llm
     store.llmProfiles = info.llmProfiles || []
     store.policy = info.policy || store.policy
+    if (info.maxTransferBytes > 0) store.maxTransferBytes = info.maxTransferBytes
     if (!store.currentHostId && store.hosts.length) store.currentHostId = store.hosts[0].id
     store.ready = true
   } catch (e) {
@@ -371,8 +409,8 @@ function liveAssistant(step) {
 // 因此每次先 EventsOff 清掉同名旧监听，再重新注册：调用多少次都只挂一份。
 const EV_NAMES = [
   'agent:delta', 'agent:message', 'agent:reasoning', 'agent:tool', 'agent:toolResult',
-  'agent:injection', 'agent:approval', 'agent:status', 'agent:error',
-  'audit:error', 'agent:done', 'term:data', 'term:exit', 'term:tui', 'agent:snapshot'
+  'agent:injection', 'agent:approval', 'approval:expired', 'agent:status', 'agent:error',
+  'audit:error', 'agent:done', 'term:data', 'term:exit', 'term:tui', 'term:cwd', 'agent:snapshot'
 ]
 
 // surfaceWrite 返回往某块终端表面（按 host+session 键）写字符串的落点（就是它
@@ -499,6 +537,16 @@ export function bindEvents() {
     paint.paintApproval(surfaceWrite(paintHost()), v)
   })
 
+  // 审批失效（后端超时或被中断）。必须按 id 比对再清 —— 事件可能在
+  // 「上一张已失效、下一张已经来了」之后才被派发，无条件清会把新的一条也抹掉。
+  r.EventsOn('approval:expired', d => {
+    const id = d && d.id
+    if (!id || !store.pending || store.pending.id !== id) return
+    store.pending = null
+    const reason = (d && d.reason) || '已失效'
+    push({ kind: 'system', content: `审批${reason}，Agent 不会执行该命令。` })
+  })
+
   r.EventsOn('agent:status', s => {
     store.running = s.status === 'thinking'
   })
@@ -534,12 +582,15 @@ export function bindEvents() {
   // 交互终端的输出。解成字节后直接交给 xterm ——
   // 让它的 UTF-8 解码器去处理跨块的续字节（这正是它存在的意义）。
   r.EventsOn('term:data', d => {
-    const sink = termSinks.get(bucketKey(d && d.hostId, d && d.sessionId))
+    const k = bucketKey(d && d.hostId, d && d.sessionId)
+    const sink = termSinks.get(k)
     // 没有落点就直接丢掉：那是「界面还没建好实例」的那一小段，
     // 而终端只在用户真的打开它之后才会有输出。
     if (!sink) return
     try {
       sink(base64ToBytes(d.data))
+      // 有人等着「这轮输出画完」：续期静默计时器（见 afterTermQuiet）。
+      armQuietTimer(k)
     } catch (e) {
       push({ kind: 'error', content: '终端输出解码失败：' + String(e && e.message ? e.message : e) })
     }
@@ -550,6 +601,23 @@ export function bindEvents() {
   r.EventsOn('term:tui', d => {
     const st = termState(d && d.hostId, d && d.sessionId)
     if (st) st.tuiActive = !!(d && d.active)
+  })
+
+  // 远端 shell 的当前目录（来自 OSC 7）。后端只在目录**变化**时发。
+  //
+  // 这是文件管理弹窗「默认定位到当前控制台目录」的数据来源：目录状态住在
+  // 远端那条 shell 里，前端只看得见渲染好的字符，猜不出用户 cd 去了哪。
+  // 按 host+session 分别记 —— 每块终端表面可能停在不同目录，混用一个
+  // 全局值会让「切到另一条任务再打开文件管理」定位到别人的目录。
+  r.EventsOn('term:cwd', d => {
+    const k = bucketKey(d && d.hostId, d && d.sessionId)
+    if (!d || !d.cwd) return
+    store.termCwd[k] = d.cwd
+    // 弹窗正开着且看的就是这块表面：跟着目录走，否则用户在终端里 cd
+    // 之后弹窗还停在旧目录，看起来像没刷新。
+    if (store.fileManager.open && store.fileManager.key === k) {
+      store.fileManager.cwd = d.cwd
+    }
   })
 
   r.EventsOn('term:exit', d => {
@@ -817,6 +885,49 @@ export async function stop() {
   }
 }
 
+// ---- 终端输出静默检测 ----
+
+// afterTermQuiet 在「某块终端的输出安静下来」之后调 fn。
+//
+// 为什么需要它：把一条命令写进 PTY 是**不等它跑完**的 —— 后端写完就返回，
+// 回显、命令输出、新提示符都在之后陆续从网络上飘回来。调用方若拿到返回值就
+// 往屏幕上画东西，那东西会插在命令输出**前面**，看起来就像「命令没执行」：
+//
+//	root@host:~$ · 想分析这段输出？…     ← 提示抢先画了
+//	install.sh mysql.php tttt.text      ← 真正的输出被挤到下面
+//	root@host:~$
+//
+// 所以凡是「命令跑完之后才该出现」的内容（LLM 提示、裁决说明），都要挂在这里。
+// 判据是输出流静默：不再有新字节到达即认为命令画完了。
+//
+// 静默时长取 400ms：本地环回上 ls 的输出常在几十毫秒内结束，400ms 不会让人
+// 察觉延迟；而慢命令的字节流会不断续期，不会被误判成「已跑完」。
+const TERM_QUIET_MS = 400
+const quietTimers = new Map()   // 表面键 → 静默计时器
+const quietWaiters = new Map()  // 表面键 → 等到静默后要执行的回调
+
+function armQuietTimer(key) {
+  const prev = quietTimers.get(key)
+  if (prev) clearTimeout(prev)
+  const timer = setTimeout(() => {
+    quietTimers.delete(key)
+    const fn = quietWaiters.get(key)
+    if (fn) {
+      quietWaiters.delete(key)
+      fn()
+    }
+  }, TERM_QUIET_MS)
+  quietTimers.set(key, timer)
+}
+
+// afterTermQuiet 登记「静默后执行」。同一块表面同时只保留一个待执行回调：
+// 用户连敲两条命令时，前一条的提示没必要还追着画（屏幕早滚过去了）。
+export function afterTermQuiet(hostId, sessionId, fn) {
+  const key = bucketKey(hostId, sessionId)
+  quietWaiters.set(key, fn)
+  armQuietTimer(key)
+}
+
 // runShellInTerminal：composer 里人敲的 shell 命令，走**常驻终端**通道 ——
 // 策略闸门裁决（高危弹审批）后把这一行写进常驻 PTY，提示符回显、输出、
 // top/vim 接管全发生在同一片终端表面上，与人亲手在键盘上敲完全同形。
@@ -831,8 +942,18 @@ export async function runShellInTerminal(hostId, sessionId, command) {
     const res = await api().RunShellInTerminal(hostId, sessionId, command)
     // 放行时 PTY 自己会回显命令与输出；命令跑完提示一句「输出可以直接问 LLM」。
     // 被拒/取消/出错由 paintShellVerdict 说明原因，不再叠加提示。
-    if (res.status === 'done') paint.paintLLMHint(surfaceWrite(key))
-    paint.paintShellVerdict(surfaceWrite(key), res)
+    //
+    // 提示必须**等命令输出画完**再落：这个调用返回时命令才刚写进 PTY，
+    // 回显与输出还在路上，此时画提示会插到输出前面（见 afterTermQuiet 注释）。
+    // 裁决说明同理 —— 它说的是「这条命令的结果如何」，显然该排在结果后面。
+    if (res.status === 'done') {
+      afterTermQuiet(hostId, sessionId, () => {
+        paint.paintLLMHint(surfaceWrite(key))
+        paint.paintShellVerdict(surfaceWrite(key), res)
+      })
+    } else {
+      paint.paintShellVerdict(surfaceWrite(key), res)
+    }
     return res
   } catch (e) {
     const msg = String(e && e.message ? e.message : e)
@@ -957,6 +1078,226 @@ export async function openTerminal(hostId, sessionId, cols, rows) {
 // 界面要补一个本地输入提示符；而 top 交接、shell 命令这类写入会让
 // shell 自己回到提示符，就不该再补。见 agent:done 处理与 ConsolePanel。
 const ptyDirty = new Set()
+
+// ---- 文件管理 ----
+
+// 文件管理弹窗同时只服务一块终端表面：它不是「全局文件浏览器」，
+// 而是「看这块终端所在目录」的窗口。打开新的会把旧的状态覆盖，
+// 因为界面上也只可能有一个弹窗。
+function fmState() {
+  return store.fileManager
+}
+
+// fmLoadSeq 是「当前有效的那次列目录请求」的序号。
+//
+// 列目录是异步的，而用户点目录的速度可以比远端回答得快：连点 a（大目录、慢）
+// 再点 b（小目录、快），b 先返回并渲染，随后 a 才返回 —— 没有这道序号，
+// a 的结果会覆盖 b，列表"自己跳回去"，而路径栏显示的却是 a。
+//
+// 同样重要的是**关闭/切换弹窗**：那时在途请求返回后不该再写任何状态，
+// 否则会把上一个任务的目录写进新任务的 termCwd，下次打开就定位错了目录。
+// 因此关闭、打开新弹窗都会 ++ 让旧请求作废。
+let fmLoadSeq = 0
+
+// openFileManager 打开弹窗并定位到该终端表面的当前目录。
+//
+// 目录来源优先级：term:cwd 事件（OSC 7，最准）＞ 后端回落的家目录。
+// 传空路径给后端是**有意为之**：让「拿不到目录」这件事只有一个处理点
+// （后端 ListRemoteDir），而不是前后端各写一份回落逻辑。
+export async function openFileManager(hostId, sessionId) {
+  const key = bucketKey(hostId, sessionId)
+  const fm = fmState()
+  // 作废上一个弹窗（如果有）在途的请求：它属于别的终端表面，
+  // 回来后会写错 key 的目录。
+  fmLoadSeq++
+  fm.open = true
+  fm.key = key
+  fm.hostId = hostId
+  fm.sessionId = sessionId
+  fm.entries = []
+  fm.error = ''
+  fm.notice = ''
+  await loadDir(store.termCwd[key] || '')
+}
+
+export function closeFileManager() {
+  // 作废在途请求：关闭之后再写状态会让已经清空的弹窗突然"复活"出内容，
+  // 或把 key 已经变空的 termCwd 写脏。
+  fmLoadSeq++
+  const fm = fmState()
+  fm.open = false
+  fm.key = ''
+  fm.entries = []
+  fm.error = ''
+  fm.notice = ''
+  fm.busy = false
+  fm.loading = false
+}
+
+// loadDir 列出一个目录并更新弹窗状态。path 传空表示「让后端决定」（家目录）。
+//
+// 每次调用领一个序号；await 回来后若序号已不是最新，说明期间用户又导航到了
+// 别处（或关掉了弹窗），这次结果直接丢弃 —— 不能写进 fm，也不能写 termCwd。
+export async function loadDir(path) {
+  const fm = fmState()
+  if (!api()) {
+    fm.error = '后端未就绪'
+    return
+  }
+  const seq = ++fmLoadSeq
+  // 记下这次请求是为哪块表面发的：await 期间 fm.key 可能已经变了。
+  const key = fm.key
+  fm.loading = true
+  fm.error = ''
+  try {
+    const res = await api().ListRemoteDir(fm.hostId, path || '')
+    if (seq !== fmLoadSeq) return // 已被更新的导航/关闭取代
+    if (res && res.ok) {
+      fm.cwd = res.path
+      fm.parent = res.parent
+      fm.entries = res.entries || []
+      // 把实际落到的目录回写进 termCwd：用户可能是在拿不到 OSC 7 时
+      // 打开弹窗、被回落到家目录，该记住的是**实际列出的**那个目录。
+      // 用请求发出时记下的 key，而不是此刻的 fm.key。
+      if (key) store.termCwd[key] = res.path
+    } else {
+      fm.error = (res && res.error) || '列目录失败'
+    }
+  } catch (e) {
+    if (seq !== fmLoadSeq) return
+    fm.error = String(e && e.message ? e.message : e)
+  } finally {
+    // 只有仍是最新那次请求才复位 loading：否则旧请求的 finally 会把
+    // 新请求正在显示的「读取中」提前关掉，界面看起来像卡住。
+    if (seq === fmLoadSeq) fm.loading = false
+  }
+}
+
+export async function fmEnter(entryPath) {
+  return loadDir(entryPath)
+}
+
+export async function fmGoParent() {
+  const fm = fmState()
+  if (!fm.parent || fm.parent === fm.cwd) return
+  return loadDir(fm.parent)
+}
+
+// fmDelete 删除一项。确认由组件负责（弹窗），这里只管执行。
+export async function fmDelete(entryPath) {
+  const fm = fmState()
+  if (!api()) return
+  fm.busy = true
+  fm.error = ''
+  try {
+    const res = await api().DeleteRemotePath(fm.hostId, entryPath)
+    if (res && res.ok) {
+      fm.notice = res.message || '已删除'
+      await loadDir(fm.cwd)
+    } else {
+      fm.error = (res && res.error) || '删除失败'
+    }
+  } catch (e) {
+    fm.error = String(e && e.message ? e.message : e)
+  } finally {
+    fm.busy = false
+  }
+}
+
+// fmUpload 把本地 File 内容 base64 后上传到当前目录。
+//
+// 先做本地大小校验再编码：把一个 2GB 的文件整个读进内存去 base64，
+// 在报「超过上限」之前就已经把页面内存打爆了 —— 那种失败方式比拒绝难看得多。
+export async function fmUpload(file) {
+  const fm = fmState()
+  if (!api() || !file) return
+  // 上限以后端下发的为准（见 store.maxTransferBytes）。
+  const limit = store.maxTransferBytes
+  if (limit > 0 && file.size > limit) {
+    fm.error = `文件超过上限（${fmtBytes(limit)}），当前 ${fmtBytes(file.size)}`
+    return
+  }
+  fm.busy = true
+  fm.error = ''
+  try {
+    const b64 = await fileToBase64(file)
+    // 去掉 data URL 前缀：后端要的是纯 base64。
+    const pure = b64.includes(',') ? b64.slice(b64.indexOf(',') + 1) : b64
+    const res = await api().UploadRemoteFile(fm.hostId, fm.cwd, file.name, pure)
+    if (res && res.ok) {
+      fm.notice = res.message || `已上传 ${file.name}`
+      await loadDir(fm.cwd)
+    } else {
+      fm.error = (res && res.error) || '上传失败'
+    }
+  } catch (e) {
+    fm.error = String(e && e.message ? e.message : e)
+  } finally {
+    fm.busy = false
+  }
+}
+
+// fmDownload 读取远端文件并触发浏览器下载。
+//
+// 用 <a download> 而不是 Wails 的 SaveFileDialog：后端只要把内容读出来，
+// 「存到哪」交给浏览器自己的下载机制（用户在系统下载对话框里选），
+// 后端不必知道有任何本地路径，也就少一条可能被滥用的能力。
+export async function fmDownload(entryPath, name) {
+  const fm = fmState()
+  if (!api()) return
+  fm.busy = true
+  fm.error = ''
+  try {
+    const res = await api().DownloadRemoteFile(fm.hostId, entryPath)
+    if (res && res.ok) {
+      saveBase64AsFile(res.message, name || 'download')
+      fm.notice = `已下载 ${name || ''}`
+    } else {
+      fm.error = (res && res.error) || '下载失败'
+    }
+  } catch (e) {
+    fm.error = String(e && e.message ? e.message : e)
+  } finally {
+    fm.busy = false
+  }
+}
+
+// fmtBytes 把字节数变成人能读的大小，用于错误与提示文案。
+export function fmtBytes(n) {
+  if (!n || n < 0) return '0 B'
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`
+  if (n < 1024 * 1024 * 1024) return `${(n / 1048576).toFixed(1)} MiB`
+  return `${(n / 1073741824).toFixed(2)} GiB`
+}
+
+// fileToBase64 把本地文件读成 base64（含 data URL 前缀，调用方负责剥掉）。
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader()
+    fr.onload = () => resolve(String(fr.result || ''))
+    fr.onerror = () => reject(fr.error || new Error('读取本地文件失败'))
+    fr.readAsDataURL(file)
+  })
+}
+
+// saveBase64AsFile 把 base64 内容作为文件下载到本地。
+//
+// 解码走 atob + Uint8Array 而不是直接造 data: URL：data URL 在
+// 大文件（几十 MB）上会被浏览器拒掉或卡死，而 Blob 是流式的。
+function saveBase64AsFile(b64, filename) {
+  const bytes = base64ToBytes(b64)
+  const blob = new Blob([bytes], { type: 'application/octet-stream' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  // 立刻 revoke 会让下载在某些浏览器上来不及取数据，延后一拍。
+  setTimeout(() => URL.revokeObjectURL(url), 10000)
+}
 
 // isPtyDirty 供界面在回合结束时判断要不要补输入提示符。
 export function isPtyDirty(hostId, sessionId) {

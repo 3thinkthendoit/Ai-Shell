@@ -9,7 +9,7 @@
 //
 // 重构后控制台就是终端本身：选中主机、组件挂载即附着常驻 PTY，
 // 不再需要「切到交互终端模式」这一步。
-import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll, vi } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import { nextTick } from 'vue'
 import ConsolePanel from '../components/ConsolePanel.vue'
@@ -89,6 +89,14 @@ function makeApp(impl = {}) {
     // composer 里的 shell 行走常驻终端通道；ReportActiveSession 报当前会话。
     RunShellInTerminal: async () => ({ status: 'done', decision: 'allow', reason: '', rule: 'auto_safe', risk: 'low' }),
     ReportActiveSession: async () => undefined,
+    // 命令识别：真实实现复用 policy 的命令库（见 app_shell.go ClassifyShellInput）。
+    // 替身认几个常见命令即可 —— 这里验的是分流逻辑，命令库本身由 Go 侧测试钉住。
+    // 不给这个实现的话，所有输入都会落进「首词不认识」分支，shell 命令根本发不出去。
+    ClassifyShellInput: async text => {
+      const first = String(text || '').trim().split(/\s+/)[0] || ''
+      const base = first.replace(/^.*\//, '')
+      return ['ls', 'echo', 'grep', 'cat', 'df', 'docker', 'systemctl', 'nginx', 'cd', 'pwd', 'a', 'b', 'uptime', 'tail', 'sed'].includes(base)
+    },
     ListSessions: async () => [{ id: 'default', name: '', turns: 0, archivedTurns: 0, isDefault: true }],
     CreateSession: async () => ({ id: 's1', name: '新会话', turns: 0, archivedTurns: 0, isDefault: false }),
     RenameSession: async () => undefined,
@@ -378,13 +386,49 @@ describe('常驻终端表面 按键与尺寸', () => {
     withHost()
     setup()
     await attached()
+    await settleResize()
     expect(roInstances).toHaveLength(1)
     const before = callsOf('ResizeTerminal').length
 
+    // 容器真的变了：先改 fit 算出的尺寸再触发 RO，onResize 才会带着新尺寸来。
+    // 真 FitAddon 尺寸没变时根本不触发 onResize；替身每次 fit 都无条件发，
+    // 所以必须显式改尺寸来模拟「尺寸确实变了」。
+    const inst = instances[0]
+    inst.addon.cols = 132
+    inst.addon.rows = 43
     roInstances[0].cb()
     await new Promise(r => setTimeout(r, 250))
 
-    expect(callsOf('ResizeTerminal').length).toBeGreaterThan(before)
+    const rs = callsOf('ResizeTerminal').slice(before)
+    expect(rs.length).toBeGreaterThan(0)
+    expect(rs[rs.length - 1].args).toEqual(['h1', 'default', 132, 43])
+  })
+
+  it('打开后与创建尺寸相同的待发 resize 被作废（否则 SIGWINCH 重绘提示符，叠出多个提示符）', async () => {
+    withHost()
+    setup()
+    await attached()
+    // 旧实现：布局稳定期（RAF 补测、状态行增减）的 onResize 与 PTY 创建尺寸相同，
+    // 仍会在 150ms 后补发一次 window-change —— SIGWINCH 让 bash 在光标处原地重绘
+    // 空提示符，与启动的那一遍叠成「[root@host ~]# [root@host ~]# [root@host ~]#」。
+    // 新约定：PTY 创建尺寸在打开完成时即登记为「已发送」，待发定时器作废；
+    // 之后真实变了尺寸（下面那条测试）才照常上报。
+    await settleResize()
+    expect(callsOf('ResizeTerminal')).toHaveLength(0)
+  })
+
+  it('慢连接下防抖在打开完成前到期：opening 期间到点的 resize 不发', async () => {
+    // OpenTerminal 故意耗时 250ms > 150ms 防抖：定时器会在打开完成前到期。
+    // 只靠「打开完成后作废待发」拦不住这一路径 —— 回调到期时必须再查一次状态，
+    // opening 期间直接丢弃（打开完成后 statusLine watcher 的 doFit 会以最终
+    // 尺寸重走去重，真实变了才补发）。
+    withHost()
+    setup({
+      OpenTerminal: async () => { await new Promise(r => setTimeout(r, 250)) }
+    })
+    await attached()
+    await settleResize()
+    expect(callsOf('ResizeTerminal')).toHaveLength(0)
   })
 })
 
@@ -568,6 +612,157 @@ describe('终端字节编解码', () => {
   })
 })
 
+// ---- 欢迎引导：每次打开/回到控制台都提示「这里能说人话」----
+//
+// 顶部 banner 是常驻的，但常驻的东西会被眼睛过滤掉。引导必须落在「正要用它」
+// 的那一刻：终端刚打开、以及从归档切回表面时，在提示符旁边就地出现一次。
+describe('欢迎引导', () => {
+  // 引导比真提示符晚出现（远端 shell 打提示符要几百毫秒）。测试里用假时钟
+  // 快进，不真的等 700ms —— 否则每个用例都白跑一秒。
+  async function runHintTimer() {
+    await flushPromises()
+    vi.advanceTimersByTime(1000)
+    await nextTick()
+  }
+
+  it('打开终端后出现一次，等真提示符出来再画', async () => {
+    vi.useFakeTimers()
+    try {
+      withHost()
+      setup()
+      await vi.advanceTimersByTimeAsync(0)
+      await attached()
+
+      // 计时器还没到点：此刻不该有引导（否则会被远端提示符压过去）。
+      expect(instances[0].text()).not.toContain('自然语言')
+
+      await runHintTimer()
+      const text = instances[0].text()
+      expect(text).toContain('自然语言')
+      expect(text).toContain('LLM')
+      // 占位符必须**就地写在光标行上**：不能另起一行（nl 会先落一个 \r\n），
+      // 否则这行说明会混进命令输出流里，看起来像一条命令的结果。
+      expect(text).not.toContain('\r\n')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('占位符从提示符末尾那一列开始写，光标随后归位到该列', async () => {
+    vi.useFakeTimers()
+    try {
+      withHost()
+      setup()
+      await vi.advanceTimersByTimeAsync(0)
+      await attached()
+
+      const inst = instances[0]
+      // 模拟真实提示符 root@VM_0_16_centos:~$ —— 23 列宽，光标停在列 23。
+      inst.buffer.active.cursorX = 23
+      await runHintTimer()
+
+      const out = inst.text()
+      // 提示之前不能有换行：必须以提示文字直接开头（紧跟在提示符之后）。
+      expect(out.startsWith('\x1b[2m可以直接用自然语言')).toBe(true)
+      // 写完提示，光标用**绝对列**移回提示符末尾（列 23 → ANSI 24）。
+      // 按提示宽度倒推会在提示符较宽时偏左，把提示符盖住。
+      expect(out.endsWith('\x1b[24G')).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('开始输入时占位符被擦掉，不污染真实输入行', async () => {
+    vi.useFakeTimers()
+    try {
+      withHost()
+      setup()
+      await vi.advanceTimersByTimeAsync(0)
+      await attached()
+
+      const inst = instances[0]
+      // 提示符末尾列号在**写占位符时**读取（见 paintWelcomeHintIfNeeded），
+      // 所以必须在计时器到点前把 cursorX 摆好，模拟「提示符占了 16 列」。
+      inst.buffer.active.cursorX = 16
+      await runHintTimer()
+      clearSurface()
+      inst.emitData('l')
+      const out = inst.text()
+      // 擦除：把光标移到占位符起点（列 16 → ANSI 17），用等宽空格盖掉提示，
+      // 再回到提示符末尾 —— 这样后续回显落在正确位置。
+      expect(out).toMatch(/\x1b\[17G +\x1b\[17G/)
+      expect(out).not.toContain('\r\n')
+      // 擦完之后才是用户敲的那个字符。
+      expect(out.endsWith('l')).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('占位符不在「已有本地输入」时插入（避免盖掉用户打了一半的行）', async () => {
+    vi.useFakeTimers()
+    try {
+      withHost()
+      setup()
+      await vi.advanceTimersByTimeAsync(0)
+      await attached()
+
+      const inst = instances[0]
+      // 用户在提示符下已经敲了字，此时切回表面不该把占位符塞进来。
+      inst.buffer.active.cursorX = 16
+      inst.emitData('ls')
+      clearSurface()
+      await runHintTimer()
+
+      expect(inst.text()).not.toContain('自然语言')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('同一块表面只提示一次，不随布局重测反复叠加', async () => {
+    vi.useFakeTimers()
+    try {
+      withHost()
+      setup()
+      await vi.advanceTimersByTimeAsync(0)
+      await attached()
+      await runHintTimer()
+
+      // 触发一次重测（容器尺寸变化会引起 doFit → 可能再走 ensureTerm）。
+      roInstances[0].cb()
+      await vi.advanceTimersByTimeAsync(1000)
+      await nextTick()
+
+      const n = instances[0].text().split('自然语言').length - 1
+      expect(n).toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('从对话归档切回表面时再提示一次', async () => {
+    vi.useFakeTimers()
+    try {
+      withHost()
+      setup()
+      await vi.advanceTimersByTimeAsync(0)
+      await attached()
+      await runHintTimer()
+
+      await toArchive()
+      await toSurface()
+      await vi.advanceTimersByTimeAsync(1000)
+      await nextTick()
+
+      const n = instances[0].text().split('自然语言').length - 1
+      expect(n).toBe(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
 // ---- 终端内直接输入（本地行编辑 + 回车分类）----
 
 describe('终端内直接输入自然语言', () => {
@@ -576,7 +771,10 @@ describe('终端内直接输入自然语言', () => {
     for (const ch of s) inst.emitData(ch)
   }
 
-  it('中文回车 → 交给 Agent，不写进 PTY', async () => {
+  // 含中文的**自然语言**（首词不是命令）直接进 Agent，不再弹窗 ——
+  // 曾经「含中文就问」，连 `你是什么模型` 都要点一下就纯属打扰。
+  // 命令识别交由后端（见 app_shell.go ClassifyShellInput）。
+  it('中文自然语言回车 → 直接交给 Agent，不弹窗', async () => {
     setup()
     withHost()
     await attached()
@@ -585,12 +783,30 @@ describe('终端内直接输入自然语言', () => {
     type(inst, '磁盘满了怎么办')
     inst.emitData('\r')
     await flushPromises()
+    await nextTick()
+    expect(wrapper.find('.route-modal').exists()).toBe(false)
     const asks = callsOf('Ask')
     expect(asks.length).toBe(1)
     expect(JSON.stringify(asks[0].args)).toContain('磁盘满了怎么办')
-    // 自然语言绝不该被当命令发给 shell。
-    expect(callsOf('WriteTerminal').length).toBe(0)
+    // 自然语言绝不该被当命令发给 shell
     expect(callsOf('RunShellInTerminal').length).toBe(0)
+  })
+
+  // 含中文但首词是命令（`echo 你好`）：命令意图明确，直接走 shell，不弹窗。
+  it('中文参数的命令回车 → 直接走 shell，不弹窗', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
+    type(inst, 'echo 你好')
+    inst.emitData('\r')
+    await flushPromises()
+    await nextTick()
+    expect(wrapper.find('.route-modal').exists()).toBe(false)
+    const run = callsOf('RunShellInTerminal')
+    expect(run.length).toBe(1)
+    expect(run[0].args[2]).toBe('echo 你好')
   })
 
   it('shell 命令回车 → 走常驻终端通道（策略闸门）', async () => {

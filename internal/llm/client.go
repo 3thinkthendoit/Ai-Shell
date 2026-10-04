@@ -289,10 +289,14 @@ func (c *Client) Ping(ctx context.Context) (PingResult, error) {
 }
 
 // redactErr 把错误响应体整理成可安全展示的信息（剔除可能被回显的 API Key）。
+//
+// 截断上限从 500 放宽到 2000：网关的报错往往是嵌套 JSON（外层包一次上游原文），
+// 真正有用的那句「为什么被拒」常在第 600 字符之后 —— 原样截到 500 时，
+// 用户看到的是一串没头没尾的转义引号，等于什么都没说。
 func (c *Client) redactErr(status int, data []byte) error {
 	msg := strings.TrimSpace(string(data))
-	if len(msg) > 500 {
-		msg = msg[:500] + "…"
+	if len(msg) > 2000 {
+		msg = msg[:2000] + "…"
 	}
 	if c.apiKey != "" {
 		msg = strings.ReplaceAll(msg, c.apiKey, "[REDACTED]")

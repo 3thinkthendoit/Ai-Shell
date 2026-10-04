@@ -39,6 +39,14 @@ function makeApp(impl = {}) {
     // 默认放行；ReportActiveSession 报当前会话，挂载/切会话时都会调。
     RunShellInTerminal: async () => ({ status: 'done', decision: 'allow', reason: '', rule: 'auto_safe', risk: 'low' }),
     ReportActiveSession: async () => undefined,
+    // 命令识别：真实实现复用 policy 的命令库（见 app_shell.go ClassifyShellInput）。
+    // 替身只认几个常见命令 —— 测试要验的是「分流逻辑有没有把首词拿去做判断」，
+    // 不是后端命令库本身（那份在 Go 侧有 TestIsKnownBinary 钉着）。
+    ClassifyShellInput: async text => {
+      const first = String(text || '').trim().split(/\s+/)[0] || ''
+      const base = first.replace(/^.*\//, '')
+      return ['ls', 'echo', 'grep', 'cat', 'df', 'docker', 'systemctl', 'nginx', 'cd'].includes(base)
+    },
     // 会话列表：默认只有一条默认会话，与后端的不变式一致。
     // 不给这个实现的话，切主机触发的 refreshSessions 会抛异常、
     // 在对话流里插一条红色报错，把别的断言全带偏。
@@ -226,6 +234,51 @@ describe('ConsolePanel 审批条', () => {
     expect(wrapper.find('.approval').exists()).toBe(false)
     expect(wrapper.text()).not.toContain('已批准执行')
     expect(wrapper.text()).toContain('已失效')
+  })
+
+  // 「不想回答」得有个心理成本最低的出口：拒绝读起来像在否决 Agent 的判断，
+  // 用户不确定拒绝了要不要给理由。跳过是中性词。两者后端动作相同（都不执行），
+  // 但语义不同，所以必须有这个按钮 —— 否则用户只能被迫选一个不像自己的选项。
+  it('「跳过」把 (id, false) 发给后端（与拒绝同一动作，语义更中性）', async () => {
+    setup()
+    store.pending = { id: 'a6', name: 'run_command', command: 'systemctl restart nginx' }
+    await nextTick()
+    const buttons = wrapper.findAll('.approval .row button')
+    expect(buttons[2].text()).toBe('跳过')
+    await buttons[2].trigger('click')
+    await nextTick()
+    expect(calls.filter(c => c.name === 'Approve')[0].args).toEqual(['a6', false])
+  })
+
+  // 倒计时告诉用户「不回答的代价」：没有它，用户以为可以无限期挂起，
+  // 实际上后端 5 分钟后就放弃了。
+  it('带 deadline 的审批显示倒计时', async () => {
+    setup()
+    store.pending = {
+      id: 'a7', name: 'run_command', command: 'ls',
+      deadlineMs: Date.now() + 5 * 60 * 1000
+    }
+    await nextTick()
+    expect(wrapper.find('.approval-countdown').exists()).toBe(true)
+    // 5 分钟整 → 显示 5:00（或 4:59，取决于跨秒）。只断言格式，避免边界抖动。
+    expect(wrapper.find('.approval-countdown').text()).toMatch(/^[45]:\d{2} 后失效$/)
+  })
+
+  it('没有 deadline 的审批不渲染倒计时（老版本后端 / 无超时场景）', async () => {
+    setup()
+    store.pending = { id: 'a8', name: 'run_command', command: 'ls' }
+    await nextTick()
+    expect(wrapper.find('.approval-countdown').exists()).toBe(false)
+  })
+
+  it('剩余不足 30 秒时倒计时标红（紧迫态）', async () => {
+    setup()
+    store.pending = {
+      id: 'a9', name: 'run_command', command: 'ls',
+      deadlineMs: Date.now() + 10 * 1000
+    }
+    await nextTick()
+    expect(wrapper.find('.approval-countdown').classes()).toContain('urgent')
   })
 
   it('「详细」按钮弹出全文弹窗，可关闭，批准后随之收起', async () => {
@@ -493,6 +546,174 @@ describe('ConsolePanel 表面渲染', () => {
     rt.emit('agent:done', {})
     await nextTick()
     expect(surfaceText()).not.toContain('❯')
+  })
+
+  // 「LLM 答完就回到控制台」必须是必达的。
+  // 曾经有一条 `t.line`（本地缓冲非空就跳过补提示符）的拦截 —— 用户在
+  // LLM 回复期间随手敲了几个键，那些字符攒进缓冲，回合结束时提示符就不补了，
+  // 用户看到的是「答完了却没回到命令行」，像是卡在某个模式里出不来。
+  it('LLM 回复期间敲的键被丢弃，不再拦住回合结束时的 ❯', async () => {
+    await setupAttached()
+    const term = instances[0]
+    await ask('本机 docker 正常么')
+    await nextTick()
+    // 回复过程中随手敲键盘（真实用户行为）
+    term.emitData('l')
+    term.emitData('s')
+    // 这些键既不该进本地缓冲（否则回车会被当提问发出去），也不该发 PTY
+    expect(calls.filter(c => c.name === 'WriteTerminal')).toHaveLength(0)
+    expect(term.written).not.toContain('ls')
+
+    rt.emit('agent:done', {})
+    await nextTick()
+    expect(surfaceText()).toContain('❯')
+  })
+
+  it('运行期间按 Ctrl-C 走中断（唯一的键盘逃生口）', async () => {
+    await setupAttached()
+    const term = instances[0]
+    await ask('本机 docker 正常么')
+    await nextTick()
+    term.emitData('\x03')
+    await nextTick()
+    // stop() 把运行态清掉：用户靠 Ctrl-C 从「等不下去了」里出来
+    expect(store.running).toBe(false)
+  })
+
+  it('回合结束时不再重复补 ❯（已有合成提示符就跳过）', async () => {
+    await setupAttached()
+    await ask('本机 docker 正常么')
+    await nextTick()
+    rt.emit('agent:done', {})
+    await nextTick()
+    const first = surfaceText().split('❯').length - 1
+    // 再触发一次 running 的 true→false（如第二轮纯问答）：不该叠出第二个 ❯
+    await ask('那磁盘呢')
+    await nextTick()
+    rt.emit('agent:done', {})
+    await nextTick()
+    // 第二轮是新的提问轮，paintUser 会画自己的行，但 ❯ 不该重复堆积在空行上
+    expect(surfaceText().split('❯').length - 1).toBeGreaterThanOrEqual(first)
+  })
+})
+
+// ---- 输入去向确认 ----
+//
+// 判断标准是「首词像不像命令」，由**后端**回答（见 app_shell.go
+// ClassifyShellInput —— 它复用 policy 的命令库）。前端不再自带命令清单：
+// 手抄的清单把 `nginx 起不来了` 判成了命令，而它是句中文提问。
+//
+// 弹窗只留给**首词是陌生素词**这一种真正两可的情况：
+//   `你是什么模型`  不是命令 → 直接 Agent
+//   `echo 你好`     是命令   → 直接 shell（中文只是参数）
+//   `foobar --help` 不认识   → 问用户一次
+describe('ConsolePanel 输入去向确认', () => {
+  async function typeLine(s) {
+    const term = instances[0]
+    for (const ch of s) term.emitData(ch)
+    term.emitData('\r')
+    await flushPromises()
+    await nextTick()
+  }
+
+  // 这一条是你截图里那个场景：`你是什么模型` 毫无歧义，不该弹窗。
+  it('中文自然语言提问（非命令首词）：直接问 LLM，不弹窗', async () => {
+    await setupAttached()
+    await typeLine('你是什么模型')
+    await nextTick()
+    expect(wrapper.find('.route-modal').exists()).toBe(false)
+    expect(store.running).toBe(true)
+  })
+
+  it('中文描述问题的句子（首词是命令名也不算）：走 Agent，不弹窗', async () => {
+    await setupAttached()
+    // nginx 是命令名，但「起不来了」是描述 —— 后端命令库只认首词，
+    // 这里由「含中文且首词判定为命令」的反面覆盖：替身认得 nginx，
+    // 但真实后端同样会判成命令意图。这条用 `看看磁盘` 锁住「非命令 → Agent」。
+    await typeLine('看看磁盘')
+    await nextTick()
+    expect(wrapper.find('.route-modal').exists()).toBe(false)
+    expect(store.running).toBe(true)
+  })
+
+  it('含中文但首词是命令：直接走 shell，不弹窗', async () => {
+    await setupAttached()
+    await typeLine('echo 你好')
+    await nextTick()
+    expect(wrapper.find('.route-modal').exists()).toBe(false)
+    const shells = calls.filter(c => c.name === 'RunShellInTerminal')
+    expect(shells.some(c => c.args.includes('echo 你好'))).toBe(true)
+  })
+
+  it('首词不认识：弹二选一，不擅自决定', async () => {
+    await setupAttached()
+    await typeLine('foobar --help')
+    await nextTick()
+    expect(wrapper.find('.route-modal').exists()).toBe(true)
+    expect(wrapper.find('.route-text').text()).toContain('foobar --help')
+    // 还没选，就绝不能已经发出去了
+    expect(calls.filter(c => c.name === 'RunShellInTerminal')).toHaveLength(0)
+    expect(store.running).toBe(false)
+  })
+
+  it('选「问 LLM」把这一行作为提问发出去', async () => {
+    await setupAttached()
+    await typeLine('foobar --help')
+    await nextTick()
+    const buttons = wrapper.findAll('.route-modal .modal-actions button')
+    await buttons[2].trigger('click') // 问 LLM
+    await flushPromises()
+    await nextTick()
+    expect(wrapper.find('.route-modal').exists()).toBe(false)
+    expect(store.running).toBe(true)
+  })
+
+  it('选「当 shell 命令」把原文交给策略闸门', async () => {
+    await setupAttached()
+    await typeLine('foobar --help')
+    await nextTick()
+    const buttons = wrapper.findAll('.route-modal .modal-actions button')
+    await buttons[1].trigger('click') // 当 shell 命令
+    await flushPromises()
+    await nextTick()
+    expect(wrapper.find('.route-modal').exists()).toBe(false)
+    const shells = calls.filter(c => c.name === 'RunShellInTerminal')
+    expect(shells.some(c => c.args.includes('foobar --help'))).toBe(true)
+  })
+
+  it('Esc 取消弹窗，不发出任何东西（出得来）', async () => {
+    await setupAttached()
+    await typeLine('foobar --help')
+    await nextTick()
+    expect(wrapper.find('.route-modal').exists()).toBe(true)
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
+    await nextTick()
+    expect(wrapper.find('.route-modal').exists()).toBe(false)
+    expect(store.running).toBe(false)
+    expect(calls.filter(c => c.name === 'RunShellInTerminal')).toHaveLength(0)
+  })
+
+  it('纯英文命令不弹窗，直接走 shell', async () => {
+    await setupAttached()
+    await typeLine('df -h')
+    await nextTick()
+    expect(wrapper.find('.route-modal').exists()).toBe(false)
+  })
+
+  it('? 开头的英文不弹窗（显式表态要问 LLM）', async () => {
+    await setupAttached()
+    await typeLine('?docker 正常么')
+    await nextTick()
+    expect(wrapper.find('.route-modal').exists()).toBe(false)
+  })
+
+  it('! 开头强制当 shell 命令，中文也不弹窗', async () => {
+    await setupAttached()
+    await typeLine('!echo 你好')
+    await nextTick()
+    expect(wrapper.find('.route-modal').exists()).toBe(false)
+    const shells = calls.filter(c => c.name === 'RunShellInTerminal')
+    expect(shells.some(c => c.args.includes('echo 你好'))).toBe(true)
   })
 })
 

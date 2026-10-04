@@ -9,7 +9,7 @@ import {
   store, push, clearLog, clearSession, bootstrap, refreshHosts, refreshSessions, bindEvents,
   ask, approve, stop, dismissAuditError, bucketKey,
   runShellInTerminal, reportActiveSession, selectSession,
-  registerTermSink, unregisterTermSink, textToBase64
+  registerTermSink, unregisterTermSink, textToBase64, bytesToBase64
 } from '../store.js'
 
 // 桶键由 bucketKey 生成，测试里不要手写 'h1\x00default' 这种字面量 ——
@@ -128,7 +128,7 @@ describe('bindEvents 事件接线', () => {
     bindEvents()
     for (const name of [
       'agent:message', 'agent:tool', 'agent:toolResult', 'agent:injection',
-      'agent:approval', 'agent:status', 'agent:error', 'agent:done',
+      'agent:approval', 'approval:expired', 'agent:status', 'agent:error', 'agent:done',
       'audit:error'
     ]) {
       expect(rt.handlerCount(name), `缺少监听: ${name}`).toBe(1)
@@ -277,6 +277,45 @@ describe('bindEvents 事件接线', () => {
     store.pending = { id: 'a2', name: 'run_command', command: 'rm -rf /tmp/x' }
     rt.emit('agent:done', {})
     expect(store.pending).toBe(null)
+  })
+
+  // 审批超时是后端**静默**发生的（time.After 到点返回 false），界面上那张条
+  // 却还挂着。用户看到的是「还在等我批准」，直到点下去才被告知「已失效」。
+  // 这组用例钉住「后端说失效、界面就收掉」这条链路。
+  it('approval:expired 收掉对应的审批条并留下一行说明', () => {
+    install({ runtime: rt, app: makeApp().app })
+    bindEvents()
+    store.pending = { id: 'a1', name: 'run_command', command: 'uptime' }
+
+    rt.emit('approval:expired', { id: 'a1', reason: '审批超时' })
+
+    expect(store.pending).toBe(null)
+    const last = store.entries.at(-1)
+    expect(last.kind).toBe('system')
+    expect(last.content).toContain('审批超时')
+  })
+
+  it('approval:expired 的 id 与当前挂起的不一致时不动它', () => {
+    install({ runtime: rt, app: makeApp().app })
+    bindEvents()
+    // 上一张（a1）的失效事件可能在下一张（a2）已经到达之后才被派发：
+    // 无条件清会把用户正在看的新审批一起抹掉。
+    store.pending = { id: 'a2', name: 'run_command', command: 'df -h' }
+
+    rt.emit('approval:expired', { id: 'a1', reason: '审批超时' })
+
+    expect(store.pending).not.toBe(null)
+    expect(store.pending.id).toBe('a2')
+  })
+
+  it('approval:expired 缺 id 时不误清（防御无字段的老版本后端）', () => {
+    install({ runtime: rt, app: makeApp().app })
+    bindEvents()
+    store.pending = { id: 'a1', name: 'run_command', command: 'uptime' }
+
+    rt.emit('approval:expired', {})
+
+    expect(store.pending).not.toBe(null)
   })
 })
 
@@ -1081,16 +1120,50 @@ describe('runShellInTerminal 常驻终端 shell 通道', () => {
   })
 
   it('放行后画一句「可问 LLM」提示（这是 done 路径唯一的额外输出）', async () => {
-    const { app } = makeApp({ RunShellInTerminal: async () => ({ status: 'done' }) })
-    install({ runtime: rt, app })
-    const sink = captureSink('h1', 's1')
-    store.currentHostId = 'h1'
+    vi.useFakeTimers()
     try {
+      const { app } = makeApp({ RunShellInTerminal: async () => ({ status: 'done' }) })
+      install({ runtime: rt, app })
+      const sink = captureSink('h1', 's1')
+      store.currentHostId = 'h1'
       await runShellInTerminal('h1', 's1', 'ls -la')
+      // 提示要等终端输出静默才出现：这个接口返回时命令才刚写进 PTY，
+      // 回显与输出还在路上，此时画提示会插到命令输出前面。
+      expect(sink.painted()).not.toContain('想分析这段输出')
+
+      await vi.advanceTimersByTimeAsync(500)
       expect(sink.painted()).toContain('想分析这段输出')
       expect(sink.painted()).toContain('直接用中文问 LLM')
-    } finally {
       unregisterTermSink('h1', 's1', sink.fn)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('输出陆续到达时提示不断延后，永远排在输出之后', async () => {
+    vi.useFakeTimers()
+    try {
+      const { app } = makeApp({ RunShellInTerminal: async () => ({ status: 'done' }) })
+      install({ runtime: rt, app })
+      bindEvents() // 挂上 term:data 监听：静默检测靠它续期
+      const sink = captureSink('h1', 's1')
+      store.currentHostId = 'h1'
+      await runShellInTerminal('h1', 's1', 'ls -la')
+
+      // 模拟远端的回显 + 输出 + 新提示符分批到达，每批间隔 200ms（小于静默阈值）。
+      for (let i = 0; i < 3; i++) {
+        rt.emit('term:data', { hostId: 'h1', sessionId: 's1', data: bytesToBase64(new TextEncoder().encode('out' + i)) })
+        await vi.advanceTimersByTimeAsync(200)
+        expect(sink.painted()).not.toContain('想分析这段输出')
+      }
+      // 输出停了，再等过静默阈值才出现。
+      await vi.advanceTimersByTimeAsync(500)
+      expect(sink.painted()).toContain('想分析这段输出')
+      // 提示必须排在最后一批输出之后。
+      expect(sink.painted().indexOf('out2')).toBeLessThan(sink.painted().indexOf('想分析这段输出'))
+      unregisterTermSink('h1', 's1', sink.fn)
+    } finally {
+      vi.useRealTimers()
     }
   })
 

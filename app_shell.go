@@ -16,7 +16,10 @@ import (
 )
 
 // 人工 shell 审批等待上限。与 agent 工具审批同量级：用户可能离开屏幕去核对命令。
-const shellApprovalTimeout = 5 * time.Minute
+//
+// 做成变量而不是常量（同 agent.approvalTimeout）：测试要把它压到毫秒级
+// 验证超时路径会发 approval:expired。
+var shellApprovalTimeout = 5 * time.Minute
 
 // cwd 哨兵：与 frontend/src/term.js 的 CWD_MARKER 保持一致。
 const cwdMarker = "__AISHELL_CWD__"
@@ -251,6 +254,8 @@ func (a *App) RunShell(hostID, command, cwd string, timeoutSec int) ShellResult 
 			Rule:     verdict.Rule,
 			Risk:     risk,
 			Status:   "pending",
+			// 与 agent 工具审批同款：把失效时刻下发，界面显示倒计时。
+			DeadlineMs: time.Now().Add(shellApprovalTimeout).UnixMilli(),
 		}
 		a.emit(agent.EvApproval, view)
 
@@ -260,6 +265,8 @@ func (a *App) RunShell(hostID, command, cwd string, timeoutSec int) ShellResult 
 		}
 		approved, cancelled := a.shell.wait(id, ch, done)
 		if cancelled {
+			// 超时/中断都要告诉界面把这条收掉，否则它永远挂着（见 EvApprovalExpired）。
+			a.emit(agent.EvApprovalExpired, map[string]string{"id": id, "reason": "审批超时或已中断"})
 			a.auditLog(audit.Entry{
 				Kind:     audit.KindDirect,
 				HostID:   hostID,
@@ -401,6 +408,8 @@ func (a *App) RunShellInTerminal(hostID, sessionID, command string) ShellResult 
 			Rule:     verdict.Rule,
 			Risk:     base.Risk,
 			Status:   "pending",
+			// 与 agent 工具审批同款：把失效时刻下发，界面显示倒计时。
+			DeadlineMs: time.Now().Add(shellApprovalTimeout).UnixMilli(),
 		})
 
 		var done <-chan struct{}
@@ -409,6 +418,8 @@ func (a *App) RunShellInTerminal(hostID, sessionID, command string) ShellResult 
 		}
 		approved, cancelled := a.shell.wait(id, ch, done)
 		if cancelled {
+			// 超时/中断都要告诉界面把这条收掉，否则它永远挂着（见 EvApprovalExpired）。
+			a.emit(agent.EvApprovalExpired, map[string]string{"id": id, "reason": "审批超时或已中断"})
 			a.auditLog(audit.Entry{
 				Kind:     audit.KindDirect,
 				HostID:   hostID,
@@ -503,6 +514,37 @@ func (a *App) probeMissingBinary(hostID, cmd string, whitelist []string) *missin
 		}
 	}
 	return nil
+}
+
+// ClassifyShellInput 判断一行输入**像不像** shell 命令，供前端做输入分流。
+//
+// 为什么把这个判断放在后端：命令识别需要「Linux 命令库」这份知识，
+// 而它已经在 policy 包里（PrimaryBinary / IsKnownBinary / shellBuiltins
+// + vault 的只读白名单）。前端再养一份必然漂移 —— 实测里前端手抄的清单
+// 把 `nginx 起不来了` 判成了命令（nginx 确实在清单里），而它是句中文提问。
+//
+// 只做**本地**判断，不发远端探测：分流发生在用户敲回车的那一刻，
+// 不能因为查远端而卡住输入。未知第三方（可能是自定义脚本）一律返回 false，
+// 由前端问一次用户 —— 那正是 needsRouteChoice 要覆盖的唯一场景。
+//
+// 返回值刻意用「是否是命令」而不是 kind 字符串：前端的既有规则
+// （? / ! 前缀、中文提问、英文问句、多行）保持不变，只在
+// 「首词像不像命令」这一处改成问后端，改动面最小。
+func (a *App) ClassifyShellInput(text string) bool {
+	bin := policy.PrimaryBinary(text)
+	if bin == "" {
+		return false
+	}
+	// 路径形（./deploy.sh、/usr/local/bin/x）：人明确在指定一个可执行文件，
+	// 即使不在命令库里也算命令意图。
+	if strings.Contains(bin, "/") {
+		return true
+	}
+	var wl []string
+	if a.v != nil {
+		wl = a.v.Policy().Whitelist
+	}
+	return policy.IsKnownBinary(bin, wl)
 }
 
 func (a *App) resolveShell(id string, approved bool) bool {

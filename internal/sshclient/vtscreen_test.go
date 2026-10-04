@@ -247,6 +247,59 @@ func TestScreenInTUI(t *testing.T) {
 	}
 }
 
+// OSC 7 是远端 shell 上报当前目录的标准序列，也是文件管理弹窗
+// 「默认定位到控制台当前目录」的唯一数据来源。这里锁死三件事：
+// 解析正确、不污染屏幕、以及含转义字符的路径能还原。
+func TestScreenOSC7Cwd(t *testing.T) {
+	s := NewScreen(40, 3)
+	if got := s.Cwd(); got != "" {
+		t.Fatalf("还没收到 OSC 7 时应为空，实得 %q", got)
+	}
+
+	// 基本形式：file://host/path
+	s.Feed([]byte("\x1b]7;file://myhost/var/log\x07"))
+	if got := s.Cwd(); got != "/var/log" {
+		t.Fatalf("应解析出 /var/log，实得 %q", got)
+	}
+
+	// host 允许为空（file:///root）。
+	s.Feed([]byte("\x1b]7;file:///root\x07"))
+	if got := s.Cwd(); got != "/root" {
+		t.Fatalf("空 host 应解析出 /root，实得 %q", got)
+	}
+
+	// 根目录必须能表达 —— 它是最容易被「空串当没收到」的健忘逻辑吃掉的边界值。
+	s.Feed([]byte("\x1b]7;file://myhost/\x07"))
+	if got := s.Cwd(); got != "/" {
+		t.Fatalf("根目录应解析出 /，实得 %q", got)
+	}
+
+	// 含空格与中文的目录会被转义，必须还原 —— 否则界面显示的是
+	// %E4%B8%AD 这种串，用户拿去当路径用会找不到目录。
+	s.Feed([]byte("\x1b]7;file://myhost/a%20b/%E4%B8%AD%E6%96%87\x07"))
+	if got := s.Cwd(); got != "/a b/中文" {
+		t.Fatalf("转义路径应还原为 /a b/中文，实得 %q", got)
+	}
+
+	// OSC 7 是控制序列，绝不能在屏幕上留下任何字符。
+	if txt := s.Text(); strings.Contains(txt, "file://") || strings.Contains(txt, "7;") {
+		t.Fatalf("OSC 7 不该被印到屏幕上：%q", txt)
+	}
+
+	// 非 file:// 的 OSC 7（罕见）应被忽略而不是解析出垃圾。
+	before := s.Cwd()
+	s.Feed([]byte("\x1b]7;http://example.com/x\x07"))
+	if got := s.Cwd(); got != before {
+		t.Fatalf("非 file scheme 不该改动 cwd，实得 %q", got)
+	}
+
+	// ST 结尾（ESC \）与 BEL 等价，也要认。
+	s.Feed([]byte("\x1b]7;file://myhost/etc\x1b\\"))
+	if got := s.Cwd(); got != "/etc" {
+		t.Fatalf("ST 结尾应同样解析出 /etc，实得 %q", got)
+	}
+}
+
 // 全屏展开/收回会重报尺寸：模型必须跟着换几何，否则 top 重绘后
 // 快照文本与真屏幕错位。
 func TestScreenResize(t *testing.T) {

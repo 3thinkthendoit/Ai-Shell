@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="ga" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#22D3EE"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.45" r="0.6">
+      <stop offset="0" stop-color="#22D3EE" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#22D3EE" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <!-- Apple HIG 图标网格：内容占 1024 的 80.5%，四周留白约 10%，
+       避免在 macOS Dock 中比系统图标视觉偏大。 -->
+  <g transform="translate(512,512) scale(0.805) translate(-512,-512)">
+    <rect width="1024" height="1024" rx="224" fill="#0B1220"/>
+    <rect x="1.5" y="1.5" width="1021" height="1021" rx="222.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="3"/>
+    <circle cx="512" cy="500" r="360" fill="url(#glow)"/>
+    <path d="M296 336 L498 512 L296 688" fill="none" stroke="url(#ga)" stroke-width="68" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="582" y="634" width="186" height="68" rx="34" fill="url(#ga)"/>
+    <path d="M724 252 Q724 316 788 316 Q724 316 724 380 Q724 316 660 316 Q724 316 724 252 Z" fill="#22D3EE"/>
+    <circle cx="812" cy="240" r="14" fill="#8B5CF6"/>
+  </g>
+</svg>

@@ -45,6 +45,13 @@ const (
 	// 但快照是瞬态上下文 —— 不进会话历史。
 	EvSnapshot = "agent:snapshot"
 	EvDone     = "agent:done"
+	// EvApprovalExpired 审批超时/被中断而失效。
+	//
+	// 为什么需要这个事件：超时是后端**静默**发生的（time.After 到点返回 false），
+	// 界面上那张审批条却还挂着 —— 用户看到的是「还在等我批准」，
+	// 直到某天点下去才被告知「已失效」。这不是误导，是骗人。
+	// 这个事件让界面能把过期的条收掉，与后端状态保持一致。
+	EvApprovalExpired = "approval:expired"
 	// EvAuditError 审计日志写入失败。单独成一个事件，因为它不是「本次任务失败」，
 	// 而是「审计轨迹可能已不完整」—— 后者更严重，必须让用户立刻知道，
 	// 不能因为主流程照常返回而淹没在正常输出里。
@@ -66,6 +73,13 @@ type ToolCallView struct {
 	Status     string          `json:"status"` // pending | running | done | denied | error
 	ExitCode   int             `json:"exitCode"`
 	DurationMs int64           `json:"durationMs"`
+	// DeadlineMs 是这次审批的失效时刻（Unix 毫秒），0 表示不失效。
+	//
+	// 为什么由后端下发而不是前端自己数：等待超时是后端 time.After 在跑，
+	// 前端若从「收到事件」起自行计时，两边会因网络延迟与事件排队而漂移 ——
+	// 界面显示还剩 30 秒、后端其实已经放弃了。下发绝对时刻后前端只做显示，
+	// 不再自行判断，两边永远一致。
+	DeadlineMs int64 `json:"deadlineMs"`
 }
 
 // Agent 持有一次会话的运行状态。
@@ -716,7 +730,12 @@ func (a *Agent) chatOnce(ctx context.Context, client *llm.Client, msgs []llm.Mes
 	return reply, nil
 }
 
-const approvalTimeout = 5 * time.Minute
+// approvalTimeout 是工具审批的等待上限。
+//
+// 做成变量而不是常量，是为了让测试能把它压到毫秒级去验证「超时后确实会发
+// EvApprovalExpired」—— 否则这条路径只能靠干等 5 分钟来测，等于不测。
+// 与 llmTestTimeout 同一个理由（见 app.go）。
+var approvalTimeout = 5 * time.Minute
 
 // Run 启动一轮 agent 会话：用户提问 → 多轮工具调用 → 最终回答。
 //
@@ -1148,33 +1167,55 @@ func (a *Agent) requestApproval(ctx context.Context, view ToolCallView) bool {
 	a.approvals[view.ID] = ch
 	a.mu.Unlock()
 
+	// 把失效时刻随审批一起下发：界面据此显示倒计时，且这个时刻就是
+	// 下面 time.After 真正到点的时刻，两者永不漂移（见 DeadlineMs 说明）。
+	view.DeadlineMs = time.Now().Add(approvalTimeout).UnixMilli()
+
 	a.emit(EvApproval, view)
 
 	select {
 	case ok := <-ch:
 		return ok
 	case <-time.After(approvalTimeout):
-		a.mu.Lock()
-		delete(a.approvals, view.ID)
-		a.mu.Unlock()
+		a.dropApproval(view.ID)
+		// 告知界面这张条已作废：否则它会一直挂着，用户点了才知道白点。
+		a.emit(EvApprovalExpired, map[string]string{"id": view.ID, "reason": "审批超时"})
 		return false
 	case <-ctx.Done():
-		a.mu.Lock()
-		delete(a.approvals, view.ID)
-		a.mu.Unlock()
+		a.dropApproval(view.ID)
+		// ctx 取消（用户点了「中断」或本轮已终止）同样要收掉条子 ——
+		// 界面上那张「等待批准」此刻同样是谎话。
+		a.emit(EvApprovalExpired, map[string]string{"id": view.ID, "reason": "本轮已中断"})
 		return false
 	}
+}
+
+// dropApproval 把审批从挂起表里摘掉。
+func (a *Agent) dropApproval(id string) {
+	a.mu.Lock()
+	delete(a.approvals, id)
+	a.mu.Unlock()
 }
 
 // ---- 工具声明 ----
 
 func toolDefs(allowCrossHost bool) []llm.Tool {
+	// required 必须**省略**而不是给空数组。
+	//
+	// 无参数的工具（如 list_hosts）原本会生成 "required": []。这看着无害，
+	// 实则有两处不对：JSON Schema 里 required 为空数组虽然合法但毫无意义；
+	// 而部分严格校验的 OpenAI 兼容网关会直接以 400 / Invalid request
+	// parameters 拒掉整个请求 —— 表现是「设置页测试能过（不带 tools），
+	// 控制台一问就 400」，极难自行定位。省略字段后谁都挑不出毛病。
 	obj := func(props map[string]any, required ...string) map[string]any {
-		return map[string]any{
+		o := map[string]any{
 			"type":       "object",
 			"properties": props,
-			"required":   required,
 		}
+		if len(required) > 0 {
+			o["required"] = required
+		}
+		return o
 	}
 	hostIDDesc := "目标主机的 id，来自 list_hosts 的返回值。注意：这是一个不透明标识，无法从中获取任何登录信息。"
 	if !allowCrossHost {

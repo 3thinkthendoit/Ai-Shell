@@ -17,6 +17,8 @@ package sshclient
 
 import (
 	"hash/fnv"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -50,6 +52,14 @@ type Screen struct {
 	// 解析期间挂起的触发（Feed 持锁解析，钩子要在解锁后才调，
 	// 否则钩子里读 Text() 会自锁）。
 	pendCmdEnd, pendCmdEndTUI, pendAltOff bool
+	// cwd 是远端 shell 上报的当前工作目录（OSC 7）。空表示还没收到过。
+	//
+	// 为什么用 OSC 7 而不是「跑一条 pwd 去问」：SSH 的 Exec 是**另开一条连接**，
+	// 它的 cwd 恒为家目录，问不出用户此刻在哪。只有常驻的那条 shell 自己知道，
+	// 而它每次打印提示符都会经过 PROMPT_COMMAND —— 在那里顺手用 $PWD（bash 内建，
+	// 不起子进程）报一次，客户端就**始终**知道当前目录，不需要任何额外往返，
+	// 也不会在用户屏幕上闪一行命令回显。
+	cwd string
 	// 定格钩子：onCmdEnd 在 OSC 133;D（命令结束）时调，参数是
 	// 「这条命令是否全屏重绘过」；onAltOff 在备用屏幕释放瞬间调。
 	// 均为 nil 安全。
@@ -262,12 +272,31 @@ func (s *Screen) Feed(p []byte) {
 	}
 }
 
-// oscFinal 处理一条完整的 OSC payload。只认 shell integration 的
-// 133 系列（命令边界）：其余（标题、超链接等）对屏幕模型无意义。
+// oscFinal 处理一条完整的 OSC payload。
+//
+// 认两类，其余（窗口标题、超链接等）对屏幕模型无意义，直接丢弃：
+//   - 133 系列：shell integration 的命令边界（C=开始，D;退出码=结束）；
+//   - 7：当前工作目录，格式 `7;file://<host><path>`（RFC 8089 风格）。
+//
+// 两类都不会在屏幕上留下任何字符 —— 它们是控制序列，这正是选它们的原因：
+// 上报目录不该让用户看到多余输出。
 func (s *Screen) oscFinal() {
 	p := string(s.osc)
 	s.osc = s.osc[:0]
-	if len(p) < 5 || p[:4] != "133;" {
+	if len(p) < 2 {
+		return
+	}
+	switch p[0] {
+	case '7':
+		if cwd, ok := parseOSC7(p); ok {
+			s.cwd = cwd
+		}
+		return
+	case '1':
+		if len(p) < 5 || p[:4] != "133;" {
+			return
+		}
+	default:
 		return
 	}
 	switch p[4] {
@@ -280,6 +309,42 @@ func (s *Screen) oscFinal() {
 			s.pendCmdEnd, s.pendCmdEndTUI = true, s.cmdTUI || s.altDuringCmd
 		}
 	}
+}
+
+// parseOSC7 从 `7;file://host/path` 里取出 path。
+//
+// 路径需要百分号解码：含空格或中文的目录会被远端 shell 转义成 %20 / %E4%B8%AD
+// 之类。不解码的话，界面里显示的是转义串，用户拿去当路径用会找不到目录。
+// 解码失败不算错 —— 退回原始串，至少信息还在。
+func parseOSC7(p string) (string, bool) {
+	rest := strings.TrimPrefix(p, "7;")
+	// 只处理 file:// 形式；其它 scheme（rare）忽略。
+	if !strings.HasPrefix(rest, "file://") {
+		return "", false
+	}
+	rest = strings.TrimPrefix(rest, "file://")
+	// 跳过 host 部分：到第一个 '/' 为止。host 允许为空（file:///path）。
+	i := strings.IndexByte(rest, '/')
+	if i < 0 {
+		return "", false
+	}
+	path := rest[i:]
+	// 空路径说明这条 OSC 7 没带目录（只有 file://host 而没有尾巴），
+	// 当作没收到 —— 拿空串去列目录只会得到一个无意义的报错。
+	if path == "" {
+		return "", false
+	}
+	if dec, err := url.PathUnescape(path); err == nil {
+		path = dec
+	}
+	return path, true
+}
+
+// Cwd 返回远端 shell 上报的当前目录；没收到过 OSC 7 时返回空串。
+func (s *Screen) Cwd() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cwd
 }
 
 func (s *Screen) put(r rune) {

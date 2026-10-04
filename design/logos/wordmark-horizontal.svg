@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 280" width="1240" height="280">
+  <defs>
+    <linearGradient id="gw" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#22D3EE"/>
+      <stop offset="1" stop-color="#8B5CF6"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(16,16) scale(0.243)">
+    <rect width="1024" height="1024" rx="224" fill="#0B1220"/>
+    <path d="M296 336 L498 512 L296 688" fill="none" stroke="url(#gw)" stroke-width="68" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="582" y="634" width="186" height="68" rx="34" fill="url(#gw)"/>
+    <path d="M724 252 Q724 316 788 316 Q724 316 724 380 Q724 316 660 316 Q724 316 724 252 Z" fill="#22D3EE"/>
+  </g>
+  <text x="300" y="186" font-family="'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace" font-weight="700" font-size="132" letter-spacing="2"><tspan fill="url(#gw)">Ai</tspan><tspan fill="#0B1220">-Shell</tspan></text>
+</svg>

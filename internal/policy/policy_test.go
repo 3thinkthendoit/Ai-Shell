@@ -166,6 +166,48 @@ func TestPrimaryBinary(t *testing.T) {
 	}
 }
 
+// 输入分流的判定基准：前端的「首词是不是命令」由 App.ClassifyShellInput
+// 复用这两个函数给出（见 app_shell.go）。这里钉住命令识别本身的语义 ——
+// 尤其是 `nginx 起不来了` 这种「首词恰好是命令名、整句却是中文提问」的输入：
+// 命令识别只看首词，所以它**会**返回 true，而「整句是不是提问」由前端
+// 的语言规则兜底（见 frontend/src/inputRoute.js 的 resolveInput）。
+// 两个判据的分工必须清楚，否则日后有人把「中文提问」的过滤塞进这里就重复了。
+func TestClassifyShellInputSemantics(t *testing.T) {
+	wl := []string{"ls", "df", "docker ps"}
+
+	// 明确的命令：含中文参数也算（中文只是参数，命令意图没变）。
+	for _, c := range []string{
+		"ls -la", "df -h", "echo 你好", "grep 错误 app.log", "cat /etc/hosts",
+		"sudo systemctl status nginx", "docker ps",
+	} {
+		if got := PrimaryBinary(c); got == "" {
+			t.Fatalf("应能抽出主程序名: %q", c)
+		}
+	}
+
+	// 中文自然语言的**首词不是命令** → 抽不出主程序名 → 前端会判成提问。
+	for _, c := range []string{
+		"你是什么模型", "看看磁盘", "帮我看下这个报错", "磁盘满了怎么办",
+	} {
+		bin := PrimaryBinary(c)
+		if IsKnownBinary(bin, wl) {
+			t.Fatalf("中文提问不该被判成命令: %q (bin=%q)", c, bin)
+		}
+	}
+
+	// 路径形输入：不是已知二进制，但人明确在指定可执行文件。
+	// ClassifyShellInput 对含斜杠的一律放行，这里钉住 PrimarBinary 能抽出来。
+	for _, c := range []string{"./deploy.sh --prod", "/opt/app/bin/run"} {
+		bin := PrimaryBinary(c)
+		if bin == "" {
+			t.Fatalf("路径形输入应能抽出主程序: %q", c)
+		}
+		if !strings.Contains(bin, "/") {
+			t.Fatalf("路径形输入抽出的主程序应含斜杠（ClassifyShellInput 据此放行）: %q → %q", c, bin)
+		}
+	}
+}
+
 func TestWriteFilePolicy(t *testing.T) {
 	if v := EvaluateWrite("/etc/shadow"); v.Decision != Deny {
 		t.Fatalf("写入 /etc/shadow 应被拒绝，实际 %s", v.Decision)

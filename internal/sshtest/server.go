@@ -10,6 +10,7 @@ package sshtest
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/pem"
 	"fmt"
@@ -504,6 +505,21 @@ func (f *memFS) remove(p string) {
 	delete(f.files, p)
 }
 
+// snapshot 返回一份文件表的副本。
+//
+// 返回副本而不是直接交出 map：调用方（fakeLsLong）要遍历它，
+// 而遍历期间若另一个 goroutine 在写（上传/删除），直接读会触发
+// 并发 map 读写崩溃 —— 那种崩溃只在并发测试下偶发，极难定位。
+func (f *memFS) snapshot() map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[string]string, len(f.files))
+	for k, v := range f.files {
+		out[k] = v
+	}
+	return out
+}
+
 // backups 返回某路径的所有备份文件名，按名字排序。
 func (f *memFS) backups(p string) []string {
 	f.mu.Lock()
@@ -595,6 +611,199 @@ func runWriteScript(cmd string, ch ssh.Channel, fs *memFS, failBackup bool) int 
 	return 0
 }
 
+// runBinaryWriteScript 模拟 sshclient.WriteFileBinary 的远端脚本。
+//
+// 与 runWriteScript 的**唯一**差别在收尾：这里要先把 stdin 的内容 base64
+// 解码再落盘（脚本最后是 `base64 -d > "$p"`）。备份逻辑完全一致，
+// 所以这里同样先跑一遍备份分支，保证「上传覆写会留备份」这条也被验证到。
+func runBinaryWriteScript(cmd string, ch ssh.Channel, fs *memFS, failBackup bool) int {
+	p, ok := extractWritePath(cmd)
+	if !ok {
+		fmt.Fprint(ch.Stderr(), "test-sshd: 无法从写脚本中解析目标路径\n")
+		return 127
+	}
+
+	old, exists := fs.read(p)
+	if exists {
+		if failBackup {
+			fmt.Fprint(ch.Stderr(), "cp: cannot create regular file '"+p+".bak': No space left on device\n")
+			fmt.Fprintln(ch, backupFailedMarker)
+			return 90
+		}
+		suffix := "20260927-100000"
+		if strings.Contains(cmd, "$$") {
+			suffix = fmt.Sprintf("%s.%d", suffix, backupSeq.Add(1))
+		}
+		bak := p + ".bak." + suffix
+		fs.write(bak, old)
+		fmt.Fprintf(ch, "%s%s\n", backupOKPrefix, bak)
+	} else {
+		fmt.Fprintf(ch, "%s%s\n", backupOKPrefix, backupNewFileNote)
+	}
+
+	// 脚本最后是 `base64 -d > "$p"`：stdin 送来的是 base64 文本。
+	body, _ := io.ReadAll(ch)
+	flat := strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == ' ' || r == '\t' {
+			return -1
+		}
+		return r
+	}, string(body))
+	decoded, err := base64.StdEncoding.DecodeString(flat)
+	if err != nil {
+		// 真 `base64 -d` 遇到坏输入会报错且**不覆盖**目标文件
+		// （它已经把旧内容读走了，但写不出来）。这里复刻「报错且不写」，
+		// 否则测出来的行为比真实环境宽松。
+		fmt.Fprint(ch.Stderr(), "base64: invalid input\n")
+		return 1
+	}
+	fs.write(p, string(decoded))
+	return 0
+}
+
+// extractRmTarget 从 `rm -rf -- '<path>'` 里取出路径。
+//
+// 按 `--` 切分而不是取最后一个 token：路径里的空格被 shellQuote 保护在
+// 单引号内，按空格切会把带空格的文件名切碎 —— 而那正是要测的边界之一。
+func extractRmTarget(cmd string) string {
+	i := strings.Index(cmd, "--")
+	if i < 0 {
+		return ""
+	}
+	rest := strings.TrimSpace(cmd[i+2:])
+	return unquoteShellArg(rest)
+}
+
+// extractRedirectTarget 从 `… > '<path>'` 里取出重定向目标。
+func extractRedirectTarget(cmd string) string {
+	i := strings.LastIndex(cmd, ">")
+	if i < 0 {
+		return ""
+	}
+	rest := strings.TrimSpace(cmd[i+1:])
+	// 跳过 `>` 之后可能紧跟的 `>`（追加重定向，这里用不到但要防误判）。
+	rest = strings.TrimSpace(strings.TrimPrefix(rest, ">"))
+	return unquoteShellArg(rest)
+}
+
+// unquoteShellArg 去掉 shellQuote 加上的单引号包裹（含内层 '\” 的还原）。
+//
+// 与 sshclient.shellQuote 是同一个协议的镜像实现，刻意不跨包共享：
+// 一旦对方改了引号策略，这里的解析会失配、相关用例立刻失败 —— 这正是想要的信号。
+func unquoteShellArg(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && strings.HasPrefix(s, "'") && strings.HasSuffix(s, "'") {
+		inner := s[1 : len(s)-1]
+		return strings.ReplaceAll(inner, `'\''`, "'")
+	}
+	return s
+}
+
+// extractLsDir 从 `ls -lan --color=never --time-style=+%s -- <dir>` 里取出目录。
+//
+// 必须找**最后**一个独立的 ` -- `，不能找第一个 "--"：命令里的
+// `--color=never` 和 `--time-style=...` 都以 `--` 开头，取第一个会把
+// "color=never --time-style=+%s -- '/srv'" 整段当成目录名，
+// 于是列表永远是空的 —— 而 ls 明明是成功的，很能误导人。
+func extractLsDir(cmd string) string {
+	i := strings.LastIndex(cmd, " -- ")
+	if i < 0 {
+		return "."
+	}
+	dir := unquoteShellArg(strings.TrimSpace(cmd[i+4:]))
+	if dir == "" {
+		return "."
+	}
+	return dir
+}
+
+// extractDownloadPath 从下载命令里取出文件路径。
+//
+// 命令形状：`sz=$(wc -c < '/p') || exit 1; printf 'SIZE:%s\n' "$sz"; head -c N -- '/p' | base64 -w0`
+//
+// 取**最后一个** `-- ` 之后的单引号串：路径本身可能含 `--`，按第一个找会切错。
+// 用 wc 那个 `< '/p'` 里的路径也行，但 head 那段才是真正读内容的一条，
+// 以它为准更能反映「客户端读的是哪个文件」。
+func extractDownloadPath(cmd string) string {
+	i := strings.LastIndex(cmd, " -- ")
+	if i < 0 {
+		return ""
+	}
+	rest := cmd[i+4:]
+	if j := strings.Index(rest, "|"); j >= 0 {
+		rest = rest[:j]
+	}
+	return strings.Trim(strings.TrimSpace(rest), "'\"")
+}
+
+// extractHeadLimit 从 `head -c N -- ...` 里取出 N（0 表示没有限制）。
+func extractHeadLimit(cmd string) int {
+	i := strings.Index(cmd, "head -c ")
+	if i < 0 {
+		return 0
+	}
+	rest := strings.TrimSpace(cmd[i+len("head -c "):])
+	if j := strings.IndexAny(rest, " \t"); j >= 0 {
+		rest = rest[:j]
+	}
+	var n int
+	_, _ = fmt.Sscanf(rest, "%d", &n)
+	return n
+}
+
+// fakeLsLong 生成 `ls -lan --time-style=+%s -- <dir>` 的输出。
+//
+// 输出的**形状**必须与真实 ls 一致：6 个元信息字段（权限/链接数/uid/gid/
+// 大小/时间戳）之后是文件名，且文件名可能含空格。解析器就是按这个形状写的，
+// 假远端若图省事只打印名字，那条解析路径就完全没有被测到。
+//
+// 内容取自 memFS 的键：这样「上传后刷新列表能看到新文件」「删除后它消失」
+// 这两条端到端链路才成立，而不是永远返回一份写死的清单。
+func fakeLsLong(cmd string, fs *memFS) string {
+	dir := extractLsDir(cmd)
+	var sb strings.Builder
+	sb.WriteString("total 8\n")
+	// 假设「一直在那里」的两项，让目录列表不至于空着（与老用例的输出一致）。
+	sb.WriteString("drwxr-xr-x 2 0 0 4096 1758880800 subdir\n")
+	sb.WriteString("-rw-r--r-- 1 0 0  120 1758880800 app.conf\n")
+	if fs == nil {
+		return sb.String()
+	}
+	// 把 memFS 里属于这个目录的普通文件也列出来（按名字排序，稳定）。
+	prefix := dir
+	if prefix == "." {
+		prefix = ""
+	} else if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	var names []string
+	for p := range fs.snapshot() {
+		if prefix == "" {
+			// 无目录上下文时只列顶层（不含 / 的名字），避免把全库倒出来。
+			if !strings.Contains(p, "/") {
+				names = append(names, p)
+			}
+			continue
+		}
+		if strings.HasPrefix(p, prefix) {
+			rest := strings.TrimPrefix(p, prefix)
+			if rest != "" && !strings.Contains(rest, "/") {
+				names = append(names, p)
+			}
+		}
+	}
+	sort.Strings(names)
+	for _, p := range names {
+		content, _ := fs.read(p)
+		base := p
+		if i := strings.LastIndex(p, "/"); i >= 0 {
+			base = p[i+1:]
+		}
+		fmt.Fprintf(&sb, "-rw-r--r-- 1 0 0 %d 1758880800 %s\n", len(content), base)
+	}
+	return sb.String()
+}
+
 // writeBulk 往指定流写**恰好** n 字节（分块写，模拟真实程序的连续输出）。
 //
 // 精确到字节是刻意的：测试要验证「正好等于上限」与「超出上限一字节」这两种
@@ -662,13 +871,33 @@ func RunCommand(cmd string, ch ssh.Channel, srv *Server) int {
 		fmt.Fprintln(ch, "/home/test")
 
 	case strings.HasPrefix(c, "mkdir ") || c == "mkdir" ||
-		strings.HasPrefix(c, "touch ") || c == "touch" ||
-		strings.HasPrefix(c, "rm ") || c == "rm":
+		strings.HasPrefix(c, "touch ") || c == "touch":
 		// 高危变更类：假远端一律成功，真测的是策略闸门而不是文件系统。
 		return 0
 
+	// rm 必须**真的删**：文件管理弹窗的删除要能端到端验证
+	// 「点了删除之后那个文件确实不见了」，只报成功而没删会把
+	// 「删错了目标/删了空路径」这类实现错误盖过去。
+	// 带 -rf 时不校验路径存在性（与真 rm -f 一致），也不递归删子项 ——
+	// 测试里删的都是扁平的顶层文件，多写一套递归只是自找麻烦。
+	case strings.HasPrefix(c, "rm ") || c == "rm":
+		target := extractRmTarget(c)
+		if target == "" {
+			fmt.Fprint(ch.Stderr(), "rm: missing operand\n")
+			return 1
+		}
+		fs.remove(target)
+		return 0
+
 	case strings.Contains(c, writeMarkerProbe):
-		// sshclient.WriteFile 下发的脚本
+		// sshclient.WriteFile / WriteFileBinary 下发的脚本。
+		// 两者只差最后一环：文本写入是 `cat > "$p"`，二进制是 `base64 -d > "$p"`。
+		// 假远端是命令解释器而不是真 shell，没法逐句执行这个多语句脚本，
+		// 只能按同一个 marker 认出来，再按收尾命令分流 —— 这也正是
+		// writeMarkerProbe 存在的意义（见它的常量注释）。
+		if strings.Contains(c, "base64 -d >") {
+			return runBinaryWriteScript(c, ch, fs, failBackup)
+		}
 		return runWriteScript(c, ch, fs, failBackup)
 
 	case strings.Contains(c, "uname -a") || strings.Contains(c, "== os =="):
@@ -690,6 +919,38 @@ func RunCommand(cmd string, ch ssh.Channel, srv *Server) int {
 			return 1
 		}
 		fmt.Fprint(ch, content)
+
+	// 二进制下载：`sz=$(wc -c < <path>) || exit 1; printf 'SIZE:%s\n' "$sz";
+	//            head -c <n> -- <path> | base64 -w0`
+	//
+	// 必须排在 `head -c` 分支**之前**：那条分支按 `--` 切分并假设右边
+	// 就是路径，遇到管道尾巴会把整个 `| base64 -w0` 当成文件名的一部分，
+	// 于是报告「文件不存在」——一个纯粹的匹配顺序问题，却表现得像文件没了。
+	//
+	// 这里必须**真的按 limit 截断**，否则「文件超过上限」这条最危险的路径
+	// 在测试里完全走不到：客户端会拿到一份完整的 base64、以为一切正常，
+	// 而那道「超限拒绝下载」的防线根本没被触发过。
+	case strings.Contains(c, "| base64 -w0"):
+		p := extractDownloadPath(c)
+		if p == "" {
+			fmt.Fprint(ch.Stderr(), "head: invalid arguments\n")
+			return 1
+		}
+		content, ok := fs.read(p)
+		if !ok {
+			// `wc -c < missing` 在真 shell 里先失败，所以 stderr 说的是 wc；
+			// 但客户端只关心非零退出码与一句能读的错，两者都满足。
+			fmt.Fprintf(ch.Stderr(), "wc: %s: No such file or directory\n", p)
+			return 1
+		}
+		// SIZE 行先出，客户端据此判断「是否被截断」。
+		fmt.Fprintf(ch, "SIZE:%d\n", len(content))
+		limit := extractHeadLimit(c)
+		if limit > 0 && len(content) > limit {
+			content = content[:limit]
+		}
+		fmt.Fprint(ch, base64.StdEncoding.EncodeToString([]byte(content)))
+		return 0
 
 	// sshclient.ReadFile 实际用的是 head -c <n> -- <path>
 	case strings.HasPrefix(c, "head -c "):
@@ -773,7 +1034,18 @@ func RunCommand(cmd string, ch ssh.Channel, srv *Server) int {
 		_, _ = fmt.Sscanf(c, "sleep %d", &n)
 		time.Sleep(time.Duration(n) * time.Second)
 
-	case strings.HasPrefix(c, "ls"):
+	case strings.HasPrefix(stripEnvPrefix(c), "ls"):
+		// 文件管理用的是 `LC_ALL=C ls -lan --color=never --time-style=+%s -- <path>`，
+		// 必须按那个格式回答（时间戳是裸 Unix 秒、uid/gid 是数字），
+		// 否则解析器的「第 6 列是时间戳」假设在测试里得不到验证。
+		// 开头的 LC_ALL=C 必须先剥掉：它是环境变量前缀，不是命令名的一部分，
+		// 直接按 "ls" 前缀匹配会一路落到 unknown command 分支上去。
+		// 旧式的 `ls`（不带这些选项）保留原输出：ReadFile/ListDir 的老用例
+		// 依赖它，且那条路径本来就只做文本展示、不解析。
+		if strings.Contains(c, "--time-style=+%s") {
+			fmt.Fprint(ch, fakeLsLong(c, fs))
+			return 0
+		}
 		fmt.Fprint(ch, "total 8\ndrwxr-xr-x 2 root root 4096 Sep 27 10:00 .\n-rw-r--r-- 1 root root  120 Sep 27 10:00 app.conf\n")
 
 	default:
@@ -781,6 +1053,39 @@ func RunCommand(cmd string, ch ssh.Channel, srv *Server) int {
 		return 127
 	}
 	return 0
+}
+
+// stripEnvPrefix 去掉命令开头的 `VAR=value ` 环境变量前缀。
+//
+// 真 shell 里 `LC_ALL=C ls` 执行的是 ls；假远端如果不剥这一层，
+// 按 "ls" 前缀匹配就会落到 unknown command 分支 —— 表现为
+// 「列目录在测试里全挂，但真机上好好的」，很容易被误判成解析器写错了。
+// 只认形如 `NAME=...` 且名字全是字母数字下划线的开头，避免把
+// `echo a=b` 这类正常内容误伤。
+func stripEnvPrefix(c string) string {
+	for {
+		eq := strings.Index(c, "=")
+		if eq <= 0 {
+			return c
+		}
+		name := c[:eq]
+		for i := 0; i < len(name); i++ {
+			ch := name[i]
+			ok := ch == '_' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')
+			if !ok {
+				return c
+			}
+		}
+		rest := strings.TrimLeft(c[eq+1:], " ")
+		// 值本身也可能带引号（LC_ALL="C"），一并剥掉。
+		rest = strings.TrimPrefix(rest, "\"")
+		rest = strings.TrimPrefix(rest, "'")
+		sp := strings.IndexByte(rest, ' ')
+		if sp < 0 {
+			return c
+		}
+		c = strings.TrimLeft(rest[sp+1:], " ")
+	}
 }
 
 func stripCdPrefix(c string) string {

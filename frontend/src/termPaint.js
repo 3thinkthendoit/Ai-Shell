@@ -188,3 +188,49 @@ export function paintInputPrompt(write) {
   if (!write) return
   write(BLUE + BOLD + '❯ ' + RESET)
 }
+
+// 欢迎引导：每次打开终端、以及从「对话归档」切回表面时提示一次。
+//
+// 顶部 banner 是常驻的，但常驻的东西会被眼睛过滤掉——用户第一次面对一个
+// 光秃秃的 shell 提示符时，并不知道这里除了敲命令还能说人话。
+//
+// 位置：**就地写在光标所在的输入行上**（紧跟真提示符之后），而不是另起一行。
+// 另起一行会把这行说明混进命令输出流里 —— 它看起来像一条命令的输出了什么，
+// 翻回滚时也一直在。写在光标处则像「占位符」，语义清楚：这里是要你输入的地方。
+//
+// 它只是**占位符**，不是真输入：光标停在提示符与提示文字之间，用户敲下第一个
+// 字符时由调用方（ConsolePanel 的 clearWelcomeHint）整行擦掉重画，提示消失、
+// 正常回显。所以这里把光标**留在提示文字之前** —— 否则用户会直觉地在提示后面
+// 打字，而本地行编辑会把字符插进提示文字中间。
+//
+// 返回占位符的显示宽度，调用方要拿它把光标移回原位（擦除后重画提示符）。
+//
+// startCol 是提示符末尾所在的列（0 基，光标就停在那里）—— 提示必须从这一列
+// 开始写，写完再把光标移**回这一列**。不能用「提示宽度的倒推」去定位：ESC[nG
+// 是绝对列定位，n 应当由 startCol 决定，按宽度算只在提示符恰好从列 1 起时才对，
+// 而真实提示符（如 root@host:~$ ）有十几个字符宽，算出来会偏到左边盖住提示符。
+export function paintWelcomeHint(write, startCol = 0) {
+  if (!write) return 0
+  const text = '可以直接用自然语言提需求（中文或 ? 开头交给 LLM）'
+  // 写完提示光标停在末尾，用绝对列定位移回起点（ANSI 列号从 1 起，故 +1）。
+  write(DIM + text + RESET + '\x1b[' + (startCol + 1) + 'G')
+  return displayCols(text)
+}
+
+// displayCols 按终端显示宽度数一列列地算：CJK/全角占 2 列，其余 1 列。
+// 与 ConsolePanel 的 displayWidth 同源，但这里只关心总列数。
+function displayCols(s) {
+  let w = 0
+  for (const ch of String(s)) {
+    const c = ch.codePointAt(0)
+    const wide = (c >= 0x1100 && c <= 0x115f) ||
+      (c >= 0x2e80 && c <= 0xa4cf) ||
+      (c >= 0xac00 && c <= 0xd7a3) ||
+      (c >= 0xf900 && c <= 0xfaff) ||
+      (c >= 0xfe30 && c <= 0xfe6f) ||
+      (c >= 0xff00 && c <= 0xff60) ||
+      (c >= 0xffe0 && c <= 0xffe6)
+    w += wide ? 2 : 1
+  }
+  return w
+}

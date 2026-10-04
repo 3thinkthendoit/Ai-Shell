@@ -593,6 +593,67 @@ func TestAgentManualModeRequiresApproval(t *testing.T) {
 	}
 }
 
+// 审批事件必须带上失效时刻：界面靠它显示倒计时。
+// 没有这个字段，用户不知道「不回答」的代价是 5 分钟后自动放弃 ——
+// 界面看起来可以无限期挂着，实际上后端早已作废。
+func TestAgentApprovalCarriesDeadline(t *testing.T) {
+	h := newHarness(t, []string{
+		respToolCall("c1", "run_command", `{"host_id":"h-test","command":"uptime"}`),
+		respContent("已检查"),
+	}, policy.ModeManual, true)
+
+	if err := runDefault(h.ag, context.Background(), h.hostID, "看负载"); err != nil {
+		t.Fatal(err)
+	}
+	if h.approval == nil {
+		t.Fatal("手动模式应产生审批事件")
+	}
+	// 必须是「未来」的时刻，且大致落在超时窗口内（留足余量，避免机器慢导致抖动）。
+	now := time.Now().UnixMilli()
+	if h.approval.DeadlineMs <= now {
+		t.Fatalf("失效时刻应在未来，实得 %d（现在 %d）", h.approval.DeadlineMs, now)
+	}
+	if got := h.approval.DeadlineMs - now; got > int64(approvalTimeout/time.Millisecond) {
+		t.Fatalf("失效时刻超出超时窗口：%d ms > %d ms", got, approvalTimeout/time.Millisecond)
+	}
+}
+
+// 审批超时后必须发 EvApprovalExpired —— 否则界面上那张条会一直挂着，
+// 用户看到的是「还在等我批准」，直到点下去才被告知「已失效」。
+func TestAgentApprovalExpiredEmitsEvent(t *testing.T) {
+	// 把超时压到毫秒级：真实路径要等 5 分钟，不缩短就等于不测这条分支。
+	old := approvalTimeout
+	approvalTimeout = 30 * time.Millisecond
+	t.Cleanup(func() { approvalTimeout = old })
+
+	// autoApprove=false：让审批一直挂到超时，而不是被自动批准。
+	h := newHarness(t, []string{
+		respToolCall("c1", "run_command", `{"host_id":"h-test","command":"uptime"}`),
+		respContent("已检查"),
+	}, policy.ModeManual, false)
+
+	// 超时需要一个真在跑的 agent：这里直接走 requestApproval 的等价路径 ——
+	// 发一条会进入审批的工具调用，等它自己超时。
+	done := make(chan error, 1)
+	go func() { done <- runDefault(h.ag, context.Background(), h.hostID, "看负载") }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("超时不应让整轮失败（应带着拒绝结果继续）: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("审批超时后整轮仍未结束（疑似卡住）")
+	}
+
+	if !h.hasEvent(EvApproval) {
+		t.Fatal("应先产生审批事件")
+	}
+	if !h.hasEvent(EvApprovalExpired) {
+		t.Fatal("超时后应发出审批失效事件，否则界面上的审批条永远挂着")
+	}
+}
+
 // 用户拒绝后，命令不得执行，agent 应继续把结论说完。
 func TestAgentUserDenial(t *testing.T) {
 	h := newHarness(t, []string{
