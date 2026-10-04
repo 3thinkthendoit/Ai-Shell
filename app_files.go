@@ -14,10 +14,17 @@ package main
 //   - 所有操作写审计，事后可查。
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
+	"os"
 	"path"
+	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/wailsapp/wails/v2/pkg/runtime"
 
 	"ai-shell/internal/audit"
 	"ai-shell/internal/sshclient"
@@ -37,6 +44,26 @@ type FileOpResult struct {
 	OK      bool   `json:"ok"`
 	Message string `json:"message"`
 	Error   string `json:"error"`
+	// Cancelled 表示用户在保存对话框里按了取消。这不是错误：界面必须
+	// 区分「失败」（要弹红字）与「用户反悔了」（什么都不该显示）。
+	Cancelled bool `json:"cancelled"`
+}
+
+// EvFileTransfer 是文件传输进度事件名。前端 bindEvents 按这个名字注册
+// 监听（前端 src/store.js 的 EV_NAMES），改名要两边同步。
+// 命名必须以 Ev 开头：contract_test.go 靠这个前缀从 AST 里收集事件常量，
+// 做前后端事件名的交叉校验 —— 换名字会让那道防线静默失效。
+const EvFileTransfer = "fm:transfer"
+
+// FileTransferProgress 是一次下载的进度快照，随分块读逐块上报。
+type FileTransferProgress struct {
+	ID    string  `json:"id"`    // 传输 id，前端用它调 CancelFileTransfer
+	Kind  string  `json:"kind"`  // 目前只有 "download"，留出上传分块的空间
+	Name  string  `json:"name"`  // 远端文件名（进度条上显示）
+	Dest  string  `json:"dest"`  // 本地保存路径
+	Done  int64   `json:"done"`  // 已传输的原始字节
+	Total int64   `json:"total"` // 远端文件总字节
+	BPS   float64 `json:"bps"`   // 累计平均速度（字节/秒）
 }
 
 // ListRemoteDir 列出远端目录。
@@ -156,15 +183,19 @@ func (a *App) UploadRemoteFile(hostID, dir, name, base64Data string) FileOpResul
 	return FileOpResult{OK: true, Message: strings.TrimSpace(res.Stdout + " 已上传 " + name)}
 }
 
-// DownloadRemoteFile 读取远端文件，返回 base64 内容交给前端保存。
+// DownloadRemoteFile 把远端文件下载到用户挑选的本地路径。
 //
-// 不在这里弹「保存到哪」的对话框：那需要 Wails 的 SaveFileDialog，
-// 而它要求调用线程有 Wails 上下文。由前端拿数据后用 <a download> 触发
-// 浏览器下载更简单，也不必让后端知道用户想存哪。
+// 与旧实现的差别：内容不再作为 base64 塞回前端、靠浏览器下载 —— 那条路
+// 在应用窗口里依赖 WebView 的下载行为（macOS 的 WKWebView 对
+// <a download> 支持很差，表现为点了没反应），且无法显示进度。
+// 现在改走 Wails 原生保存对话框 + 后端分块落盘 + 进度事件（fm:transfer），
+// 大于一个块的文件会持续回报进度与速度，中途可取消。
 //
-// **超过上限时明确拒绝，而不是返回截断的内容。** 这是这个函数里最重要的
-// 一条：用户下载一个大日志，如果只拿到前半截却没有任何提示，他很可能
-// 拿这份残缺文件去做覆盖/迁移/取证 —— 静默截断比直接报错危险得多。
+// 流程与顺序是有讲究的：
+//  1. 先探大小（StatFileSize）——文件不存在、超过上限都在**弹对话框之前**
+//     失败。对话框弹了又被一条错误收场，比直接报错更让人困惑。
+//  2. 再弹保存对话框 —— 用户取消就安静返回（Cancelled），什么都不显示。
+//  3. 最后分块传输（downloadTo），每块回报进度。
 func (a *App) DownloadRemoteFile(hostID, path string) FileOpResult {
 	if err := a.ready(); err != nil {
 		return FileOpResult{Error: err.Error()}
@@ -177,26 +208,168 @@ func (a *App) DownloadRemoteFile(hostID, path string) FileOpResult {
 		return FileOpResult{Error: "请选择一个文件"}
 	}
 
-	data, mayTruncate, total, _, err := a.ssh.ReadFileBinary(hostID, target, sshclient.MaxTransferBytes)
+	total, err := a.ssh.StatFileSize(hostID, target)
 	if err != nil {
 		a.auditFile("下载失败："+err.Error(), hostID, target)
 		return FileOpResult{Error: err.Error()}
 	}
-	if mayTruncate {
-		size := ""
-		if total > 0 {
-			size = fmt.Sprintf("（%s）", humanBytes(total))
-		}
+	if total > sshclient.MaxTransferBytes {
 		a.auditFile(fmt.Sprintf("下载被拒：文件 %d 字节超过上限", total), hostID, target)
 		return FileOpResult{Error: fmt.Sprintf(
-			"文件%s 超过 %s 上限，未下载。请改用终端里的 scp/sftp 取这个大文件。",
-			size, humanBytes(sshclient.MaxTransferBytes))}
+			"文件（%s）超过 %s 上限，未下载。请改用终端里的 scp/sftp 取这个大文件。",
+			humanBytes(total), humanBytes(sshclient.MaxTransferBytes))}
 	}
-	a.auditFile(fmt.Sprintf("下载 %d 字节", len(data)), hostID, target)
-	return FileOpResult{
-		OK:      true,
-		Message: base64.StdEncoding.EncodeToString(data),
+
+	dest, err := a.pickSaveDest(target)
+	if err != nil {
+		return FileOpResult{Error: err.Error()}
 	}
+	if dest == "" {
+		// 用户在系统对话框里按了取消：不是错误，界面什么都不该显示。
+		return FileOpResult{Cancelled: true}
+	}
+
+	return a.downloadTo(hostID, target, dest, func(p FileTransferProgress) {
+		a.emit(EvFileTransfer, p)
+	})
+}
+
+// pickSaveDest 弹出原生保存对话框，返回用户选的本地路径（取消返回空串）。
+func (a *App) pickSaveDest(target string) (string, error) {
+	if a.ctx == nil {
+		// 测试直接构造 App 不带 ctx；生产里 startup 之后 ctx 一定就绪。
+		return "", fmt.Errorf("窗口尚未就绪")
+	}
+	dest, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+		Title:           "保存到本机",
+		DefaultFilename: path.Base(target),
+	})
+	if err != nil {
+		return "", fmt.Errorf("无法打开保存对话框：%w", err)
+	}
+	return strings.TrimSpace(dest), nil
+}
+
+// downloadTo 分块读取远端文件并写到本地 dest，逐块回报进度。
+//
+// 单独抽出来（而不是并进 DownloadRemoteFile）是为了可测：进度回调与
+// 目标路径都由调用方给，测试不需要真的弹对话框、也不需要 Wails 上下文。
+//
+// 两条铁律：
+//   - **任何失败都必须删掉半成品本地文件**。一个「自称完整」的残缺文件
+//     比失败危险得多 —— 用户会拿它去覆盖、去部署、去取证。取消同理。
+//   - **写完的字节数必须等于探得的总大小**。分块之间的远端文件是可能
+//     变化的（被截断、被删除），少了就报错，绝不交出缺尾巴的文件。
+func (a *App) downloadTo(hostID, target, dest string, onProgress func(FileTransferProgress)) FileOpResult {
+	total, err := a.ssh.StatFileSize(hostID, target)
+	if err != nil {
+		a.auditFile("下载失败："+err.Error(), hostID, target)
+		return FileOpResult{Error: err.Error()}
+	}
+	if total > sshclient.MaxTransferBytes {
+		a.auditFile(fmt.Sprintf("下载被拒：文件 %d 字节超过上限", total), hostID, target)
+		return FileOpResult{Error: fmt.Sprintf(
+			"文件（%s）超过 %s 上限，未下载。请改用终端里的 scp/sftp 取这个大文件。",
+			humanBytes(total), humanBytes(sshclient.MaxTransferBytes))}
+	}
+
+	// 每次传输一个独立 context：CancelFileTransfer 找到它并触发取消。
+	parent := a.ctx
+	if parent == nil {
+		parent = context.Background() // 测试环境没有 Wails ctx
+	}
+	ctx, cancel := context.WithCancel(parent)
+	id := strconv.FormatInt(atomic.AddInt64(&a.tSeq, 1), 10)
+	a.registerTransfer(id, cancel)
+	defer a.unregisterTransfer(id)
+	defer cancel()
+
+	name := path.Base(target)
+	report := func(done int64, bps float64) {
+		if onProgress == nil {
+			return
+		}
+		onProgress(FileTransferProgress{
+			ID: id, Kind: "download", Name: name, Dest: dest,
+			Done: done, Total: total, BPS: bps,
+		})
+	}
+
+	f, err := os.Create(dest)
+	if err != nil {
+		a.auditFile("下载失败："+err.Error(), hostID, target)
+		return FileOpResult{Error: "无法创建本地文件：" + err.Error()}
+	}
+	fail := func(msg string) FileOpResult {
+		f.Close()
+		os.Remove(dest)
+		a.auditFile("下载失败："+msg, hostID, target)
+		return FileOpResult{Error: msg}
+	}
+
+	start := time.Now()
+	var written int64
+	for written < total {
+		if err := ctx.Err(); err != nil {
+			return fail("已取消，未保存文件")
+		}
+		chunk := sshclient.ChunkSize
+		if remain := total - written; remain < chunk {
+			chunk = remain
+		}
+		data, cerr := a.ssh.ReadFileChunk(hostID, target, written, chunk)
+		if cerr != nil {
+			return fail(cerr.Error())
+		}
+		if len(data) == 0 {
+			return fail(fmt.Sprintf("远端文件在传输中变短（已传 %d / %d 字节）", written, total))
+		}
+		if _, werr := f.Write(data); werr != nil {
+			return fail("写入本地文件失败：" + werr.Error())
+		}
+		written += int64(len(data))
+		// 速度用**累计平均**而不是瞬时值：分块粒度大，瞬时速度抖得厉害，
+		// 进度条旁边跳来跳去的数字只会让人以为网络不稳。
+		report(written, float64(written)/time.Since(start).Seconds())
+	}
+
+	if err := f.Close(); err != nil {
+		os.Remove(dest)
+		a.auditFile("下载失败："+err.Error(), hostID, target)
+		return FileOpResult{Error: "写入本地文件失败：" + err.Error()}
+	}
+	a.auditFile(fmt.Sprintf("下载 %d 字节到本地 %s", written, dest), hostID, target)
+	return FileOpResult{OK: true, Message: dest}
+}
+
+// registerTransfer / unregisterTransfer 维护活跃传输的取消注册表。
+// map 懒初始化：测试直接构造 &App{}，不走 newApp()。
+func (a *App) registerTransfer(id string, cancel context.CancelFunc) {
+	a.tMu.Lock()
+	defer a.tMu.Unlock()
+	if a.tCancels == nil {
+		a.tCancels = make(map[string]context.CancelFunc)
+	}
+	a.tCancels[id] = cancel
+}
+
+func (a *App) unregisterTransfer(id string) {
+	a.tMu.Lock()
+	defer a.tMu.Unlock()
+	delete(a.tCancels, id)
+}
+
+// CancelFileTransfer 取消一次进行中的下载（按进度事件里给的 id）。
+// 返回是否存在这样的传输 —— 前端不需要处理返回值，它只为测试与调试存在。
+func (a *App) CancelFileTransfer(id string) bool {
+	a.tMu.Lock()
+	cancel, ok := a.tCancels[id]
+	a.tMu.Unlock()
+	if !ok {
+		return false
+	}
+	cancel()
+	return true
 }
 
 // humanBytes 把字节数变成人能读的大小，用在错误信息里。

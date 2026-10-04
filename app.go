@@ -35,6 +35,14 @@ type App struct {
 	shell   shellGate   // 人工 shell 命令的审批闸门（与 Agent 工具审批分开）
 	lane    sessionLane // Ask 与 RunShell 互斥道
 
+	// 活跃传输（文件下载）的取消注册表。下载是分块循环（见 app_files.go
+	// 的 downloadTo），取消 = 让循环在下一块之前退出 —— 所以每个传输一个
+	// context，前端拿事件里的 id 调 CancelFileTransfer 即可。
+	// tCancels 懒初始化：测试直接构造 &App{}，不走 newApp()。
+	tMu      sync.Mutex
+	tSeq     int64 // 传输 id 发生器（原子递增）
+	tCancels map[string]context.CancelFunc
+
 	// termVT 是常驻终端的 VT 管线注册表（termKey = host+session → 状态）：每条任务
 	// 各一条独立 shell，屏幕模型负责认全屏重绘（OSC 133 命令边界 + CUP/ED 特征 +
 	// 备用屏幕开关），在命令结束/备用屏幕释放/PTY 退出时把最后一帧定格送进快照管线。

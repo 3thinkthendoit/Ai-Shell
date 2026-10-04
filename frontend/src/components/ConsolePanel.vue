@@ -911,7 +911,6 @@ function onWinKeydown(e) {
     return
   }
   // 文件管理弹窗最外层优先：它盖住整个界面，Esc 应该先关它。
-  // 删除确认是它内部的一层，由组件自己处理（见 FileManagerModal）。
   if (e.key === 'Escape' && store.fileManager.open) {
     closeFileManager()
     return

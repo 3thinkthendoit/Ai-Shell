@@ -83,9 +83,65 @@ type Server struct {
 	// 用于验证「备份失败就中止、绝不继续覆写」。
 	failBackup atomic.Bool
 
+	// dlHeadNoise / dlTailNoise 是**二进制下载时注入到 stdout 的杂音**。
+	//
+	// 存在的理由：真实远端并不是一台只回答我们要的东西的机器。
+	// 登录 shell 的 /etc/profile 会打欢迎语、busybox 的 base64 会把用法
+	// 提示打到 stdout、缺子命令会报 `bc: command not found`……
+	// 这些都会混进下载输出里。
+	//
+	// 这正是「远端返回的内容不是合法 base64：illegal base64 data at input
+	// byte 4」那条 bug 的成因：内容本身是对的，只是前后多了别的东西。
+	// 没有这个开关，那个 bug 在测试里永远复现不出来（假远端太干净了）。
+	dlHeadNoise atomic.Value // []string
+	dlTailNoise atomic.Value // []string
+
+	// corruptDownloadBody 为真时，跳过 base64 编码、把文件内容原样写进
+	// 哨兵之间 —— 模拟"远端根本没编码"或"内容本身就是二进制垃圾"。
+	// 用于验证错误信息是否带上可读的预览。
+	corruptDownloadBody atomic.Bool
+
+	// downloadMissingEnd 为真时，下载分支不打印 END 哨兵 —— 模拟真实
+	// 机器上出现过的怪癖：base64 载荷完整，END 却始终没出现（连接抖动、
+	// shell 提前收工）。客户端应当靠「长度严格等于请求值」抢救成功，
+	// 而不是为一个丢失的标记把完好的数据扔掉。
+	downloadMissingEnd atomic.Bool
+
+	// downloadShortBody 为真时，只发送前一半 base64（裁到 4 字符的倍数，
+	// 仍是合法可解码的 base64）—— 模拟载荷在半路被截断。配合上面的
+	// missingEnd 验证：抢救路径必须拒绝长度不符的数据，绝不悄悄收下
+	// 残缺的块。
+	downloadShortBody atomic.Bool
+
 	ptyMu   sync.Mutex
 	lastPTY *PTYRequest
 	resizes []Size
+}
+
+// SetCorruptDownloadBody 开关「下载正文不编码」的模拟。
+func (s *Server) SetCorruptDownloadBody(v bool) { s.corruptDownloadBody.Store(v) }
+
+// SetDownloadMissingEnd 开关「END 哨兵丢失」的模拟。
+func (s *Server) SetDownloadMissingEnd(v bool) { s.downloadMissingEnd.Store(v) }
+
+// SetDownloadShortBody 开关「载荷被截断一半」的模拟。
+func (s *Server) SetDownloadShortBody(v bool) { s.downloadShortBody.Store(v) }
+
+// SetDownloadNoise 设置下载输出里注入的杂音（head = 正文之前，tail = 正文之后）。
+// 传 nil 清空。测试用它来复现「远端 stdout 不干净」的各种真实情况。
+func (s *Server) SetDownloadNoise(head, tail []string) {
+	s.dlHeadNoise.Store(head)
+	s.dlTailNoise.Store(tail)
+}
+
+func (s *Server) downloadNoise() []string     { return noiseOf(s.dlHeadNoise) }
+func (s *Server) downloadTailNoise() []string { return noiseOf(s.dlTailNoise) }
+
+func noiseOf(v atomic.Value) []string {
+	if lines, ok := v.Load().([]string); ok {
+		return lines
+	}
+	return nil
 }
 
 // PTYRequest 记录一次 pty-req 的内容。
@@ -545,6 +601,33 @@ const (
 	writeMarkerProbe   = "__AISHELL_BACKUP__"
 )
 
+// 二进制下载正文与大小探测的哨兵，必须与 sshclient（readChunkCmd /
+// statSizeCmd）里的一致。刻意重复定义：对方改了协议，相关测试会立刻
+// 失败 —— 这是想要的信号。（曾用 ###...###：# 在 shell 里开启注释，
+// 真实远端把整条管道吞掉了，而这里的假远端不执行命令、只会照着常量发
+// 输出，根本发现不了。客户端已换成 @@...@@ 并加引号，命令文本另有
+// 语法单测守着。）
+const (
+	downloadBodyMark = "@@B64-BEGIN@@"
+	downloadBodyEnd  = "@@B64-END@@"
+	sizeBodyMark     = "@@SZ-BEGIN@@"
+	sizeBodyEnd      = "@@SZ-END@@"
+)
+
+// wrapBase64 模拟 busybox base64 的默认行为：每 76 字符插一个换行
+// （它不认 -w0，所以客户端必须自己剥空白）。
+func wrapBase64(s string) string {
+	const width = 76
+	var sb strings.Builder
+	for len(s) > width {
+		sb.WriteString(s[:width])
+		sb.WriteByte('\n')
+		s = s[width:]
+	}
+	sb.WriteString(s)
+	return sb.String()
+}
+
 // backupSeq 代替真实脚本里的 `-$$`（shell PID），保证同一「秒」内多次写入
 // 也能拿到不同的备份名 —— 真实脚本靠 $$，测试里靠自增。
 var backupSeq atomic.Int64
@@ -719,7 +802,9 @@ func extractLsDir(cmd string) string {
 
 // extractDownloadPath 从下载命令里取出文件路径。
 //
-// 命令形状：`sz=$(wc -c < '/p') || exit 1; printf 'SIZE:%s\n' "$sz"; head -c N -- '/p' | base64 -w0`
+// 命令形状：`sz=$(wc -c < '/p') || exit 1; printf 'SIZE:%s\n' "$sz";
+// printf '@@B64-BEGIN@@'; head -c N -- '/p' | base64 || exit $?;
+// printf '@@B64-END@@\n'`
 //
 // 取**最后一个** `-- ` 之后的单引号串：路径本身可能含 `--`，按第一个找会切错。
 // 用 wc 那个 `< '/p'` 里的路径也行，但 head 那段才是真正读内容的一条，
@@ -736,19 +821,39 @@ func extractDownloadPath(cmd string) string {
 	return strings.Trim(strings.TrimSpace(rest), "'\"")
 }
 
-// extractHeadLimit 从 `head -c N -- ...` 里取出 N（0 表示没有限制）。
-func extractHeadLimit(cmd string) int {
-	i := strings.Index(cmd, "head -c ")
+// extractWcPath 从大小探针命令里取出路径：
+// `printf '@@SZ-BEGIN@@'; wc -c < '/p'; printf '@@SZ-END@@\n'`
+func extractWcPath(cmd string) string {
+	i := strings.Index(cmd, "wc -c < ")
 	if i < 0 {
-		return 0
+		return ""
 	}
-	rest := strings.TrimSpace(cmd[i+len("head -c "):])
-	if j := strings.IndexAny(rest, " \t"); j >= 0 {
+	rest := strings.TrimSpace(cmd[i+len("wc -c < "):])
+	if j := strings.Index(rest, ";"); j >= 0 {
 		rest = rest[:j]
 	}
-	var n int
-	_, _ = fmt.Sscanf(rest, "%d", &n)
-	return n
+	return strings.Trim(strings.TrimSpace(rest), "'\"")
+}
+
+// extractChunkRange 从分块读命令里取出区间：
+// `tail -c +<off1> -- 'p' | head -c <size> | base64`。
+// off1 是 tail 的 **1 起**偏移，与命令字面一致；调用方换算成 0 起。
+func extractChunkRange(cmd string) (off1, size int64, ok bool) {
+	i := strings.Index(cmd, "tail -c +")
+	if i < 0 {
+		return 0, 0, false
+	}
+	if _, err := fmt.Sscanf(cmd[i+len("tail -c +"):], "%d", &off1); err != nil {
+		return 0, 0, false
+	}
+	j := strings.Index(cmd, "head -c ")
+	if j < 0 {
+		return 0, 0, false
+	}
+	if _, err := fmt.Sscanf(cmd[j+len("head -c "):], "%d", &size); err != nil {
+		return 0, 0, false
+	}
+	return off1, size, true
 }
 
 // fakeLsLong 生成 `ls -lan --time-style=+%s -- <dir>` 的输出。
@@ -920,36 +1025,99 @@ func RunCommand(cmd string, ch ssh.Channel, srv *Server) int {
 		}
 		fmt.Fprint(ch, content)
 
-	// 二进制下载：`sz=$(wc -c < <path>) || exit 1; printf 'SIZE:%s\n' "$sz";
-	//            head -c <n> -- <path> | base64 -w0`
-	//
-	// 必须排在 `head -c` 分支**之前**：那条分支按 `--` 切分并假设右边
-	// 就是路径，遇到管道尾巴会把整个 `| base64 -w0` 当成文件名的一部分，
-	// 于是报告「文件不存在」——一个纯粹的匹配顺序问题，却表现得像文件没了。
-	//
-	// 这里必须**真的按 limit 截断**，否则「文件超过上限」这条最危险的路径
-	// 在测试里完全走不到：客户端会拿到一份完整的 base64、以为一切正常，
-	// 而那道「超限拒绝下载」的防线根本没被触发过。
-	case strings.Contains(c, "| base64 -w0"):
-		p := extractDownloadPath(c)
+	// 下载大小探测：`printf '@@SZ-BEGIN@@'; wc -c < '/p'; printf '@@SZ-END@@\n'`
+	// 必须排在下载分支之前（后者按 `| base64` 匹配，探针里没有它，顺序其实
+	// 无关，但放在一起便于对照）。
+	// 杂音包裹与下载分支同理：脏 stdout 的机器上探针同样会被污染，
+	// 客户端靠哨兵取中间那个数字。
+	case strings.HasPrefix(c, "printf '"+sizeBodyMark+"'"):
+		p := extractWcPath(c)
 		if p == "" {
-			fmt.Fprint(ch.Stderr(), "head: invalid arguments\n")
+			fmt.Fprint(ch.Stderr(), "wc: invalid usage\n")
 			return 1
 		}
 		content, ok := fs.read(p)
 		if !ok {
-			// `wc -c < missing` 在真 shell 里先失败，所以 stderr 说的是 wc；
-			// 但客户端只关心非零退出码与一句能读的错，两者都满足。
 			fmt.Fprintf(ch.Stderr(), "wc: %s: No such file or directory\n", p)
 			return 1
 		}
-		// SIZE 行先出，客户端据此判断「是否被截断」。
-		fmt.Fprintf(ch, "SIZE:%d\n", len(content))
-		limit := extractHeadLimit(c)
-		if limit > 0 && len(content) > limit {
-			content = content[:limit]
+		for _, line := range srv.downloadNoise() {
+			fmt.Fprint(ch, line)
 		}
-		fmt.Fprint(ch, base64.StdEncoding.EncodeToString([]byte(content)))
+		fmt.Fprint(ch, sizeBodyMark)
+		fmt.Fprintf(ch, "%d\n", len(content))
+		fmt.Fprintln(ch, sizeBodyEnd)
+		for _, line := range srv.downloadTailNoise() {
+			fmt.Fprint(ch, line)
+		}
+		return 0
+
+	// 二进制下载（分块）：`printf '@@B64-BEGIN@@';
+	//            tail -c +<off1> -- '/p' | head -c <size> | base64 || exit $?;
+	//            printf '@@B64-END@@\n'`
+	//
+	// 客户端的命令文本本身有语法单测（internal/sshclient 对 readChunkCmd
+	// 的 shell 分词检查）—— 这里只负责按协议应答，不执行命令，语法错误
+	// 在这一侧是发现不了的（### 标记事故的教训）。
+	//
+	// 必须排在 `head -c` 文本分支**之前**：那条分支按 `--` 切分并假设右边
+	// 就是路径，遇到管道尾巴会把整个 `| base64` 当成文件名的一部分，
+	// 于是报告「文件不存在」——一个纯粹的匹配顺序问题，却表现得像文件没了。
+	case strings.Contains(c, downloadBodyMark) || strings.Contains(c, "| base64"):
+		p := extractDownloadPath(c)
+		if p == "" {
+			fmt.Fprint(ch.Stderr(), "tail: invalid arguments\n")
+			return 1
+		}
+		off1, size, ok := extractChunkRange(c)
+		if !ok || off1 < 1 || size <= 0 {
+			fmt.Fprint(ch.Stderr(), "tail: invalid arguments\n")
+			return 1
+		}
+		content, ok := fs.read(p)
+		if !ok {
+			fmt.Fprintf(ch.Stderr(), "tail: cannot open '%s' for reading: No such file or directory\n", p)
+			return 1
+		}
+		data := []byte(content)
+		start := off1 - 1
+		if start > int64(len(data)) {
+			start = int64(len(data))
+		}
+		end := start + size
+		if end > int64(len(data)) {
+			end = int64(len(data))
+		}
+		chunk := data[start:end]
+		// 模拟真实环境里各种会污染 stdout 的东西（欢迎语、用法提示……）。
+		// 客户端取两个标记之间的内容，头尾杂音天然被无视。
+		for _, line := range srv.downloadNoise() {
+			fmt.Fprint(ch, line)
+		}
+		fmt.Fprint(ch, downloadBodyMark)
+		if srv.corruptDownloadBody.Load() {
+			// 故意不编码：正文里会是任意字节，客户端必须拒绝并给出可读原因。
+			fmt.Fprint(ch, chunk)
+		} else {
+			// busybox 的 base64 不认 -w0，默认就换行；这里固定按换行输出，
+			// 逼客户端用 stripWhitespace 去处理，而不是假设 -w0 生效。
+			enc := base64.StdEncoding.EncodeToString(chunk)
+			if srv.downloadShortBody.Load() {
+				// 只发前一半，裁到 4 字符的倍数 —— 截断的 base64 仍是
+				// 合法可解码的，这正是「残缺数据伪装完整」的最阴险形态。
+				if cut := (len(enc) / 4) * 4 / 2; cut > 0 {
+					enc = enc[:cut]
+				}
+			}
+			fmt.Fprint(ch, wrapBase64(enc))
+		}
+		if !srv.downloadMissingEnd.Load() {
+			fmt.Fprintf(ch, "%s\n", downloadBodyEnd)
+		}
+		// 尾巴上的污染：在 END 标记**之后**再吐一行提示。
+		for _, line := range srv.downloadTailNoise() {
+			fmt.Fprint(ch, line)
+		}
 		return 0
 
 	// sshclient.ReadFile 实际用的是 head -c <n> -- <path>

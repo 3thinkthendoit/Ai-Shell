@@ -194,80 +194,216 @@ func (c *Client) DeletePath(hostID, path string) (Result, error) {
 	return c.Exec(hostID, "rm -rf -- "+shellQuote(path), 60*time.Second)
 }
 
-// ReadFileBinary 读取远端文件的原始字节。
+// b64Begin / b64End 是下载正文的哨兵。
 //
-// 与 ReadFile 的区别：那个走 `head -c` 把内容当**文本**塞进 stdout，
-// 中途会经过 UTF-8 解码（无效字节变成替换字符），二进制文件（图片、
-// 压缩包、可执行文件）会被破坏。这里让远端先 base64 编码再传 ——
-// base64 字符集全是可打印 ASCII，任何一层都不会动它。
+// 字符用 @ 而不是 #，这是用一次真实事故换来的教训：曾用 ###B64-BEGIN###
+// 且**没加引号**，# 在 shell 里开启注释 —— 远端把
+// "###B64-BEGIN###; head ... ; printf ..." 整段吞成注释，真正执行的只剩
+// 一个零参数 printf，报出：
 //
-// maxBytes 是**解码后**的大小上限。base64 会膨胀约 33%，所以远端截断
-// 位置要按编码后的长度算。
+//	printf: usage: printf [-v var] format [arguments]
 //
-// 返回值里的 total 是远端的**真实文件大小**（来自 `wc -c`），mayTruncate
-// 表示「文件可能已被截到 maxBytes」。
+// 整个下载就此失败（且报错完全看不出是标记的问题）。
+// @ 不开启注释、不触发 glob，也不在 base64 标准字符集（A-Za-z0-9+/=）里，
+// 两边都不会误认。即便如此，命令里仍然给它们套上单引号 ——
+// 不依赖「这个字符碰巧无害」的运气（见 readChunkCmd）。
+const (
+	b64Begin = "@@B64-BEGIN@@"
+	b64End   = "@@B64-END@@"
+)
+
+// ChunkSize 是分块下载每块请求的**原始字节数**（512 KiB）。
 //
-// 为什么要专门回报大小，而不是「解码后长度恰好等于 maxBytes 就算截断」：
-// **文件正好等于上限时**那个判据会误报，而用户手上真的有一个 32 MiB 的文件
-// 并不罕见。多跑一条 wc -c 就能把「恰好这么大」与「被截断了」分开 ——
-// 这比让用户拿到一个静默截断的文件要好得多（见 app_files 里的处理）。
-func (c *Client) ReadFileBinary(hostID, path string, maxBytes int64) (data []byte, mayTruncate bool, total int64, res Result, err error) {
-	if maxBytes <= 0 {
-		maxBytes = defaultTransferLimit
-	}
-	// 按 base64 长度截断，保证解码后不超过 maxBytes。
-	encoded := base64.StdEncoding.EncodedLen(int(maxBytes))
+// 下载改成分块读（见 ReadFileChunk）之后，块大小是一对取舍：
+//   - 太小 → 每块一次 SSH 往返，32 MiB 的文件会多出几百次往返，慢；
+//   - 太大 → 进度条长时间不动，用户不知道是卡了还是在传。
+//
+// 还有一个**硬约束**：base64 会把块膨胀到 4/3（busybox 还会加约 2.7% 的
+// 换行），而 Exec 的输出捕获上限是 MaxCaptureBytes（1 MiB）。1 MiB 的块
+// 编码后是 1.4 MB —— 恰好被捕获上限拦腰截断，结束哨兵丢了，整块作废
+// （这条是用一次真实测试失败换来的）。512 KiB 编码后约 718 KiB，
+// 加上哨兵与换行仍稳稳落在上限内；32 MiB 上限对应最多 64 次往返，
+// 进度条每半 MiB 动一格。调大 ChunkSize 必须先算这笔账。
+const ChunkSize int64 = 512 << 10
+
+// szBegin / szEnd 是大小探针的哨兵：脏 stdout 的机器上 `wc -c` 的输出
+// 会混进欢迎语，直接解析整段 stdout 会失败 —— 取两个标记之间的那个数字。
+const (
+	szBegin = "@@SZ-BEGIN@@"
+	szEnd   = "@@SZ-END@@"
+)
+
+// statSizeCmd 构造「查文件字节数」的命令。单独抽出是为了做 shell 语法单测。
+func statSizeCmd(path string) string {
+	return fmt.Sprintf("printf '%s'; wc -c < %s; printf '%s\\n'", szBegin, shellQuote(path), szEnd)
+}
+
+// readChunkCmd 构造「读文件 [offset, offset+size) 区间的 base64」命令。
+//
+// 与 readBinaryCmd（已删）的逐段设计一致，只列增量：
+//   - `tail -c +K`：POSIX 的 K 是 **1 起**的偏移，所以调用方传 0 起
+//     的 offset 时这里要 +1。差一位就是整体错位一个字节 —— 二进制内容
+//     全部损坏，而且很难从表象看出原因，所以这一位必须钉死在构造处。
+//   - `head -c size` 把尾部截断：tail 会一路输出到文件末尾，没有这一环
+//     除了最后一块之外每块都会多读。管道退出码取**最后**一环（base64），
+//     tail 在 head 关闭管道后收到 SIGPIPE 退出不影响数据正确性。
+//   - 哨兵夹正文、base64 挂 `|| exit $?`、标记套引号 —— 理由同前：
+//     杂音隔离、失败可见、不赌字符无害。
+func readChunkCmd(path string, offset, size int64) string {
 	q := shellQuote(path)
-	// 一条命令里同时取「真实大小」与「内容」：
-	//   wc -c 走 stderr？不行 —— 这里用两条输出、以标记行分隔，避免解析歧义。
-	// 先打 SIZE 行再打内容，标记用不可能出现在 base64 字符集里的字符（'#'）。
-	cmd := fmt.Sprintf("sz=$(wc -c < %s) || exit 1; printf 'SIZE:%%s\\n' \"$sz\"; head -c %d -- %s | base64 -w0",
-		q, encoded, q)
-	res, err = c.Exec(hostID, cmd, 120*time.Second)
+	return fmt.Sprintf(
+		"printf '%s'; tail -c +%d -- %s | head -c %d | base64 || exit $?; printf '%s\\n'",
+		b64Begin, offset+1, q, size, b64End)
+}
+
+// StatFileSize 查询远端文件的字节数。下载用它先探明总量：
+// 超限要在弹保存对话框**之前**拒绝，分块循环要知道终点。
+func (c *Client) StatFileSize(hostID, path string) (int64, error) {
+	res, err := c.Exec(hostID, statSizeCmd(path), 30*time.Second)
 	if err != nil {
-		return nil, false, 0, res, err
+		return 0, err
 	}
 	if res.ExitCode != 0 {
-		return nil, false, 0, res, fmt.Errorf("读取文件失败：%s", firstNonEmpty(res.Stderr, "退出码 "+strconv.Itoa(res.ExitCode)))
+		return 0, fmt.Errorf("%s", firstNonEmpty(strings.TrimSpace(res.Stderr), "退出码 "+strconv.Itoa(res.ExitCode)))
+	}
+	// 取哨兵之间的数字；没拿到哨兵（老 shell/命令被截断）就退回解析
+	// 整段输出 —— 失败时错误里会带原文预览，不至于莫名其妙。
+	body, ok := extractBetween(res.Stdout, szBegin, szEnd)
+	if !ok {
+		body = res.Stdout
+	}
+	n, perr := strconv.ParseInt(strings.TrimSpace(body), 10, 64)
+	if perr != nil || n < 0 {
+		// stdout 混进了别的行（登录脚本欢迎语之类）时解析会失败 ——
+		// 与其猜哪一行是大小，不如把原文带进错误里让人一眼看出原因。
+		return 0, fmt.Errorf("无法确定文件大小（远端输出：%q）", previewForError(res.Stdout))
+	}
+	return n, nil
+}
+
+// ReadFileChunk 读取远端文件 [offset, offset+size) 的原始字节。
+//
+// 下载从「一次读整个文件」改成了分块读 —— 一次 Exec 拿不到中间进度，
+// 而一个 32 MiB 的传输没有进度条，用户只能看着界面猜它死没死。
+// 分块之后每块回来都能发一次进度、检查一次取消。
+//
+// 返回的字节数可能**小于** size：那是区间越过文件末尾的正常截断
+// （最后一块）。中途拿到 0 字节则说明文件比预期短了（传输中被截断/删除），
+// 调用方必须当作错误处理，绝不能当成正常结束 —— 那会得到一个
+// 缺了尾巴还自称完整的文件。
+func (c *Client) ReadFileChunk(hostID, path string, offset, size int64) ([]byte, error) {
+	if offset < 0 || size <= 0 {
+		return nil, fmt.Errorf("非法的读取区间 [%d, %d)", offset, offset+size)
+	}
+	res, err := c.Exec(hostID, readChunkCmd(path, offset, size), 120*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if res.ExitCode != 0 {
+		return nil, fmt.Errorf("读取文件失败：%s", firstNonEmpty(res.Stderr, "退出码 "+strconv.Itoa(res.ExitCode)))
 	}
 
-	// 切开 SIZE 行与 base64 正文。
-	raw := strings.TrimSpace(res.Stdout)
-	var body string
-	if i := strings.IndexByte(raw, '\n'); i >= 0 && strings.HasPrefix(raw, "SIZE:") {
-		if n, perr := strconv.ParseInt(strings.TrimSpace(strings.TrimPrefix(raw[:i], "SIZE:")), 10, 64); perr == nil {
-			total = n
+	// 取哨兵之间的内容。ok=false 分两种，必须分开处理：
+	//
+	//   - 有 BEGIN 没 END：先尝试**抢救**。真实机器上出现过这种怪癖 ——
+	//     base64 载荷完整、END 始终没来（连接抖动、shell 提前收工），
+	//     数据一个字节都没坏，为一个丢失的标记报错是浪费用户时间。
+	//     抢救的接受条件是**解码长度与请求的 size 严格相等**：截断在
+	//     4 字符边界上的 base64 同样能解码成功，但长度必然小于请求值 ——
+	//     这道长度闸门是防「悄悄收下残缺数据」的唯一防线，绝不能放宽成
+	//     「解得动就要」。长度不符时按截断报错（多半是输出被 Exec 的
+	//     捕获上限 MaxCaptureBytes 拦腰截断，要修 ChunkSize 的信号）。
+	//   - 连 BEGIN 都没有：老 shell / 命令被截断 —— 兜底把整段当正文解，
+	//     解码失败时错误里会带原文预览，比静默成功诚实。
+	body, ok := extractBetween(res.Stdout, b64Begin, b64End)
+	if !ok && strings.Contains(res.Stdout, b64Begin) {
+		salvage := res.Stdout[strings.Index(res.Stdout, b64Begin)+len(b64Begin):]
+		if data, serr := decodeB64Body(salvage); serr == nil && int64(len(data)) == size {
+			return data, nil
 		}
-		body = raw[i+1:]
-	} else {
-		// 远端没按预期回 SIZE 行（shell 不支持 $() 等）：退回只看正文。
-		// 此时 total 未知（0），由调用方按长度判断是否可能截断。
-		body = raw
+		return nil, fmt.Errorf(
+			"远端输出不完整（缺少结束标记）：本块应返回 %d 字节，实际数据不足或无法解码",
+			size)
 	}
+	if !ok {
+		body = res.Stdout
+	}
+	return decodeB64Body(body)
+}
 
-	body = strings.TrimSpace(body)
+// decodeB64Body 把远端回的 base64 文本解成字节。
+//
+// 无条件剥掉所有空白：远端若是 busybox base64（不认 -w0），输出会带
+// 换行；这里的剥离是幂等的，先剥再解，比"解失败再剥再解"少一次无用功。
+// 还失败就考虑 URL-safe 变体（少数精简系统的 base64 会用 -_ 而不是 +/）。
+func decodeB64Body(body string) ([]byte, error) {
+	body = stripWhitespace(body)
 	data, decErr := base64.StdEncoding.DecodeString(body)
 	if decErr != nil {
-		// -w0 缺失或远端 base64 实现不同会让输出带换行；去掉空白再试一次。
-		compact := strings.Map(func(r rune) rune {
-			if r == '\n' || r == '\r' || r == ' ' {
-				return -1
-			}
-			return r
-		}, body)
-		data, decErr = base64.StdEncoding.DecodeString(compact)
-		if decErr != nil {
-			return nil, false, 0, res, fmt.Errorf("远端返回的内容不是合法 base64（该机器的 base64 实现可能不支持 -w0）：%w", decErr)
+		if alt, aerr := base64.RawURLEncoding.DecodeString(strings.TrimRight(body, "=")); aerr == nil {
+			return alt, nil
 		}
+		// 把「远端到底回了什么」带进错误里。只报 input byte 4 等于没说：
+		// 用户看到的是"数据坏了"，而我们其实一眼就能看出是尾巴上多了提示。
+		return nil, fmt.Errorf(
+			"远端返回的内容不是合法 base64：%w（收到 %d 字节，开头为 %q）",
+			decErr, len(body), previewForError(body))
 	}
+	return data, nil
+}
 
-	// 两种判据取其一：知道真实大小就比大小；不知道就看长度是否顶着上限。
-	if total > 0 {
-		mayTruncate = total > int64(len(data))
-	} else {
-		mayTruncate = int64(len(data)) >= maxBytes
+// extractBetween 取 begin 与 end 之间的内容。
+//
+// 返回的 ok 区分两种「内容为空」：
+//   - ok=true  且 body 为空 —— 哨兵都在、正文为空，即**空文件**，合法；
+//   - ok=false —— 没找到哨兵，调用方该走兜底解析。
+//
+// 之前用「body 是否为空串」判断，空文件会被误当成没拿到哨兵，
+// 走了兜底路径后把杂音和标记本身一起喂给 base64 解码，直接报错。
+//
+// 用"第一个 begin + 其后的第一个 end"而不是 LastIndex：远端可能因为
+// 多跑了一次提示而出现重复标记，取最靠前的一对才对应真正的那段正文。
+func extractBetween(s, begin, end string) (body string, ok bool) {
+	i := strings.Index(s, begin)
+	if i < 0 {
+		return "", false
 	}
-	return data, mayTruncate, total, res, nil
+	rest := s[i+len(begin):]
+	j := strings.Index(rest, end)
+	if j < 0 {
+		return "", false
+	}
+	return rest[:j], true
+}
+
+// stripWhitespace 去掉所有空白字符。base64 不在乎它们，而远端各种实现
+// 会在哪儿插换行/空格完全不可预测（-w0 缺失、tr 缺失、busybox 变体……）。
+func stripWhitespace(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\n', '\r', '\v', '\f':
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// previewForError 取一小段内容放进错误信息里，便于用户/我们判断是哪种污染。
+// 只取开头，且把不可打印字符换掉，免得日志里出现控制序列。
+func previewForError(s string) string {
+	const max = 60
+	out := make([]rune, 0, max)
+	for _, r := range s {
+		if len(out) >= max {
+			return string(out) + "…"
+		}
+		if r < 32 || r == 127 {
+			out = append(out, '·')
+			continue
+		}
+		out = append(out, r)
+	}
+	return string(out)
 }
 
 // WriteFileBinary 把原始字节写到远端文件（覆写，带备份）。

@@ -13,6 +13,17 @@ import (
 
 func newShellTestApp(t *testing.T, mode vault.PolicyMode, whitelist []string) (*App, string) {
 	t.Helper()
+	a, hostID, _ := newShellTestAppWithServer(t, mode, whitelist)
+	return a, hostID
+}
+
+// newShellTestAppWithServer 与 newShellTestApp 相同，但把假远端服务器也交出来。
+//
+// 有些用例需要**改造远端的行为**才能复现真实环境的问题 —— 最典型的是
+// 「远端 stdout 不干净」（登录脚本打欢迎语、busybox 的 base64 打用法提示），
+// 而这个条件在默认的假远端里不存在，于是那类 bug 永远测不到。
+func newShellTestAppWithServer(t *testing.T, mode vault.PolicyMode, whitelist []string) (*App, string, *sshtest.Server) {
+	t.Helper()
 	srv := sshtest.Start(t)
 
 	a := newTestApp(t)
@@ -39,7 +50,7 @@ func newShellTestApp(t *testing.T, mode vault.PolicyMode, whitelist []string) (*
 		t.Fatalf("初始化审计日志失败: %v", err)
 	}
 	a.audit = lg
-	return a, "h1"
+	return a, "h1", srv
 }
 
 func TestRunShell_SafeAutoAllows(t *testing.T) {

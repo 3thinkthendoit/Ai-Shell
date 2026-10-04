@@ -113,7 +113,24 @@ export const store = reactive({
     // busy 表示有一次上传/下载/删除正在进行：期间禁用按钮，
     // 避免同一个文件被并发删两次之类。
     busy: false,
-    notice: ''      // 操作成功的短暂提示
+    notice: '',     // 操作成功的短暂提示
+    // progress 是传输进度，只在上传/下载期间非空。
+    //
+    // 字段：
+    //   phase  'reading'（本地读文件并 base64）/ 'sending'（发给后端）
+    //          / 'downloading'（后端正在分块拉取并落盘）/ 'done'
+    //   loaded 已处理的**原始字节数**（不是 base64 长度 —— 用户看到的
+    //          应该是文件本身的进度，而 base64 会膨胀约 33%）
+    //   total  原始文件总字节（0 表示未知）
+    //   name   正在传的文件名
+    //   id     传输 id（仅下载）：后端分块下载的事件里带回来，取消时
+    //          原样传给 CancelFileTransfer
+    //   bps    累计平均速度（字节/秒，仅下载）
+    //
+    // 为什么要有 total 之外还留 loaded：FileReader 的 progress 事件
+    // 在文件很小时可能一次都不触发（直接 onload），所以 UI 必须能处理
+    // 「有名字有阶段但没有百分比」的状态，而不是除以 0 显示 NaN%。
+    progress: null
   },
 
   // bySession 是「每台主机的每条会话各一条独立时间线」：桶键 → 对话记录。
@@ -410,7 +427,8 @@ function liveAssistant(step) {
 const EV_NAMES = [
   'agent:delta', 'agent:message', 'agent:reasoning', 'agent:tool', 'agent:toolResult',
   'agent:injection', 'agent:approval', 'approval:expired', 'agent:status', 'agent:error',
-  'audit:error', 'agent:done', 'term:data', 'term:exit', 'term:tui', 'term:cwd', 'agent:snapshot'
+  'audit:error', 'agent:done', 'term:data', 'term:exit', 'term:tui', 'term:cwd', 'agent:snapshot',
+  'fm:transfer'
 ]
 
 // surfaceWrite 返回往某块终端表面（按 host+session 键）写字符串的落点（就是它
@@ -617,6 +635,22 @@ export function bindEvents() {
     // 之后弹窗还停在旧目录，看起来像没刷新。
     if (store.fileManager.open && store.fileManager.key === k) {
       store.fileManager.cwd = d.cwd
+    }
+  })
+
+  // 文件传输进度（下载）。后端每落盘一块就推一次（app_files.go 的
+  // downloadTo → a.emit），这里把它翻译成 fm.progress 的 downloading 相位，
+  // 与上传共用同一个进度条渲染。上传的进度仍由前端自己驱动（读本地文件），
+  // 走不到这条事件。
+  r.EventsOn('fm:transfer', d => {
+    if (!d || d.kind !== 'download') return
+    store.fileManager.progress = {
+      phase: 'downloading',
+      id: d.id,
+      loaded: d.done,
+      total: d.total,
+      name: d.name,
+      bps: d.bps
     }
   })
 
@@ -1183,31 +1217,32 @@ export async function fmGoParent() {
   return loadDir(fm.parent)
 }
 
-// fmDelete 删除一项。确认由组件负责（弹窗），这里只管执行。
-export async function fmDelete(entryPath) {
-  const fm = fmState()
-  if (!api()) return
-  fm.busy = true
-  fm.error = ''
-  try {
-    const res = await api().DeleteRemotePath(fm.hostId, entryPath)
-    if (res && res.ok) {
-      fm.notice = res.message || '已删除'
-      await loadDir(fm.cwd)
-    } else {
-      fm.error = (res && res.error) || '删除失败'
-    }
-  } catch (e) {
-    fm.error = String(e && e.message ? e.message : e)
-  } finally {
-    fm.busy = false
-  }
-}
-
-// fmUpload 把本地 File 内容 base64 后上传到当前目录。
+// 注意：这里**没有** fmDelete。
 //
-// 先做本地大小校验再编码：把一个 2GB 的文件整个读进内存去 base64，
-// 在报「超过上限」之前就已经把页面内存打爆了 —— 那种失败方式比拒绝难看得多。
+// 弹窗只提供「浏览 / 上传 / 下载」，删除要用户走终端自己敲 rm —— 那是一条
+// 看得见、留得下历史、也能被审批闸门拦住的路径。把不可逆的远端删除做成
+// 列表里的一个按钮，误点成本太高（尤其是当列表里混着目录时）。
+//
+// 后端 App.DeleteRemotePath 仍然保留：它是通用能力（终端、自动化都能用），
+// 只是这个前端入口不再暴露它。
+
+// fmUpload 把本地 File 内容 base64 后上传到当前目录（二进制安全，带进度）。
+//
+// 走的是和下载同一条路：整个文件 base64 后一次性交给后端，后端再
+// base64 -d 落到远端。所以「二进制」这件事是端到端成立的 —— 上传的不是
+// 文本，而是原始字节的 base64 表示，`\x00` 与无效 UTF-8 都能原样过去。
+//
+// 关于进度：Wails 的绑定调用是**一次性**的（参数就是一个大字符串），
+// 中间没有可观测的传输事件。所以进度只能分两段报：
+//
+//   1. 'reading' —— 本地把文件读成 base64。这一段是真实分块的（FileReader
+//      的 progress 事件），也是大文件耗时最长的部分，进度是真的。
+//   2. 'sending' —— 调后端。这一段只能显示"不定进度"（UI 上做条纹动画），
+//      因为拿不到回调。硬要显示一个假百分比，在大文件上会长时间停着不动，
+//      比诚实的"发送中"更让人心慌。
+//
+// 两段都报**原始字节数**，不是 base64 长度：base64 会膨胀约 33%，
+// 直接用它当分子会让"读完了"显示成 75% 那种莫名其妙的数字。
 export async function fmUpload(file) {
   const fm = fmState()
   if (!api() || !file) return
@@ -1219,12 +1254,18 @@ export async function fmUpload(file) {
   }
   fm.busy = true
   fm.error = ''
+  fm.notice = ''
+  fm.progress = { phase: 'reading', loaded: 0, total: file.size, name: file.name }
   try {
-    const b64 = await fileToBase64(file)
-    // 去掉 data URL 前缀：后端要的是纯 base64。
-    const pure = b64.includes(',') ? b64.slice(b64.indexOf(',') + 1) : b64
+    const pure = await fileToBase64Paced(file, loaded => {
+      // 读阶段：loaded 是已读的原始字节。
+      fm.progress = { phase: 'reading', loaded, total: file.size, name: file.name }
+    })
+    // 读完之后切到"发送中"。这一段的百分比是未知的，UI 会显示不定进度。
+    fm.progress = { phase: 'sending', loaded: file.size, total: file.size, name: file.name }
     const res = await api().UploadRemoteFile(fm.hostId, fm.cwd, file.name, pure)
     if (res && res.ok) {
+      fm.progress = { phase: 'done', loaded: file.size, total: file.size, name: file.name }
       fm.notice = res.message || `已上传 ${file.name}`
       await loadDir(fm.cwd)
     } else {
@@ -1233,33 +1274,54 @@ export async function fmUpload(file) {
   } catch (e) {
     fm.error = String(e && e.message ? e.message : e)
   } finally {
+    // 无论成败都要清掉进度：留着会让下次打开弹窗看到一个停在 60% 的
+    // 陈旧进度条，用户以为还在传。
+    fm.progress = null
     fm.busy = false
   }
 }
 
-// fmDownload 读取远端文件并触发浏览器下载。
+// fmDownload 把远端文件下载到用户挑选的本地路径。
 //
-// 用 <a download> 而不是 Wails 的 SaveFileDialog：后端只要把内容读出来，
-// 「存到哪」交给浏览器自己的下载机制（用户在系统下载对话框里选），
-// 后端不必知道有任何本地路径，也就少一条可能被滥用的能力。
+// 保存走 Wails 原生对话框、传输由后端分块落盘（app_files.go 的
+// downloadTo）：前端只发一次请求，之后通过 fm:transfer 事件收进度与速度。
+//
+// 旧实现把整个文件 base64 塞回前端、用 <a download> 触发浏览器下载 ——
+// 在应用窗口里这依赖 WebView 的下载行为，macOS 的 WKWebView 对它支持
+// 很差（表现为点了没反应），而且传输期间没有任何进度可看。
 export async function fmDownload(entryPath, name) {
   const fm = fmState()
   if (!api()) return
   fm.busy = true
   fm.error = ''
+  fm.notice = ''
   try {
     const res = await api().DownloadRemoteFile(fm.hostId, entryPath)
+    if (res && res.cancelled) {
+      // 用户在保存对话框里按了取消：不是错误，界面什么都不该显示。
+      return
+    }
     if (res && res.ok) {
-      saveBase64AsFile(res.message, name || 'download')
-      fm.notice = `已下载 ${name || ''}`
+      fm.notice = res.message ? `已保存到 ${res.message}` : `已下载 ${name || ''}`
     } else {
       fm.error = (res && res.error) || '下载失败'
     }
   } catch (e) {
     fm.error = String(e && e.message ? e.message : e)
   } finally {
+    // 无论成败都要清掉进度：留着会让下次打开弹窗看到一个停在 60% 的
+    // 陈旧进度条，用户以为还在传。
+    fm.progress = null
     fm.busy = false
   }
+}
+
+// fmCancelTransfer 取消当前下载：把进度事件里带回来的 id 还给后端。
+// id 为空说明第一块还没传完（事件还没来过），此时没有真正可取消的东西。
+export function fmCancelTransfer() {
+  const fm = fmState()
+  const id = fm.progress && fm.progress.id
+  if (id && api()) api().CancelFileTransfer(id)
 }
 
 // fmtBytes 把字节数变成人能读的大小，用于错误与提示文案。
@@ -1271,33 +1333,75 @@ export function fmtBytes(n) {
   return `${(n / 1073741824).toFixed(2)} GiB`
 }
 
-// fileToBase64 把本地文件读成 base64（含 data URL 前缀，调用方负责剥掉）。
-function fileToBase64(file) {
+// fileToBase64Paced 把本地文件读成**纯** base64（不含 data URL 前缀），
+// 并在读取过程中回调已处理的原始字节数。
+//
+// 为什么不直接用 FileReader.readAsDataURL 的 onload：
+//
+//  1. 那个结果是带 `data:...;base64,` 前缀的，调用方还得手动切一刀；
+//  2. onprogress 给的是**整个 data URL 字符串**的进度，而 base64 比原始
+//     字节多约 33%，拿它当进度会让百分比虚高（读到 75% 就显示 100%）；
+//  3. 小文件时 onprogress 可能一次都不触发，只有 onload，
+//     如果 UI 依赖进度事件，小文件会一直显示 0%。
+//
+// 所以这里自己按块读：每块是原始字节，先算好总块数再逐块推进，
+// 保证**最后一块读完时 loaded 恰好等于 file.size** —— 进度条一定能走到 100%，
+// 不会停在 97% 那种地方。
+//
+// 拼接用字符串而不是先合 Uint8Array 再转：几十 MB 的文件里，前者只是
+// 字符串相加，后者会额外复制一份完整缓冲，内存峰值翻倍。
+const B64_CHUNK = 1024 * 1024 // 每次读 1 MiB 原始字节
+
+function fileToBase64Paced(file, onProgress) {
   return new Promise((resolve, reject) => {
-    const fr = new FileReader()
-    fr.onload = () => resolve(String(fr.result || ''))
-    fr.onerror = () => reject(fr.error || new Error('读取本地文件失败'))
-    fr.readAsDataURL(file)
+    const size = file.size || 0
+    if (!size) {
+      // 空文件：没有可读的块，直接给空串。给进度回调一个 0/0 的终态，
+      // 让 UI 能立刻显示"完成"而不是一直转圈。
+      if (onProgress) onProgress(0)
+      resolve('')
+      return
+    }
+
+    const parts = []
+    let offset = 0
+
+    // 用 FileReaderSync 不行（它是 Worker 专用的），所以还是异步 FileReader，
+    // 只是把"一次读整个文件"换成"顺序读若干块"。
+    function readNext() {
+      const end = Math.min(offset + B64_CHUNK, size)
+      const fr = new FileReader()
+
+      // onloadend 同时覆盖成功与失败：少写一个分支就少一处忘记推进的地方。
+      // 真失败时 fr.result 为空、fr.error 非空。
+      fr.onerror = () => reject(fr.error || new Error('读取本地文件失败'))
+      fr.onload = () => {
+        const buf = fr.result
+        if (!buf) {
+          reject(new Error('读取本地文件失败（内容为空）'))
+          return
+        }
+        const bytes = new Uint8Array(buf)
+        parts.push(bytesToBase64(bytes))
+        offset = end
+        // 报原始字节数：这是"文件传了多少"，和用户看到的文件大小同一个单位。
+        if (onProgress) onProgress(offset)
+        if (offset < size) {
+          readNext()
+        } else {
+          resolve(parts.join(''))
+        }
+      }
+      fr.readAsArrayBuffer(file.slice(offset, end))
+    }
+
+    readNext()
   })
 }
 
-// saveBase64AsFile 把 base64 内容作为文件下载到本地。
-//
-// 解码走 atob + Uint8Array 而不是直接造 data: URL：data URL 在
-// 大文件（几十 MB）上会被浏览器拒掉或卡死，而 Blob 是流式的。
-function saveBase64AsFile(b64, filename) {
-  const bytes = base64ToBytes(b64)
-  const blob = new Blob([bytes], { type: 'application/octet-stream' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  document.body.appendChild(a)
-  a.click()
-  document.body.removeChild(a)
-  // 立刻 revoke 会让下载在某些浏览器上来不及取数据，延后一拍。
-  setTimeout(() => URL.revokeObjectURL(url), 10000)
-}
+// 注意：这里**不**再定义一份 bytesToBase64。上面已经有一个导出给终端用的
+// 同名函数，实现完全一样（分块 + fromCharCode.apply，避开爆栈与 UCS-2 陷阱）。
+// 复制一份出来只会多一处将来会漂移的实现 —— 二进制编码这件事只该有一个源头。
 
 // isPtyDirty 供界面在回合结束时判断要不要补输入提示符。
 export function isPtyDirty(hostId, sessionId) {

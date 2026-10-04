@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/base64"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -179,16 +181,106 @@ func TestUploadRemoteFile_BinaryRoundTrip(t *testing.T) {
 		t.Fatalf("上传失败: %s", up.Error)
 	}
 
-	down := a.DownloadRemoteFile(hostID, "/srv/blob.bin")
-	if !down.OK {
-		t.Fatalf("下载失败: %s", down.Error)
-	}
-	got, err := base64.StdEncoding.DecodeString(down.Message)
-	if err != nil {
-		t.Fatalf("下载回来不是合法 base64: %v", err)
-	}
+	got, _ := mustDownload(t, a, hostID, "/srv/blob.bin")
 	if string(got) != string(raw) {
 		t.Fatalf("二进制内容被改动了：\n发出 %v\n收回 %v", raw, got)
+	}
+}
+
+// 回归：远端 stdout 里混进了**别的行**时，下载仍必须成功。
+//
+// 这就是线上报的那条：
+//
+//	远端返回的内容不是合法 base64（该机器的 base64 实现可能不支持 -w0）：
+//	illegal base64 data at input byte 4
+//
+// 内容本身完全正确，问题在于远端多打了几行 —— 登录脚本的欢迎语、
+// busybox base64 的用法提示、`bc: command not found` 之类。
+// 旧实现只在正文**前面**放了一个 SIZE 标记，挡不住**尾巴**上的污染：
+// 提示行拼在 base64 后面，解码就在正文中间某处失败，报出的字节偏移
+// 看起来像"数据坏了"，其实数据是好的。
+//
+// 现在正文被一对哨兵夹住，标记之外的一切都被无视。几条用例分别覆盖
+// 头部污染、尾部污染、以及两头都有 —— 最后一种才是真实环境最常见的。
+func TestDownloadRemoteFile_SurvivesNoisyStdout(t *testing.T) {
+	a, hostID, srv := newShellTestAppWithServer(t, vault.ModeManual, nil)
+
+	raw := []byte{0x00, 0x01, 0xff, 0xfe, 0x80, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a}
+	if up := a.UploadRemoteFile(hostID, "/srv", "noisy.bin", base64.StdEncoding.EncodeToString(raw)); !up.OK {
+		t.Fatalf("上传失败: %s", up.Error)
+	}
+
+	cases := []struct {
+		name string
+		head []string
+		tail []string
+	}{
+		{"尾巴有提示（本次线上那种）", nil, []string{"bc: command not found\n"}},
+		{"头部有欢迎语", []string{"Welcome to Ubuntu 22.04 LTS\n"}, nil},
+		{"两头都有", []string{"-bash: /etc/profile.d/x.sh: Permission denied\n"}, []string{"base64: invalid option -- 'w'\n"}},
+		{"多行尾部污染", nil, []string{"Usage: base64 [-d] [file]\n", "bc: command not found\n"}},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv.SetDownloadNoise(c.head, c.tail)
+			t.Cleanup(func() { srv.SetDownloadNoise(nil, nil) })
+
+			got, _ := mustDownload(t, a, hostID, "/srv/noisy.bin")
+			if string(got) != string(raw) {
+				t.Fatalf("杂音混进了内容里：\n发出 %v\n收回 %v", raw, got)
+			}
+		})
+	}
+}
+
+// 远端把 base64 换行了（busybox 不认 -w0）也必须能解出来。
+//
+// 换行本身不算污染 —— 它在哨兵**内部**。这条用例守的是
+// stripWhitespace 那道处理：漏了它，凡是 base64 不带 -w0 的机器
+// 都会下载失败，而这类机器（精简镜像、老发行版）恰恰很常见。
+func TestDownloadRemoteFile_SurvivesWrappedBase64(t *testing.T) {
+	a, hostID := newShellTestApp(t, vault.ModeManual, nil)
+
+	// 内容要足够长，超过 76 字符才会被假远端折行。
+	raw := []byte(strings.Repeat("The quick brown fox jumps over the lazy dog. ", 8))
+	if up := a.UploadRemoteFile(hostID, "/srv", "long.txt", base64.StdEncoding.EncodeToString(raw)); !up.OK {
+		t.Fatalf("上传失败: %s", up.Error)
+	}
+
+	got, _ := mustDownload(t, a, hostID, "/srv/long.txt")
+	if string(got) != string(raw) {
+		t.Fatalf("内容被改动：\n发出 %d 字节\n收回 %d 字节", len(raw), len(got))
+	}
+}
+
+// 真的解不出来时，错误信息必须带上「远端到底回了什么」。
+//
+// 原来只报 `illegal base64 data at input byte 4` —— 用户看到的是"数据坏了"，
+// 完全无法判断是文件问题还是远端在乱打日志。带上开头的内容预览，
+// 一眼就能看出尾巴上多了一行提示。
+func TestDownloadRemoteFile_CorruptBodyReportsPreview(t *testing.T) {
+	a, hostID, srv := newShellTestAppWithServer(t, vault.ModeManual, nil)
+
+	// 用一段不被 base64 字符集接受的内容当正文：模拟远端把二进制
+	// 原样吐了出来（而不是编码后）。哨兵之间全是非法字符。
+	srv.SetCorruptDownloadBody(true)
+	t.Cleanup(func() { srv.SetCorruptDownloadBody(false) })
+
+	dest, res, _ := doDownload(t, a, hostID, "/srv/app.conf")
+	if res.OK {
+		t.Fatal("正文非法时下载应失败")
+	}
+	if !strings.Contains(res.Error, "不是合法 base64") {
+		t.Fatalf("错误信息应指明 base64 解析失败，实得: %s", res.Error)
+	}
+	// 关键：得说清楚"收到了什么"，否则用户只能猜。
+	if !strings.Contains(res.Error, "收到") {
+		t.Fatalf("错误信息应带上远端回的内容预览，实得: %s", res.Error)
+	}
+	// 失败时半成品文件必须被清掉：留着会被人当成完整文件去用。
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Fatalf("失败的下载不应留下半成品文件（%s）", dest)
 	}
 }
 
@@ -226,18 +318,37 @@ func TestUploadRemoteFile_RejectsOversize(t *testing.T) {
 	}
 }
 
-func TestDownloadRemoteFile_ReturnsContent(t *testing.T) {
+// doDownload 走一遍真实下载（分块落盘路径 downloadTo），把进度事件收集起来。
+// dest 固定落在临时目录，测试结束时自动清理。
+func doDownload(t *testing.T, a *App, hostID, path string) (string, FileOpResult, []FileTransferProgress) {
+	t.Helper()
+	dest := filepath.Join(t.TempDir(), "out.bin")
+	var events []FileTransferProgress
+	res := a.downloadTo(hostID, path, dest, func(p FileTransferProgress) {
+		events = append(events, p)
+	})
+	return dest, res, events
+}
+
+// mustDownload 是 doDownload 的「应该成功」版本，顺带读回落盘内容。
+func mustDownload(t *testing.T, a *App, hostID, path string) ([]byte, []FileTransferProgress) {
+	t.Helper()
+	dest, res, events := doDownload(t, a, hostID, path)
+	if !res.OK {
+		t.Fatalf("下载失败: %s", res.Error)
+	}
+	data, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("下载结果文件读不回来: %v", err)
+	}
+	return data, events
+}
+
+func TestDownloadRemoteFile_WritesContent(t *testing.T) {
 	a, hostID := newShellTestApp(t, vault.ModeManual, nil)
 
 	// 假远端预置了 ConfPath。
-	down := a.DownloadRemoteFile(hostID, "/srv/app.conf")
-	if !down.OK {
-		t.Fatalf("下载失败: %s", down.Error)
-	}
-	data, err := base64.StdEncoding.DecodeString(down.Message)
-	if err != nil {
-		t.Fatalf("内容不是合法 base64: %v", err)
-	}
+	data, _ := mustDownload(t, a, hostID, "/srv/app.conf")
 	if !strings.Contains(string(data), "listen") {
 		t.Fatalf("下载内容不符: %q", string(data))
 	}
@@ -245,12 +356,34 @@ func TestDownloadRemoteFile_ReturnsContent(t *testing.T) {
 
 func TestDownloadRemoteFile_MissingFileReportsError(t *testing.T) {
 	a, hostID := newShellTestApp(t, vault.ModeManual, nil)
-	res := a.DownloadRemoteFile(hostID, "/srv/does-not-exist")
+	dest, res, _ := doDownload(t, a, hostID, "/srv/does-not-exist")
 	if res.OK {
 		t.Fatal("下载不存在的文件应报错")
 	}
 	if res.Error == "" {
 		t.Fatal("失败时必须给出原因，否则界面只能显示一个空错误")
+	}
+	// 探测阶段就失败，本地连文件都不该有。
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Fatalf("失败的下载不应留下半成品文件（%s）", dest)
+	}
+}
+
+// 空文件的下载必须是**成功的空文件**，而不是失败。
+//
+// 总量为 0 时分块循环一次都不进，直接落一个 0 字节的本地文件 ——
+// 这本身就是用户要的结果。别把它当成「什么都没发生」的失败路径。
+func TestDownloadRemoteFile_EmptyFile(t *testing.T) {
+	a, hostID := newShellTestApp(t, vault.ModeManual, nil)
+
+	// 上传一个空文件作为下载对象。
+	if up := a.UploadRemoteFile(hostID, "/srv", "empty.bin", ""); !up.OK {
+		t.Fatalf("上传空文件失败: %s", up.Error)
+	}
+
+	data, _ := mustDownload(t, a, hostID, "/srv/empty.bin")
+	if len(data) != 0 {
+		t.Fatalf("空文件不应有内容, 实得 %d 字节", len(data))
 	}
 }
 
@@ -263,25 +396,26 @@ func TestDownloadRemoteFile_RejectsOversize(t *testing.T) {
 	a, hostID := newShellTestApp(t, vault.ModeManual, nil)
 
 	// 把上限压到 8 字节。假远端预置的 /srv/app.conf 远长于它，
-	// 于是「超限」这条路径真的被走到 —— 前提是假远端**真的按 limit 截断**
-	// （它现在会了；以前不截断，这条用例根本测不出东西）。
+	// 于是「超限」这条路径真的被走到 —— 探测（wc -c）先行，
+	// 超限在弹对话框、写任何本地字节之前就被拒绝。
 	old := sshclient.MaxTransferBytes
 	sshclient.MaxTransferBytes = 8
 	t.Cleanup(func() { sshclient.MaxTransferBytes = old })
 
-	res := a.DownloadRemoteFile(hostID, "/srv/app.conf")
+	dest, res, _ := doDownload(t, a, hostID, "/srv/app.conf")
 	if res.OK {
-		// 最要命的形态：返回成功，但内容只有 8 字节。
-		data, _ := base64.StdEncoding.DecodeString(res.Message)
-		t.Fatalf("超限的下载必须被拒绝，却报告成功并返回了 %d 字节", len(data))
+		t.Fatalf("超限的下载必须被拒绝，却报告成功（%s）", dest)
 	}
 	if !strings.Contains(res.Error, "上限") {
 		t.Fatalf("拒绝理由应说明是超过上限，实得 %q", res.Error)
 	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Fatalf("被拒绝的下载不应留下半成品文件（%s）", dest)
+	}
 }
 
 // 文件**恰好等于**上限时必须正常下载 —— 这是「按长度顶格即视为截断」
-// 那种实现会误报的边界，也是这里专门回报真实大小的原因。
+// 那种实现会误报的边界，也是这里先用 wc -c 探明真实大小的原因。
 func TestDownloadRemoteFile_ExactLimitIsNotTruncated(t *testing.T) {
 	a, hostID := newShellTestApp(t, vault.ModeManual, nil)
 
@@ -295,13 +429,66 @@ func TestDownloadRemoteFile_ExactLimitIsNotTruncated(t *testing.T) {
 	sshclient.MaxTransferBytes = int64(len(raw))
 	t.Cleanup(func() { sshclient.MaxTransferBytes = old })
 
-	res := a.DownloadRemoteFile(hostID, "/srv/exact.bin")
-	if !res.OK {
-		t.Fatalf("恰好等于上限的文件应能下载，实得错误: %s", res.Error)
-	}
-	got, _ := base64.StdEncoding.DecodeString(res.Message)
+	got, _ := mustDownload(t, a, hostID, "/srv/exact.bin")
 	if string(got) != string(raw) {
 		t.Fatalf("内容不符：期望 %q，实得 %q", raw, got)
+	}
+}
+
+// 远端把 END 哨兵弄丢时，只要 base64 载荷完整，下载就必须成功。
+//
+// 真实机器上出现过：base64 完整、END 始终没出现（连接抖动、shell 提前
+// 收工），数据一个字节都没坏。旧版整文件下载在这种情况下的行为是
+// 把哨兵一起喂给解码器，报出莫名其妙的
+// "不是合法 base64：illegal base64 data at input byte 0"——
+// 数据是好的，报错却像文件坏了。现在的抢救路径按「解码长度与请求的
+// 块大小严格相等」放行。
+func TestDownloadRemoteFile_MissingEndMarkStillSucceeds(t *testing.T) {
+	a, hostID, srv := newShellTestAppWithServer(t, vault.ModeManual, nil)
+
+	srv.SetDownloadMissingEnd(true)
+	t.Cleanup(func() { srv.SetDownloadMissingEnd(false) })
+
+	raw := []byte("payload without a closing marker from the remote")
+	if up := a.UploadRemoteFile(hostID, "/srv", "noend.bin", base64.StdEncoding.EncodeToString(raw)); !up.OK {
+		t.Fatalf("准备用例的上传失败: %s", up.Error)
+	}
+
+	got, _ := mustDownload(t, a, hostID, "/srv/noend.bin")
+	if string(got) != string(raw) {
+		t.Fatalf("抢救出的内容不符：期望 %q，实得 %q", raw, got)
+	}
+}
+
+// 载荷也不完整时必须报错，绝不悄悄收下残缺的块。
+//
+// 最阴险的形态：base64 在 4 字符边界上被截断 —— 仍然"合法"、仍然解得动，
+// 但只有前一半。抢救路径的长度闸门（解码长度 == 请求的块大小）就是
+// 防这道题的：不符即拒，报错里带上应传字节数。
+func TestDownloadRemoteFile_TruncatedChunkFails(t *testing.T) {
+	a, hostID, srv := newShellTestAppWithServer(t, vault.ModeManual, nil)
+
+	srv.SetDownloadMissingEnd(true)
+	srv.SetDownloadShortBody(true)
+	t.Cleanup(func() {
+		srv.SetDownloadMissingEnd(false)
+		srv.SetDownloadShortBody(false)
+	})
+
+	raw := []byte(strings.Repeat("x", 4096))
+	if up := a.UploadRemoteFile(hostID, "/srv", "short.bin", base64.StdEncoding.EncodeToString(raw)); !up.OK {
+		t.Fatalf("准备用例的上传失败: %s", up.Error)
+	}
+
+	dest, res, _ := doDownload(t, a, hostID, "/srv/short.bin")
+	if res.OK {
+		t.Fatal("载荷残缺的块必须报错，不能当成功处理")
+	}
+	if !strings.Contains(res.Error, "不完整") {
+		t.Fatalf("报错应说明输出不完整，实得 %q", res.Error)
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Fatalf("失败的下载不应留下半成品文件（%s）", dest)
 	}
 }
 
@@ -330,4 +517,98 @@ func hasEntry(entries []sshclient.FileEntry, name string) bool {
 		}
 	}
 	return false
+}
+
+// 分块下载必须逐块回报进度：这是进度条与速度显示的数据来源。
+//
+// 2.5 MiB 恰好横跨 ChunkSize=1 MiB 的三块边界（1M / 2M / 2.5M），
+// 一旦有人把 ChunkSize 调大导致退化成单块、或把分块逻辑改坏，
+// 这里的块数断言会立刻抓住。
+func TestDownloadRemoteFile_ReportsChunkedProgress(t *testing.T) {
+	a, hostID := newShellTestApp(t, vault.ModeManual, nil)
+
+	raw := []byte(strings.Repeat("x", 2*1024*1024+512*1024))
+	if up := a.UploadRemoteFile(hostID, "/srv", "big.bin", base64.StdEncoding.EncodeToString(raw)); !up.OK {
+		t.Fatalf("准备用例的上传失败: %s", up.Error)
+	}
+
+	dest, res, events := doDownload(t, a, hostID, "/srv/big.bin")
+	if !res.OK {
+		t.Fatalf("下载失败: %s", res.Error)
+	}
+	if !strings.Contains(res.Message, dest) && res.Message != dest {
+		t.Fatalf("成功结果应给出保存路径，实得 %q", res.Message)
+	}
+
+	wantChunks := (len(raw) + int(sshclient.ChunkSize) - 1) / int(sshclient.ChunkSize)
+	if len(events) != wantChunks {
+		t.Fatalf("应逐块回报 %d 次进度，实得 %d 次", wantChunks, len(events))
+	}
+	var last int64
+	for i, p := range events {
+		if p.Done <= last {
+			t.Fatalf("进度必须单调递增：第 %d 次 done=%d，上一次 %d", i, p.Done, last)
+		}
+		last = p.Done
+		if p.Total != int64(len(raw)) {
+			t.Fatalf("进度必须带总大小 %d，实得 %d", len(raw), p.Total)
+		}
+		if p.BPS <= 0 {
+			t.Fatalf("进度必须带正的速度，第 %d 次实得 %v", i, p.BPS)
+		}
+		if p.ID == "" || p.Name != "big.bin" || p.Dest != dest {
+			t.Fatalf("进度缺少 id/文件名/目标路径：%+v", p)
+		}
+	}
+	if last != int64(len(raw)) {
+		t.Fatalf("最后一块的 done 应等于总大小 %d，实得 %d", len(raw), last)
+	}
+
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("下载结果文件读不回来: %v", err)
+	}
+	if string(got) != string(raw) {
+		t.Fatalf("分块拼接内容不符：发出 %d 字节，收回 %d 字节", len(raw), len(got))
+	}
+}
+
+// 取消必须真的停下来，且半成品文件必须被删掉 ——
+// 用户按了取消之后屏幕上若留下一个「看起来完整」的残缺文件，
+// 它迟早会被拿去当真文件用。
+func TestDownloadRemoteFile_CancelStopsAndCleansUp(t *testing.T) {
+	a, hostID := newShellTestApp(t, vault.ModeManual, nil)
+
+	raw := []byte(strings.Repeat("x", 3*1024*1024))
+	if up := a.UploadRemoteFile(hostID, "/srv", "canc.bin", base64.StdEncoding.EncodeToString(raw)); !up.OK {
+		t.Fatalf("准备用例的上传失败: %s", up.Error)
+	}
+
+	dest := filepath.Join(t.TempDir(), "out.bin")
+	var events []FileTransferProgress
+	res := a.downloadTo(hostID, "/srv/canc.bin", dest, func(p FileTransferProgress) {
+		events = append(events, p)
+		// 收到第一次进度就取消：模拟用户盯着进度条点了「取消」。
+		a.CancelFileTransfer(p.ID)
+	})
+	if res.OK {
+		t.Fatal("取消后的下载不应报告成功")
+	}
+	if !strings.Contains(res.Error, "已取消") {
+		t.Fatalf("取消应有可读的报错，实得 %q", res.Error)
+	}
+	if len(events) < 1 {
+		t.Fatal("取消前至少应有一次进度回调")
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Fatalf("取消后必须清掉半成品文件（%s）", dest)
+	}
+}
+
+// 取消一个不存在的传输必须安全返回 false，而不是 panic 或误伤别的传输。
+func TestCancelFileTransfer_UnknownIDReturnsFalse(t *testing.T) {
+	a, _ := newShellTestApp(t, vault.ModeManual, nil)
+	if a.CancelFileTransfer("no-such-id") {
+		t.Fatal("不存在的传输 id 应返回 false")
+	}
 }
