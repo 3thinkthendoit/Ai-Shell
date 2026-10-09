@@ -107,6 +107,9 @@ function disposeTerm(key) {
     clearTimeout(pending)
     pendingResize.delete(key)
   }
+  // 副本-on-select 的防抖定时器也要停：实例已销毁，回调里的 terms.get 会落空，
+  // 虽然安全但会白跑一次；显式清掉更干净。
+  cancelCopyOnSelect(key)
   lastSentSize.delete(key)
   const t = terms.get(key)
   if (t) {
@@ -225,6 +228,70 @@ async function ensureTerm(hostId, sessionId) {
   // 用户按键 → 本地行编辑（见 onTermData）：常态下可打印字符本地回显、
   // 回车时分类；全屏程序接管或控制键则原样透传。不再是无脑逐字符进 PTY。
   term.onData(d => onTermData(key, d))
+
+  // 粘贴接线：xterm 本身**不处理剪贴板** —— Ctrl+V 会被浏览器/WebView2 先截走，
+  // 结果就是一个字节都进不了 onData，onTermData 里那个「多字符 = 粘贴」的分支
+  // 永远等不到输入（现象：Ctrl+V 毫无反应）。
+  //
+  // 所以这里必须自己接管按键：拦下键事件（返回 false 阻止 xterm 再处理），
+  // 异步读剪贴板后把整段文本喂进 onTermData —— 复用已有的分类逻辑：
+  // 含换行会逐行提交，纯命令走本地行编辑，全屏程序 / Agent 运行中由既有分支各自处置。
+  //
+  // 注意读剪贴板不能同步完成，所以 return false 是"这个键我接了"，
+  // 内容稍后到达；不拦住的话浏览器默认行为与我们的写入可能各干一遍。
+  term.attachCustomKeyEventHandler(e => {
+    if (e.type !== 'keydown') return true
+
+    // e.key 在合成事件/极端环境下可能缺失，统一取小写再比较，避免直接
+    // toLowerCase() 抛 TypeError（回调里抛异常会让整个按键链路失效）。
+    const k = (e.key || '').toLowerCase()
+
+    // 复制（优先级最高）：Ctrl+Shift+C 与 Ctrl+Insert。返回 false 阻止 xterm
+    // 继续把按键当输入处理，否则 Ctrl+Insert 会被解析成转义序列打进 PTY。
+    const isCopy = (e.ctrlKey && e.shiftKey && k === 'c') ||
+                   (e.ctrlKey && k === 'insert')
+    if (isCopy) {
+      e.preventDefault()
+      // 有选区就复制；没选区时什么都不做（不要清空剪贴板）。
+      void copySelection(key)
+      return false
+    }
+
+    // 裸 Ctrl+C 的语义修正：**有选区时复制，无选区时才发 SIGINT**。
+    // 这是所有正经终端（Windows Terminal / iTerm / Termius）的既定行为 ——
+    // 用户框选一段文字后下意识按 Ctrl+C，期待的是复制，不是打断远端程序。
+    // 无选区时返回 true 交给原有链路，\x03 照旧透传给 PTY，中断能力不受影响。
+    if (e.ctrlKey && !e.shiftKey && !e.altKey && k === 'c') {
+      const sel = term.getSelection ? term.getSelection() : ''
+      if (sel) {
+        e.preventDefault()
+        void copySelection(key)
+        return false
+      }
+      return true
+    }
+
+    const isPaste = (e.ctrlKey && !e.altKey && k === 'v') ||
+                    (e.shiftKey && k === 'insert')
+    if (!isPaste) return true
+    e.preventDefault()
+    // WebView2 下 readText 可能因权限被拒：静默失败，不要弹出未捕获的 rejection。
+    navigator.clipboard?.readText?.()
+      .then(text => { if (text) onTermData(key, text) })
+      .catch(() => {})
+    return false
+  })
+
+  // copy-on-select：拖选一松开就把选区写进剪贴板（防抖 60ms，避开拖动中途的
+  // 中间态）。选中后再按 Ctrl+C / Ctrl+Shift+C 也能复制，两条路并行不冲突。
+  if (term.onSelectionChange) {
+    term.onSelectionChange(() => {
+      const sel = term.getSelection ? term.getSelection() : ''
+      if (!sel) { cancelCopyOnSelect(key); return }
+      scheduleCopyOnSelect(key)
+    })
+  }
+
   // 尺寸变化 → 后端。少了这一步远端程序会一直按初始尺寸排版。
   term.onResize(({ cols, rows }) => {
     reportResize(key, hostId, sessionId, cols, rows)
@@ -864,28 +931,88 @@ const pendingCmd = computed(() => {
   return typeof raw === 'string' ? raw : JSON.stringify(raw ?? '', null, 2)
 })
 
+// writeClipboard 往系统剪贴板写文本，返回是否成功。
+//
+// 为什么不能只用 navigator.clipboard：WebView2 / WKWebView 下它需要页面处于
+// 「聚焦 + 安全上下文」，而终端场景里焦点在 xterm 的隐藏 textarea 上、事件又
+// 常在鼠标松开那一刻触发，writeText 会被拒绝。所以统一退回 execCommand。
+// 返回布尔值而不是吞掉异常：调用方要据此决定要不要给用户提示。
+async function writeClipboard(text) {
+  if (!text) return false
+  try {
+    await navigator.clipboard.writeText(text)
+    return true
+  } catch {
+    // 继续走下面的兜底
+  }
+  const ta = document.createElement('textarea')
+  ta.value = text
+  ta.setAttribute('readonly', '')
+  ta.style.position = 'fixed'
+  ta.style.left = '-9999px'
+  ta.style.opacity = '0'
+  document.body.appendChild(ta)
+  ta.select()
+  let ok = false
+  try { ok = document.execCommand('copy') } catch { ok = false }
+  ta.remove()
+  return ok
+}
+
 async function copyPendingCmd() {
   const text = pendingCmd.value
   if (!text) return
-  let ok = false
-  try {
-    await navigator.clipboard.writeText(text)
-    ok = true
-  } catch { ok = false }
-  if (!ok) {
-    // WKWebView 等环境下 clipboard API 可能不可用，退回 execCommand。
-    const ta = document.createElement('textarea')
-    ta.value = text
-    ta.style.position = 'fixed'
-    ta.style.opacity = '0'
-    document.body.appendChild(ta)
-    ta.select()
-    try { ok = document.execCommand('copy') } catch { ok = false }
-    ta.remove()
-  }
+  const ok = await writeClipboard(text)
   if (ok) {
     cmdCopied.value = true
     setTimeout(() => { cmdCopied.value = false }, 1500)
+  }
+}
+
+// ---- 终端框选复制（copy-on-select / Ctrl+Shift+C / Ctrl+Insert）----
+//
+// 为什么要自己接：xterm v6 默认 Canvas 渲染，文本是画布像素，浏览器原生框选
+// 选不到任何东西；Ctrl+C 又被 onTermData 当作 \x03 透传给 PTY（SIGINT）。
+// 但 xterm 自己维护了一份选区模型 —— term.getSelection() 与 DOM 渲染无关，
+// Canvas 下同样有效。所以拖选本身是**可用的**，缺的只是把选区接进剪贴板。
+//
+// copy-on-select 用防抖：拖动过程中选区每次变化都会触发 onSelectionChange，
+// 逐次写剪贴板会（a）狂调系统 API，（b）把中间态覆盖进剪贴板。抖完再写。
+
+const COPY_SELECT_DEBOUNCE_MS = 60
+const copyTimers = new Map()   // key -> timer
+
+// copySelection 把当前选区写进系统剪贴板，返回是否成功。
+//
+// 刻意**不往终端流里写任何反馈**：终端表面是命令流，插一行「已复制」会
+//   (a) 污染回滚内容（那行文字不是命令输出，却混在里面）；
+//   (b) 更糟 —— paintSystem 会先写 \r\n 把光标推到新行，而本地行编辑的
+//       t.line / t.startCol 并不知道光标被挪走了。用户打了一半命令时去复制，
+//       接着输入字符落在新行、退格却按旧列号定位，表现为擦错位置、字符乱跳。
+// 复制是高频动作，静默完成最稳妥；真要提示应走 UI 层（toast），不碰终端。
+async function copySelection(key) {
+  const t = terms.get(key)
+  if (!t) return false
+  const sel = t.term.getSelection ? t.term.getSelection() : ''
+  if (!sel) return false
+  return writeClipboard(sel)
+}
+
+function scheduleCopyOnSelect(key) {
+  const prev = copyTimers.get(key)
+  if (prev) clearTimeout(prev)
+  const timer = setTimeout(() => {
+    copyTimers.delete(key)
+    void copySelection(key)
+  }, COPY_SELECT_DEBOUNCE_MS)
+  copyTimers.set(key, timer)
+}
+
+function cancelCopyOnSelect(key) {
+  const prev = copyTimers.get(key)
+  if (prev) {
+    clearTimeout(prev)
+    copyTimers.delete(key)
   }
 }
 

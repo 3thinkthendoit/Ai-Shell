@@ -28,6 +28,11 @@ export class Terminal {
     // cursorX 是当前列。本地行编辑靠它做让路判定与擦除定位；
     // 测试里直接改这两个字段就能模拟「进了 vim」或「提示符占了几列」。
     this.buffer = { active: { type: 'normal', cursorX: 0, cursorY: 0 } }
+    // 选区服务（对应真 xterm 的 getSelection/onSelectionChange/clearSelection）。
+    // 组件用它做框选复制：真 xterm 在 Canvas 下也有这套模型，所以替身必须模拟出
+    // 「选区变了会通知、能取到选中文本」这两个行为，否则复制接线无从断言。
+    this.selection = ''
+    this.selectionHandlers = []
     instances.push(this)
   }
 
@@ -63,6 +68,20 @@ export class Terminal {
     this.customKeyHandler = fn
   }
 
+  onSelectionChange(fn) {
+    this.selectionHandlers.push(fn)
+    return { dispose() {} }
+  }
+
+  getSelection() {
+    return this.selection
+  }
+
+  clearSelection() {
+    this.selection = ''
+    for (const fn of this.selectionHandlers) fn()
+  }
+
   dispose() {
     this.disposed = true
   }
@@ -74,11 +93,25 @@ export class Terminal {
     for (const fn of this.dataHandlers) fn(s)
   }
 
+  // emitKey 模拟用户按下按键交给自定义处理器。
+  // 返回 handler 的判定值（true=放行给 xterm，false=组件自己接管了）。
+  // 没有注册 handler 时返回 true，与真实 xterm 的默认行为一致。
+  emitKey(e) {
+    if (!this.customKeyHandler) return true
+    return this.customKeyHandler(e)
+  }
+
   // emitResize 模拟终端尺寸变化。
   emitResize(cols, rows) {
     this.cols = cols
     this.rows = rows
     for (const fn of this.resizeHandlers) fn({ cols, rows })
+  }
+
+  // emitSelection 模拟用户拖选/取消选中：改选区文本并通知所有监听者。
+  emitSelection(text) {
+    this.selection = text
+    for (const fn of this.selectionHandlers) fn()
   }
 
   // text 把收到的内容拼成字符串，便于断言「用户看到了什么」。

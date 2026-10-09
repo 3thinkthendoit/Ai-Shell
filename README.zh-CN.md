@@ -72,7 +72,27 @@ wails dev
 wails build
 ```
 
-产物在 `build/bin/`（已被 git 忽略）。
+### Windows 一键打包
+
+命令行跑直接可用的脚本（不受 PowerShell Execution Policy 限制）：
+
+```bat
+scripts\build.bat          :: 只打包
+scripts\build.bat run      :: 打包并启动
+scripts\build.bat dev      :: 热重载开发
+```
+
+也可以双击 `scripts\build.bat`，或使用 PowerShell 版本：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build.ps1
+```
+
+两个脚本都会自动补齐 `wails` CLI 与前端依赖，最终执行
+`wails build -clean -trimpath -webview2 embed`。`-webview2 embed` 会内嵌
+WebView2 bootstrapper，目标机没装 WebView2 也能运行。
+
+产物在 `build/bin/`（已被 git 忽略），单文件绿色版，直接拷 `Ai-Shell.exe` 即可。
 
 ## 测试
 

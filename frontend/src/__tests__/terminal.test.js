@@ -169,6 +169,46 @@ function callsOf(name) {
   return calls.filter(c => c.name === name)
 }
 
+// keyEvent 造一个按键事件对象。组件里会调 preventDefault（拦下浏览器默认行为），
+// 所以替身必须提供这个方法，否则组件会抛 TypeError。
+function keyEvent(key, mods = {}) {
+  return { type: 'keydown', key, preventDefault() {}, ...mods }
+}
+
+// withClipboard 给 navigator.clipboard 装上 readText 替身。
+// jsdom 里没有这个 API（也就没有权限模型），组件又必须能读到文本才能粘贴，
+// 所以这里自己造一个。第二个参数传入 Error 即模拟「权限被拒」。
+let origClipboard
+function withClipboard(text, err) {
+  origClipboard = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
+  Object.defineProperty(navigator, 'clipboard', {
+    configurable: true,
+    value: { readText: () => (err ? Promise.reject(err) : Promise.resolve(text)) }
+  })
+}
+
+afterEach(() => {
+  if (origClipboard) Object.defineProperty(navigator, 'clipboard', origClipboard)
+  else delete navigator.clipboard
+  origClipboard = undefined
+})
+
+// withWriteClipboard 给 navigator.clipboard 装上 writeText 替身，并把写进去的
+// 文本记在返回对象上。复制/粘贴用的是两个不同的 API，得分开造 —— 只装 readText
+// 时 writeText 不存在，组件会一路退到 execCommand 兜底（jsdom 里也多半失败）。
+function withWriteClipboard() {
+  const box = { text: '' }
+  origClipboard = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
+  Object.defineProperty(navigator, 'clipboard', {
+    configurable: true,
+    value: {
+      readText: () => Promise.resolve(''),
+      writeText: t => { box.text = t; return Promise.resolve() }
+    }
+  })
+  return box
+}
+
 // selectHost 通过 UiSelect（自绘下拉）切换目标主机。
 // 原生 select 已被替换：触发器是按钮，选项是列表项，不能用 setValue。
 async function selectHost(id) {
@@ -942,6 +982,176 @@ describe('终端内直接输入自然语言', () => {
     await flushPromises()
     const run = callsOf('RunShellInTerminal')
     expect(run.map(c => c.args[2])).toEqual(['ls', 'pwd'])
+  })
+
+  // ---- Ctrl+V 粘贴接线 ----
+  //
+  // xterm 不碰剪贴板：Ctrl+V 会被浏览器先截走，一个字节都到不了 onData。
+  // 所以组件用 attachCustomKeyEventHandler 自己接管，读剪贴板后喂给 onTermData。
+
+  it('Ctrl+V 拦下按键并读剪贴板，内容进本地行缓冲', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
+    withClipboard('ls -la')
+    const handled = inst.emitKey(keyEvent('v', { ctrlKey: true }))
+    await flushPromises()
+    // 返回 false = 组件接管了这个键，不让 xterm 再处理。
+    expect(handled).toBe(false)
+    // 粘贴的整段命令留在本地缓冲，回车前不发给远端。
+    expect(callsOf('RunShellInTerminal').length).toBe(0)
+    inst.emitData('\r')
+    await flushPromises()
+    expect(callsOf('RunShellInTerminal')[0].args[2]).toBe('ls -la')
+  })
+
+  it('Shift+Insert 同样触发粘贴', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
+    withClipboard('pwd')
+    const handled = inst.emitKey(keyEvent('Insert', { shiftKey: true }))
+    await flushPromises()
+    expect(handled).toBe(false)
+    inst.emitData('\r')
+    await flushPromises()
+    expect(callsOf('RunShellInTerminal')[0].args[2]).toBe('pwd')
+  })
+
+  it('普通按键放行给 xterm（不被粘贴逻辑吃掉）', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    expect(inst.emitKey(keyEvent('v'))).toBe(true)
+    expect(inst.emitKey(keyEvent('a', { ctrlKey: true }))).toBe(true)
+    // keyup 不处理，避免一次按键读两遍剪贴板。
+    expect(inst.emitKey({ type: 'keyup', key: 'v', ctrlKey: true })).toBe(true)
+  })
+
+  // ---- 框选复制：copy-on-select / Ctrl+Shift+C / Ctrl+Insert ----
+  //
+  // 背景：xterm 默认 Canvas 渲染，文本是画布像素，浏览器原生框选选不到东西；
+  // 且 xterm.css 在 .xterm 上设了 user-select:none。所以复制只能走 xterm 自己的
+  // 选区模型（getSelection / onSelectionChange）。下面钉的就是这条接线。
+
+  it('拖选后自动复制（copy-on-select）', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    const copied = withWriteClipboard()
+    inst.emitSelection('ls -la\ntotal 0')
+    // 防抖后才写剪贴板。
+    await vi.waitFor(() => expect(copied.text).toBe('ls -la\ntotal 0'))
+  })
+
+  it('取消选中不写剪贴板（防抖被撤销）', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    const copied = withWriteClipboard()
+    inst.emitSelection('some text')
+    // 还没到防抖窗口就取消选中：应把待执行的复制撤掉。
+    inst.emitSelection('')
+    await new Promise(r => setTimeout(r, 120))
+    expect(copied.text).toBe('')
+  })
+
+  it('Ctrl+Shift+C 复制选区并返回 false（不让 xterm 处理）', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    const copied = withWriteClipboard()
+    inst.selection = 'docker ps'
+    const handled = inst.emitKey(keyEvent('C', { ctrlKey: true, shiftKey: true }))
+    expect(handled).toBe(false)
+    await vi.waitFor(() => expect(copied.text).toBe('docker ps'))
+  })
+
+  it('Ctrl+Insert 同样复制选区', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    const copied = withWriteClipboard()
+    inst.selection = 'uptime'
+    expect(inst.emitKey(keyEvent('Insert', { ctrlKey: true }))).toBe(false)
+    await vi.waitFor(() => expect(copied.text).toBe('uptime'))
+  })
+
+  it('无选区时裸 Ctrl+C 放行（仍是 SIGINT，不被复制逻辑吃掉）', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    const copied = withWriteClipboard()
+    // 没有选区：Ctrl+C 必须继续走原来的 \x03 透传链路。
+    expect(inst.emitKey(keyEvent('c', { ctrlKey: true }))).toBe(true)
+    expect(copied.text).toBe('')
+  })
+
+  it('有选区时裸 Ctrl+C 改为复制（不再发 SIGINT）', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    const copied = withWriteClipboard()
+    inst.selection = 'rm -rf /tmp/x'
+    clearSurface()
+    const handled = inst.emitKey(keyEvent('c', { ctrlKey: true }))
+    expect(handled).toBe(false)
+    await vi.waitFor(() => expect(copied.text).toBe('rm -rf /tmp/x'))
+    // 复制分支不得把 \x03 打进 PTY。
+    expect(callsOf('WriteTerminal').length).toBe(0)
+  })
+
+  it('复制不往终端流写任何字节（否则会冲掉正在编辑的输入行）', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    const copied = withWriteClipboard()
+    // 回归点：早先的实现会在复制后用 paintSystem 在终端里闪一行「已复制 N 个字符」，
+    // 而 paintSystem 先写 \r\n 把光标推到新行，本地行编辑的 t.line / t.startCol 却
+    // 不知道光标被挪走了 —— 用户打了一半命令时复制，接着输入字符落在新行、退格
+    // 却按旧列号定位，表现为擦错位置。复制必须静默。
+    //
+    // 只比较复制前后的增量，不断言整个流为空：终端本身可能因别的异步链路
+    // （上一条用例跑过 shell 命令，静默 400ms 后画「问 LLM」提示）在后台写入，
+    // 那不归复制负责。
+    const before = inst.written.length
+    inst.selection = 'docker ps'
+    inst.emitKey(keyEvent('C', { ctrlKey: true, shiftKey: true }))
+    // 等到剪贴板真的被写入，证明显式复制这条路确实跑完了。
+    await vi.waitFor(() => expect(copied.text).toBe('docker ps'))
+    // 剪贴板写入是 async 的，任何随之而来的终端写入都排在它之后 —— 多等一轮
+    // 宏任务，确保「若实现真的画了提示」已经落进 written，断言才抓得到。
+    await new Promise(r => setTimeout(r, 50))
+    const extra = inst.written.slice(before).join('')
+    // 复制本身不得产生任何终端输出（尤其不得是「已复制」这类提示）。
+    expect(extra).not.toContain('已复制')
+    expect(extra).not.toContain('想分析这段输出')
+  })
+
+  it('剪贴板被拒时不抛异常、不写出任何字节', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
+    // WebView2 下 readText 可能因权限被拒。
+    withClipboard(null, new Error('denied'))
+    expect(inst.emitKey(keyEvent('v', { ctrlKey: true }))).toBe(false)
+    await flushPromises()
+    expect(callsOf('WriteTerminal').length).toBe(0)
+    expect(callsOf('RunShellInTerminal').length).toBe(0)
   })
 
   it('连敲回车串行提交（不并发 runShellInTerminal）', async () => {

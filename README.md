@@ -72,7 +72,29 @@ wails dev
 wails build
 ```
 
-The binary is written under `build/bin/` (ignored by git).
+### One-command build on Windows
+
+A cmd batch script that runs without any PowerShell Execution Policy hassle:
+
+```bat
+scripts\build.bat          :: build only
+scripts\build.bat run      :: build and launch
+scripts\build.bat dev      :: dev mode (hot reload)
+```
+
+You can also double-click `scripts\build.bat`, or use the PowerShell variant:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build.ps1
+```
+
+Both scripts install the `wails` CLI and frontend deps if missing, then run
+`wails build -clean -trimpath -webview2 embed`. The `-webview2 embed` flag
+bundles the WebView2 bootstrapper so the app still runs on machines without
+WebView2 installed.
+
+The binary is written under `build/bin/` (ignored by git) as a single
+self-contained exe — just copy `Ai-Shell.exe` and ship it.
 
 ## Tests
 
