@@ -1,6 +1,11 @@
 import { nextTick, ref } from 'vue'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
+// xterm 的布局契约全在这张样式表里（隐藏输入捕获 textarea、行/格对齐、
+// 视口滚动裁剪）。谁创建 Terminal 实例谁负责带它 —— 重构拆文件时曾把它
+// 留在旧 ConsolePanel 里一起删掉，控制台立刻塌成裸 DOM（顶部冒出可见的
+// 输入框与错位乱码行）。放在这里，再拆模块也不会丢。
+import '@xterm/xterm/css/xterm.css'
 import { TERM_THEMES, currentTermTheme } from '../termTheme.js'
 import * as paint from '../termPaint.js'
 import { bucketKey, termState, openTerminal, resizeTerminal, writeTerminal, textToBase64 } from '../store.js'
