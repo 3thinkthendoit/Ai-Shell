@@ -451,7 +451,7 @@ function liveAssistant(step) {
 const EV_NAMES = [
   'agent:delta', 'agent:message', 'agent:reasoning', 'agent:tool', 'agent:toolResult',
   'agent:injection', 'agent:approval', 'approval:expired', 'agent:status', 'agent:error',
-  'audit:error', 'agent:done', 'term:data', 'term:exit', 'term:tui', 'term:cwd', 'agent:snapshot',
+  'audit:error', 'agent:done', 'term:data', 'term:exit', 'term:tui', 'term:cmd', 'term:cwd', 'agent:snapshot',
   'fm:transfer', 'agent:transfer'
 ]
 
@@ -738,6 +738,17 @@ export function bindEvents() {
     if (st) st.tuiActive = !!(d && d.active)
   })
 
+  // 远端是否有一条命令正在跑（OSC 133;C..D 之间）。后端只在状态**变化**时发。
+  //
+  // 前端据此把按键让给正在等输入的程序：bt 菜单、read、REPL、sudo 口令这类
+  // **非全屏**的交互程序没有别的让路信号，只能靠这一档 —— 漏掉时用户答菜单
+  // 的 `14` 会被本地行编辑按「数字编号回复」路由给 LLM（截图 bug：表面画出
+  // `Ai-Shell > 14` + `Working...`，而菜单一直等不到输入）。
+  r.EventsOn('term:cmd', d => {
+    const st = termState(d && d.hostId, d && d.sessionId)
+    if (st) st.cmdActive = !!(d && d.active)
+  })
+
   // 远端 shell 的当前目录（来自 OSC 7）。后端只在目录**变化**时发。
   //
   // 这是文件管理弹窗「默认定位到当前控制台目录」的数据来源：目录状态住在
@@ -799,6 +810,11 @@ export function bindEvents() {
     if (!st || (st.status !== 'open' && st.status !== 'opening')) return
     st.status = 'closed'
     st.exitReason = (d && d.reason) || '终端已结束'
+    // 终端已经没了，输入态必须跟着归零：后端此后不再有任何屏幕事件，
+    // 残留的 cmdActive/tuiActive 会把按键继续透传给一条死掉的通道
+    // （表现为「敲什么都没反应、也不报错」）。
+    st.cmdActive = false
+    st.tuiActive = false
   })
 
   // 终端屏幕快照：模型看的那份净化后文本，原样落一条给人看 ——
@@ -1133,12 +1149,22 @@ export async function runShellInTerminal(hostId, sessionId, command) {
     // 回显与输出还在路上，此时画提示会插到输出前面（见 afterTermQuiet 注释）。
     // 裁决说明同理 —— 它说的是「这条命令的结果如何」，显然该排在结果后面。
     if (res.status === 'done') {
-      afterTermQuiet(hostId, sessionId, () => {
+      // 「命令跑完」不能只看输出静默：交互式命令（bt 菜单/read/REPL）在
+      // **等输入**时输出同样是停的 —— 静默一到就画，提示会插进程序界面里
+      // （bt 菜单里会挂在 "Please enter command number:" 后面），长命令的
+      // 输出间隙也会被误判成结束。命令还在跑（term:cmd，OSC 133;C..D）
+      // 就再等一轮静默，直到真的回到提示符。
+      const afterDone = () => {
+        if (termState(hostId, sessionId).cmdActive) {
+          afterTermQuiet(hostId, sessionId, afterDone)
+          return
+        }
         paint.paintShellVerdict(surfaceWrite(key), res)
         // 「可交给 LLM 分析」的提示由**组件**画：占位符要贴在提示符后面，
         // 起点列只有组件读得到（xterm 光标位置），store 只有 write 函数。
         fireLLMHint(hostId, sessionId)
-      })
+      }
+      afterTermQuiet(hostId, sessionId, afterDone)
     } else {
       paint.paintShellVerdict(surfaceWrite(key), res)
     }
@@ -1252,7 +1278,13 @@ export function unregisterTermSink(hostId, sessionId, fn) {
 export function termState(hostId, sessionId) {
   const key = bucketKey(hostId, sessionId)
   if (!store.terms[key]) {
-    store.terms[key] = { status: 'idle', error: '', exitReason: '' }
+    // tuiActive / cmdActive 是两块「输入让路」信号（全屏接管 / 命令运行中），
+    // 由 term:tui / term:cmd 事件更新。初值必须在场：读到它们的地方不该
+    // 依赖 undefined 的 falsy 语义。
+    store.terms[key] = {
+      status: 'idle', error: '', exitReason: '',
+      tuiActive: false, cmdActive: false
+    }
   }
   return store.terms[key]
 }
@@ -1635,6 +1667,11 @@ export async function closeTerminal(hostId, sessionId) {
     st.status = 'idle'
     st.exitReason = ''
     st.error = ''
+    // 输入态一并归零。不能等 term:exit：那条事件到达时状态已是 idle，
+    // 会被上面的守卫跳过 —— 残留的 cmdActive/tuiActive 会让重开后的按键
+    // 一直走透传，本地行编辑「再也回不来」。
+    st.cmdActive = false
+    st.tuiActive = false
   }
   return ok
 }

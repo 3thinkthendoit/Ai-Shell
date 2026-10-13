@@ -606,6 +606,27 @@ describe('ConsolePanel 表面渲染', () => {
     expect(store.running).toBe(false)
   })
 
+  // 与上一条互补：命令被交接进常驻终端后（如 agent 跑 top 失败 → 把原命令
+  // 写进那块 PTY 给人操作），它随时可能等输入 —— 此时按键必须给命令，即使
+  // agent 回合还没收尾。Ctrl-C 同理：SIGINT 属于前台那条命令，不是中断回合
+  // （回合由工具条的「中断」按钮停）。
+  it('命令交接进终端后（term:cmd active）：按键给命令、可立即操作', async () => {
+    await setupAttached()
+    const term = instances[0]
+    await ask('看看负载')
+    await nextTick()
+    // 后端推来「有命令正在跑」：交接的交互程序开始等输入。
+    rt.emit('term:cmd', { hostId: 'h1', active: true })
+    await nextTick()
+    term.emitData('q')
+    term.emitData('\x03')
+    await flushPromises()
+    const wt = calls.filter(c => c.name === 'WriteTerminal')
+    expect(wt.map(c => c.args[2])).toEqual([textToBase64('q'), textToBase64('\x03')])
+    // Ctrl-C 没有变成「中断 agent 回合」。
+    expect(calls.filter(c => c.name === 'Stop')).toHaveLength(0)
+  })
+
   it('回合结束时不再重复补输入提示符（已有合成提示符就跳过）', async () => {
     await setupAttached()
     await ask('本机 docker 正常么')

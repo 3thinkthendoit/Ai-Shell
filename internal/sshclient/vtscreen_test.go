@@ -247,6 +247,51 @@ func TestScreenInTUI(t *testing.T) {
 	}
 }
 
+// CmdActive 是前端「命令运行中输入归命令」的后端信号（OSC 133;C..D）。
+//
+// 与 InTUI 分开锁：非全屏的交互程序（bt 菜单/read/REPL/sudo 口令）不发备用
+// 屏幕、也不重绘，只能靠这一档让路 —— 漏掉时用户答菜单的 `14` 会被本地
+// 行编辑当「数字编号回复」路由给 LLM，而菜单一直等不到输入（截图 bug）。
+func TestScreenCmdActive(t *testing.T) {
+	s := NewScreen(20, 3)
+	if s.CmdActive() {
+		t.Fatal("空屏幕不该判为命令运行中")
+	}
+
+	s.Feed([]byte("\x1b]133;C\x07")) // 命令开始
+	if !s.CmdActive() {
+		t.Fatal("133;C 后应报告命令运行中")
+	}
+	// 命令期间的普通输出（菜单文本）不改变状态 —— bt 菜单既不重绘也不切屏。
+	s.Feed([]byte("Please enter command number: "))
+	if !s.CmdActive() {
+		t.Fatal("命令期间的普通输出不该让出")
+	}
+	s.Feed([]byte("\x1b]133;D;0\x07")) // 命令结束（带退出码）
+	if s.CmdActive() {
+		t.Fatal("133;D 后应让出")
+	}
+
+	// 无配对 133;C 的 133;D 忽略（注入期首屏可能出现）；重复 133;C 只算一次。
+	s.Feed([]byte("\x1b]133;D\x07"))
+	if s.CmdActive() {
+		t.Fatal("无配对 133;C 的 133;D 不该改变状态")
+	}
+	s.Feed([]byte("\x1b]133;C\x07"))
+	s.Feed([]byte("\x1b]133;C\x07"))
+	s.Feed([]byte("\x1b]133;D\x07"))
+	if s.CmdActive() {
+		t.Fatal("重复 133;C 之后一个 133;D 也应让出")
+	}
+
+	// 备用屏幕本身不是「命令运行中」——那是 InTUI 的档位，两档信号分开。
+	alt := NewScreen(20, 3)
+	alt.Feed([]byte("\x1b[?1049h"))
+	if alt.CmdActive() {
+		t.Fatal("只有备用屏幕（没有命令边界）不该判为命令运行中")
+	}
+}
+
 // OSC 7 是远端 shell 上报当前目录的标准序列，也是文件管理弹窗
 // 「默认定位到控制台当前目录」的唯一数据来源。这里锁死三件事：
 // 解析正确、不污染屏幕、以及含转义字符的路径能还原。

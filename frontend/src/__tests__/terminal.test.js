@@ -16,6 +16,7 @@ import ConsolePanel from '../components/ConsolePanel.vue'
 import {
   store,
   bindEvents,
+  bucketKey,
   bytesToBase64,
   base64ToBytes,
   textToBase64
@@ -804,6 +805,36 @@ describe('欢迎引导', () => {
       vi.useRealTimers()
     }
   })
+
+  it('命令运行中（term:cmd active）不画：避免插进正在等输入的程序界面', async () => {
+    vi.useFakeTimers()
+    try {
+      withHost()
+      setup()
+      await vi.advanceTimersByTimeAsync(0)
+      await attached()
+      // 用户先跑起 bt（菜单在等输入）：无论引导定时器到点，还是从归档切回，
+      // 都不能把提示画进菜单界面里。
+      rt.emit('term:cmd', { hostId: 'h1', active: true })
+      await flushPromises()
+      await toArchive()
+      await toSurface()
+      await vi.advanceTimersByTimeAsync(1000)
+      await nextTick()
+      expect(instances[0].text()).not.toContain('自然语言')
+
+      // 命令结束、回到提示符：再切回时正常提示。
+      rt.emit('term:cmd', { hostId: 'h1', active: false })
+      await flushPromises()
+      await toArchive()
+      await toSurface()
+      await vi.advanceTimersByTimeAsync(1000)
+      await nextTick()
+      expect(instances[0].text()).toContain('自然语言')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })
 
 // ---- 终端内直接输入（本地行编辑 + 回车分类）----
@@ -1230,5 +1261,95 @@ describe('终端内直接输入自然语言', () => {
     // '中' 占 2 列 → 覆盖 2 个空格；startCol=0 → 定位第 1 列；同样带 SGR 复位。
     expect(inst.text()).toContain('\r\x1b[1G\x1b[0m  \x1b[0m\r\x1b[1G')
     await flushPromises()
+  })
+})
+
+// ---- 命令运行中（OSC 133 命令边界）：输入归命令，不进 Agent ----
+//
+// 回归背景（用户截图）：`bt` 的 aaPanel 菜单在等输入（"Please enter command
+// number:"），用户答 `14` —— 却被本地行编辑按「数字编号回复」路由给了 Agent：
+// 表面画出 `Ai-Shell > 14` + `Working...`（LLM 在跑），而菜单一直等不到输入。
+// 根因：只有「全屏程序」会让路，非全屏的交互命令（菜单/read/REPL/sudo 口令）
+// 没有让路信号。后端现在按 OSC 133;C..D 推 term:cmd，前端据此把**所有**按键
+// 原样透传给 PTY。
+describe('命令运行中 输入归命令', () => {
+  const decode = c => new TextDecoder().decode(base64ToBytes(c.args[2]))
+
+  it('菜单等输入时：按键与回车都原样透传，`14` 不进 Agent、不进本地缓冲', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
+
+    // 命令跑起来了（133;C 与 133;D 之间）—— bt 菜单在等输入。
+    rt.emit('term:cmd', { hostId: 'h1', active: true })
+    await flushPromises()
+
+    inst.emitData('1')
+    inst.emitData('4')
+    inst.emitData('\r')
+    await flushPromises()
+
+    // 每个按键原样写进 PTY（不被攒进本地缓冲，也不被拆改）。
+    expect(callsOf('WriteTerminal').map(decode)).toEqual(['1', '4', '\r'])
+    // 关键断言：`14` 没有被当自然语言发给 LLM（截图 bug 的直接复现点），
+    // 也没有走 shell 提交通道 —— 它就是菜单程序的输入。
+    expect(callsOf('Ask').length).toBe(0)
+    expect(callsOf('RunShellInTerminal').length).toBe(0)
+  })
+
+  it('运行期间整段到达（粘贴）也整体透传，不拆行、不进本地缓冲', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
+    rt.emit('term:cmd', { hostId: 'h1', active: true })
+    await flushPromises()
+
+    inst.emitData('14\r') // 一次到达的多字符（粘贴）
+    await flushPromises()
+
+    const wt = callsOf('WriteTerminal')
+    expect(wt.length).toBe(1)
+    expect(decode(wt[0])).toBe('14\r')
+  })
+
+  it('命令结束（active=false）恢复本地行编辑：可打印字符不再写 PTY', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
+    rt.emit('term:cmd', { hostId: 'h1', active: true })
+    await flushPromises()
+    inst.emitData('q')
+    await flushPromises()
+    expect(callsOf('WriteTerminal').length).toBe(1)
+
+    // 命令退出、回到提示符：输入恢复「本地行编辑 + 回车分流」。
+    rt.emit('term:cmd', { hostId: 'h1', active: false })
+    await flushPromises()
+    clearSurface()
+    inst.emitData('l')
+    await flushPromises()
+    expect(callsOf('WriteTerminal').length).toBe(1) // 不再透传
+    expect(inst.text()).toContain('l')               // 本地回显
+  })
+
+  it('关闭终端后输入态归零：重开不会继续把按键透传出去', async () => {
+    withHost()
+    setup()
+    await attached()
+    rt.emit('term:cmd', { hostId: 'h1', active: true })
+    await flushPromises()
+    expect(store.terms[bucketKey('h1', 'default')].cmdActive).toBe(true)
+
+    // 自己点关闭：closeTerminal 会把输入态一并归零（term:exit 到达时
+    // 状态已是 idle、会被守卫跳过，不能指望它）。
+    await wrapper.find('.sess-banner button').trigger('click')
+    await flushPromises()
+    expect(store.terms[bucketKey('h1', 'default')].cmdActive).toBe(false)
   })
 })

@@ -421,7 +421,9 @@ function paintWelcomeHintIfNeeded(key, force = false) {
   // 占位符只该在「空提示符、没有本地缓冲」时出现：用户已经打了一半字再切回
   // 归档，回来时把那半行盖掉会很突兀。
   if (t.line || t.passthrough || t.lineSynthetic) return
-  if (isFullscreen(key)) return
+  // 全屏接管、命令运行中都不画：屏幕此刻不是「空提示符」，提示会插进正在
+  // 等输入的程序界面里（bt 菜单、REPL 提示行）。
+  if (isFullscreen(key) || isCmdRunning(key)) return
   // 提示符末尾的列号必须**在写占位符之前**取。
   // 写占位符的最后一步是 ESC[<n>G（把光标移到提示文字起点），真实 xterm 会
   // 因此把 cursorX 改掉 —— 事后再读就拿到提示文字的位置了，擦除会从错误的
@@ -450,6 +452,18 @@ function isFullscreen(key) {
   // 经 term:tui 推来的 tuiActive 才能识别 —— 两条都得认，否则 top 里敲
   // q 会被本地行编辑吞掉。
   return !!t && !!termState(t.hostId, t.sessionId).tuiActive
+}
+
+// isCmdRunning 报告该表面是否有一条命令正在跑（后端 VT 模型从 OSC 133
+// 命令边界推来，见 store 的 term:cmd）。
+//
+// 与 isFullscreen 分开、而不是合并：这个不要求全屏 —— bt 菜单、read、
+// REPL、sudo 口令这类普通交互程序也算，它们同样随时会读 stdin，输入必须
+// 归它们。合并会误伤：全屏判定还用于「丢弃本地半行」等只该在真全屏发生
+// 的场景，而命令运行中不该做那些。
+function isCmdRunning(key) {
+  const t = terms.get(key)
+  return !!t && !!termState(t.hostId, t.sessionId).cmdActive
 }
 
 function cursorCol(t) {
@@ -568,6 +582,27 @@ function onTermData(key, d) {
   const t = terms.get(key)
   if (!t) return
   const send = s => writeTerminal(t.hostId, t.sessionId, s)
+
+  // 命令运行中（OSC 133;C..D 之间，见 store 的 term:cmd）：输入归命令，
+  // 所有按键原样透传给 PTY。
+  //
+  // 放在最前面（在 agent 吞键与本地行编辑之前）：命令在跑时按键属于**那条
+  // 命令** —— 不归 Agent（它的程序正等着这个输入），也不进本地缓冲（用户答
+  // `bt` 菜单的 `14` 被攒下来、回车时按「数字编号回复」路由给 LLM，就是截图
+  // 里的 bug：表面画出 `Ai-Shell > 14` + `Working...`，而菜单一直等不到输入）。
+  // 非全屏的交互程序全在这一档；全屏程序另有 isFullscreen 覆盖（两者都为真
+  // 时先到这里，效果同样是透传）。
+  //
+  // 为什么不先判断「程序是不是真的在等输入」：判断不出来（tty 不暴露读端
+  // 状态），而且真实终端的语义就是「命令运行期间键入都进那条 tty」—— 不猜。
+  // Ctrl-C 在这里同样透传：SIGINT 属于前台那条命令，不是中断 Agent 回合
+  // （回合要靠工具条的「中断」按钮停）。
+  if (isCmdRunning(key)) {
+    clearWelcomeHint(t)
+    clearLLMHint(t)
+    send(textToBase64(d))
+    return
+  }
 
   // agent 正在跑：此刻的按键不属于任何命令行，**必须丢掉**。
   //

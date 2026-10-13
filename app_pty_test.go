@@ -315,6 +315,22 @@ func TestCloseTerminalActuallyEndsSession(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("关闭之后终端应当结束（远端 shell 收到挂断）")
 	}
+	// 等 onExit 的审计写入落盘再收尾。
+	//
+	// Done() 只表示会话结束：pty.finish() 先 close(done)、**之后**才执行 onExit
+	// 回调（含「交互终端已结束」这条审计写入）。若在 Done() 后立即返回，
+	// t.TempDir 的清理就会与那次写入竞态 —— Windows 上表现为
+	// 「RemoveAll ... The directory is not empty」（audit.log 正被写入/重建），
+	// 实测约 4/10 概率触发。等审计条目真的可见（= 写入完成、句柄已关）再返回。
+	// （不去改 finish() 的次序：Done() 的契约是「会话结束」，不是「回调跑完」。）
+	waitForTerm(t, "退出审计落盘", func() bool {
+		for _, e := range a.ListAudit(0).Entries {
+			if e.Kind == audit.KindTerminal && strings.Contains(e.Note, "交互终端已结束") {
+				return true
+			}
+		}
+		return false
+	})
 	if p.Resize(sshclient.TerminalSize{Cols: 80, Rows: 24}) == nil {
 		t.Error("关闭之后调整尺寸应当报错")
 	}

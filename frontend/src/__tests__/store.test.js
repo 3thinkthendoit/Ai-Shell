@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import {
   store, push, clearLog, clearSession, bootstrap, refreshHosts, refreshSessions, bindEvents,
   ask, approve, stop, dismissAuditError, bucketKey,
-  runShellInTerminal, reportActiveSession, selectSession,
+  runShellInTerminal, reportActiveSession, selectSession, closeTerminal, termState,
   registerTermSink, unregisterTermSink, registerLLMHint, textToBase64, bytesToBase64
 } from '../store.js'
 
@@ -103,6 +103,7 @@ function resetStore() {
   // 复位必须清它 —— 给 entries 赋值会失败，因为它是只读的 getter。
   store.bySession = {}
   store.sessions = {}
+  store.terms = {}
   store.currentSessionId = ''
   store.activeHostId = ''
   store.activeSessionId = ''
@@ -1265,6 +1266,34 @@ describe('runShellInTerminal 常驻终端 shell 通道', () => {
     }
   })
 
+  it('命令还在跑（term:cmd active）时提示不落：等它真结束再触发', async () => {
+    vi.useFakeTimers()
+    try {
+      const { app } = makeApp({ RunShellInTerminal: async () => ({ status: 'done' }) })
+      install({ runtime: rt, app })
+      bindEvents() // 挂上 term:cmd 监听：运行态来自后端事件
+      store.currentHostId = 'h1'
+      const hintCalls = []
+      const unregister = registerLLMHint('h1', 's1', () => hintCalls.push(1))
+      await runShellInTerminal('h1', 's1', 'bt')
+
+      // 命令跑起来了（133;C..D 之间）：菜单在等输入，输出是静默的 ——
+      // 静默检测不能把它当成「跑完」，否则提示会插进菜单界面里
+      // （bt 菜单的 "Please enter command number:" 后面）。
+      rt.emit('term:cmd', { hostId: 'h1', sessionId: 's1', active: true })
+      await vi.advanceTimersByTimeAsync(500)
+      expect(hintCalls).toHaveLength(0)
+
+      // 用户答完菜单、命令退出（133;D）：下一轮静默后提示才落。
+      rt.emit('term:cmd', { hostId: 'h1', sessionId: 's1', active: false })
+      await vi.advanceTimersByTimeAsync(500)
+      expect(hintCalls).toHaveLength(1)
+      unregister()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('被策略拒绝：在表面上说明原因，并清掉可能挂着的过期审批条', async () => {
     const { app } = makeApp({ RunShellInTerminal: async () => ({ status: 'denied', reason: 'rm -rf 属于高危命令' }) })
     install({ runtime: rt, app })
@@ -1369,3 +1398,43 @@ describe('护栏：shell 命令不得进入 agent 模式', () => {
   })
 })
 
+
+// ---- term:cmd：命令运行态（OSC 133 命令边界）----
+//
+// 后端在命令开始/结束（133;C / 133;D）时推 term:cmd，前端记在 termState 上，
+// 供「终端内直接输入」把按键让给正在等输入的程序。终端退出/关闭后必须归零：
+// 残留的 true 会把按键继续透传给一条死掉的通道。
+describe('term:cmd 命令运行态', () => {
+  it('active 变化更新 cmdActive；term:exit 归零', () => {
+    install({ runtime: rt, app: makeApp().app })
+    bindEvents()
+
+    rt.emit('term:cmd', { hostId: 'h1', sessionId: 's1', active: true })
+    expect(termState('h1', 's1').cmdActive).toBe(true)
+    rt.emit('term:cmd', { hostId: 'h1', sessionId: 's1', active: false })
+    expect(termState('h1', 's1').cmdActive).toBe(false)
+
+    // 远端退出：状态是 open，term:exit 被认，输入态归零。
+    const st = termState('h1', 's1')
+    st.status = 'open'
+    rt.emit('term:cmd', { hostId: 'h1', sessionId: 's1', active: true })
+    rt.emit('term:tui', { hostId: 'h1', sessionId: 's1', active: true })
+    rt.emit('term:exit', { hostId: 'h1', sessionId: 's1', reason: '远端 shell 已退出' })
+    expect(st.cmdActive).toBe(false)
+    expect(st.tuiActive).toBe(false)
+  })
+
+  it('closeTerminal 把输入态一并归零（term:exit 会被 idle 守卫跳过）', async () => {
+    const { app } = makeApp({ CloseTerminal: async () => true })
+    install({ runtime: rt, app })
+    const st = termState('h1', 's1')
+    st.status = 'open'
+    st.cmdActive = true
+    st.tuiActive = true
+
+    await closeTerminal('h1', 's1')
+    expect(st.status).toBe('idle')
+    expect(st.cmdActive).toBe(false)
+    expect(st.tuiActive).toBe(false)
+  })
+})

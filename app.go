@@ -696,6 +696,14 @@ const (
 	// EvTermTUI 报告远端是否被全屏程序接管（vim/top/htop）。前端终端内
 	// 直接输入据此让路：接管中不本地缓冲按键，原样透传，避免吞键。
 	EvTermTUI = "term:tui"
+	// EvTermCmd 报告「有命令正在跑」状态（OSC 133;C 开始，133;D 结束）。
+	//
+	// 与 EvTermTUI 分开、而不是塞进同一个事件：全屏接管罕见且只在特定
+	// 程序出现，而命令边界**每条命令**都会翻；前端对两者的用法也不同 ——
+	// tui 管「全屏程序别抢键」，cmd 管「非全屏的交互程序（bt 菜单/read/
+	// REPL/sudo 口令）在等输入，按键必须透传给 PTY」。只靠 tui 会让这些
+	// 非全屏程序收不到输入（用户答菜单的 `14` 被本地行编辑路由给 LLM）。
+	EvTermCmd = "term:cmd"
 	// EvTermCwd 报告远端 shell 的当前工作目录（来自 OSC 7）。
 	//
 	// 必须由后端推、而不是前端猜：目录状态住在远端那条 shell 里，
@@ -773,6 +781,9 @@ func (a *App) OpenTerminal(hostID, sessionID string, cols, rows int) error {
 	// lastTui 记录上一次上报的全屏接管状态，只在**变化**时发 term:tui，
 	// 避免每个输出块都推一条事件把前端淹掉。
 	lastTui := false
+	// lastCmd 记录上一次上报的「命令运行中」状态，同样只在**变化**时发 ——
+	// 命令边界每条命令都要翻，按输出块推会把前端淹掉。
+	lastCmd := false
 	// lastCwd 记录上一次通知前端的目录：提示符每次刷新都会带一条 OSC 7，
 	// 而绝大多数时候目录根本没变（敲一条命令就报一次）。不做去重的话，
 	// 每敲一条命令都会推一条 term:cwd，前端跟着重渲染一次文件列表 ——
@@ -791,6 +802,13 @@ func (a *App) OpenTerminal(hostID, sessionID string, cols, rows int) error {
 			if tui := screen.InTUI(); tui != lastTui {
 				lastTui = tui
 				a.emit(EvTermTUI, map[string]any{"hostId": hostID, "sessionId": sessionID, "active": tui})
+			}
+			// 命令运行态（OSC 133;C..D）：前端据此把按键让给正在等输入的程序
+			// （bt 菜单/read/REPL/sudo 口令），**非全屏也算** —— 只认全屏会让
+			// 这些程序收不到输入（见 EvTermCmd 注释）。
+			if cmd := screen.CmdActive(); cmd != lastCmd {
+				lastCmd = cmd
+				a.emit(EvTermCmd, map[string]any{"hostId": hostID, "sessionId": sessionID, "active": cmd})
 			}
 			// 目录上报放在 TUI 判断之后：全屏程序（vim/top）接管期间用户
 			// 并没有"当前目录"可言，那时也不会有提示符更不会有 OSC 7，
@@ -882,7 +900,15 @@ func (a *App) OpenTerminal(hostID, sessionID string, cols, rows int) error {
 // 而它每次印提示符都会走这里。用 $PWD 而不是 $(pwd)：前者是 bash 内建变量，
 // 读它不起子进程 —— 这段代码在**每一次**命令结束后都会执行，多一个 fork
 // 就是给每条命令平白加上一次进程创建开销。
-const shellIntegration = `if [ -n "$BASH_VERSION" ]; then trap 'printf "\033]133;C\007"' DEBUG; PROMPT_COMMAND='printf "\033]133;D;%s\007" "$?"; printf "\033]7;file://%s%s\007" "$HOSTNAME" "$PWD"'; elif [ -n "$ZSH_VERSION" ]; then precmd() { printf "\033]133;D;%s\007" "$?"; printf "\033]7;file://%s%s\007" "$HOST" "$PWD"; }; preexec() { printf "\033]133;C\007"; }; fi`
+//
+// PROMPT_COMMAND 必须是**单条** printf（D 与 OSC 7 合并成一次输出）。
+// 原因：bash 的 DEBUG trap 会为**每一条**简单命令各发一次 133;C —— 包括
+// PROMPT_COMMAND 里的命令。写成两条（先 D 再 7）时，命令结束时的序列是
+// C,D,C：最后那个 C 之后没有配对的 D，「命令运行中」会永久停在 true ——
+// 客户端据此把**所有按键**都透传给 PTY，自然语言再也进不了 Agent
+// （真实主机上踩到过：bt 菜单退出后，输入任何中文都被当 shell 命令执行）。
+// zsh 分支保持两条 printf：precmd/preexec 不是逐命令触发的 DEBUG trap 机制。
+const shellIntegration = `if [ -n "$BASH_VERSION" ]; then trap 'printf "\033]133;C\007"' DEBUG; PROMPT_COMMAND='printf "\033]133;D;%s\007\033]7;file://%s%s\007" "$?" "$HOSTNAME" "$PWD"'; elif [ -n "$ZSH_VERSION" ]; then precmd() { printf "\033]133;D;%s\007" "$?"; printf "\033]7;file://%s%s\007" "$HOST" "$PWD"; }; preexec() { printf "\033]133;C\007"; }; fi`
 
 // injectShellIntegration 把 shell integration 片段送进刚开好的 shell。
 //
@@ -927,8 +953,18 @@ func (a *App) injectShellIntegration(p *sshclient.PTY) {
 // promptRestore 是「恢复提示符」的一行命令。拆成单独常量是为了让它和
 // shellIntegration 各自可读 —— 两者的引号层级都比较绕，混在一起更难核对。
 //
+// 它必须是**真·一次性**，跑完这一轮就要做两件事：
+//   - 把 PROMPT_COMMAND 装回 shellIntegration 装的正式值。早先的版本只是
+//     把 PROMPT_COMMAND 覆盖成一个「擦行 + 恢复 PS1」的钩子，但它再也不会
+//     变回去 —— 于是 133;D 与 OSC 7 从启动后就再也不上报，每条命令结束时
+//     最后一个标记都是 DEBUG trap 补的 133;C，「命令运行中」永久为真
+//     （所有输入被当程序输入透传，Agent 入口整个失效）。
+//   - 以一次 133;D 收尾：它自己前面的每条命令也都会被 DEBUG trap 各补一个
+//     133;C，不补一个 D 的话，第一个提示符前的最后一个标记同样是 C。
+//
 // 引号分层：外层用双引号包住整条 PROMPT_COMMAND（bash 里 `VAR="..."` 的
-// 惯用法），因此内部的 printf 格式串与 PS1 值都要用反斜杠转义的双引号。
+// 惯用法），因此内部的 printf 格式串与 PS1 值都要用反斜杠转义的双引号；
+// 要嵌进值里、留待远端展开的 `$` 写成 `\$`（如 `\$?` / `\$HOSTNAME` / `\$PWD`）。
 //
 // 两处细节都由实测确定，改错任何一处都会留下一个擦不掉的提示符：
 //   - printf 格式串开头的 `\r` 在 Go 里是**真实回车字节**，不是反斜杠加 r：
@@ -936,7 +972,7 @@ func (a *App) injectShellIntegration(p *sshclient.PTY) {
 //     的话远端 printf 会原样打印一个 `r`，清行失效。
 //   - `\\033` / `\\u` / `\\w` / `\\$` 则必须是**反斜杠字面量**：它们由远端
 //     printf 与 PS1 解释，Go 这一层不能先把反斜杠吃掉。
-const promptRestore = `PROMPT_COMMAND="printf \"\r\033[K\"; PS1=\"\\u@\\h:\\w\\$ \""`
+const promptRestore = `PROMPT_COMMAND="printf \"\r\033[K\"; PS1=\"\\u@\\h:\\w\\$ \"; PROMPT_COMMAND='printf \"\033]133;D;%s\007\033]7;file://%s%s\007\" \"\$?\" \"\$HOSTNAME\" \"\$PWD\"'; printf \"\033]133;D;0\007\""`
 
 // sleepBriefly 让注入的三步之间留出间隔。
 //

@@ -98,6 +98,19 @@ func (s *Screen) InTUI() bool {
 	return s.alt || (s.cmdActive && s.cmdTUI)
 }
 
+// CmdActive 报告当前是否有一条命令正在跑（OSC 133;C 与 133;D 之间）。
+//
+// 与 InTUI 是**两档**信号，别合并：InTUI 只认全屏程序接管，而 bt 菜单、
+// read、REPL、sudo 口令这类非全屏的交互程序不发备用屏幕、也不重绘 ——
+// 它们同样随时会读 stdin，按键必须归它们。前端据此把命令运行期间的输入
+// 原样透传给 PTY（漏掉这一档的后果：用户答菜单的 `14` 被当自然语言
+// 发给 LLM，而菜单一直等不到输入）。
+func (s *Screen) CmdActive() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cmdActive
+}
+
 func blankLine(cols int) []rune {
 	line := make([]rune, cols)
 	for i := range line {
