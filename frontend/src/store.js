@@ -1,6 +1,10 @@
 import { reactive } from 'vue'
 import * as paint from './termPaint'
-import { providerTermBadge } from './providerLogos'
+import {
+  bindTerminalEvents,
+  registerTermSink, unregisterTermSink, registerLLMHint,
+  surfaceWrite, fireLLMHint, afterTermQuiet
+} from './terminal/termEvents.js'
 
 const api = () => window.go?.main?.App
 const rt = () => window.runtime
@@ -221,7 +225,7 @@ function entriesFor(hostId, sessionId) {
 // 显式给了主机却不给会话时落到**默认会话**：这是刻意的取舍 ——
 // 调用方要么两个都给，要么都不给；只给主机多半是「跟会话无关的
 // 主机级提示」，放默认会话至少是可见的，好过凭空造一条谁也找不到的时间线。
-function targetKey(explicitHostId, explicitSessionId) {
+export function targetKey(explicitHostId, explicitSessionId) {
   if (explicitHostId) return bucketKey(explicitHostId, explicitSessionId)
   if (store.activeHostId) return bucketKey(store.activeHostId, store.activeSessionId)
   return bucketKey(store.currentHostId, store.currentSessionId)
@@ -232,7 +236,7 @@ function targetKey(explicitHostId, explicitSessionId) {
 // 与 store.entries 的区别必须分清：后者是**用户此刻在看的**那条，
 // 前者是**输出该去**的那条。用户跑到一半切走时两者会不同 ——
 // 流式增量、工具状态更新都必须用前者，否则内容会写进用户切过去的那条会话。
-function targetEntries() {
+export function targetEntries() {
   return store.bySession[targetKey()] || NO_ENTRIES
 }
 
@@ -266,16 +270,9 @@ export function clearLog() {
   store.pending = null
 }
 
-// isHumanShellApproval 判断挂起的审批是否是「人敲命令」的审批
-// （composer/终端里敲的 shell 行经策略闸门弹出的确认）。
-// 它与 agent 工具审批共用 store.pending，但生命周期不同：
-// agent 工具审批随回合收场；人敲审批由后端 shellGate 单独等待，
-// 只属于它自己（批准 / 拒绝 / 5 分钟超时 / 中断）。
-function isHumanShellApproval(p) {
-  return !!(p && p.name === 'shell')
-}
+// 审批性命判断（isHumanShellApproval）随事件处理一起拆到 terminal/termEvents.js。
 
-function upsertTool(v) {
+export function upsertTool(v) {
   const list = targetEntries()
   const found = list.find(e => e.kind === 'tool' && e.toolId === v.id)
   if (found) {
@@ -436,7 +433,7 @@ function pruneTimelines(hostId, list) {
 // 用 step（后端给的第几轮）做标识，而不是「最后一条 assistant」——
 // 多轮工具调用里会有多条 assistant 消息，认错目标就会把内容写到错误的回答上。
 // step 缺失时必须返回 undefined：否则 e.stream === undefined 会命中所有非流式消息。
-function liveAssistant(step) {
+export function liveAssistant(step) {
   if (step === undefined || step === null) return undefined
   // 认的是「正在跑那一轮」的时间线，不是当前选中的会话 ——
   // 跑到一半切了主机或会话，流式消息仍在原来那条时间线上。
@@ -448,400 +445,16 @@ function liveAssistant(step) {
 // 热重载或组件重新挂载后再绑一遍，每条事件就会被处理 N 次 ——
 // 表现是终端里「ls 变成 lllsss」、对话消息重复三份。
 // 因此每次先 EventsOff 清掉同名旧监听，再重新注册：调用多少次都只挂一份。
-const EV_NAMES = [
-  'agent:delta', 'agent:message', 'agent:reasoning', 'agent:tool', 'agent:toolResult',
-  'agent:injection', 'agent:approval', 'approval:expired', 'agent:status', 'agent:error',
-  'audit:error', 'agent:done', 'term:data', 'term:exit', 'term:tui', 'term:cmd', 'term:cwd', 'agent:snapshot',
-  'fm:transfer', 'agent:transfer'
-]
-
-// surfaceWrite 返回往某块终端表面（按 host+session 键）写字符串的落点（就是它
-// xterm 实例的 write）。没有实例（还没打开/已卸载）时返回 undefined —— termPaint 的
-// 每个函数都对 undefined 落点安全 no-op。
-function surfaceWrite(key) {
-  return termSinks.get(key)
-}
-
-// 事件该画到哪片表面：正在跑那一轮的任务（activeHost+activeSession），
-// 其次当前任务。与 targetKey 同源 —— 用户中途切任务也不会把输出画错地方。
-function paintHost() {
-  return targetKey()
-}
-
-// ---- 思考占位（「……」动画）----
-
-// currentModelBadge 取「这一轮实际在用的模型方案」的终端徽标信息。
-//
-// 优先用 selectedProfileId（下拉框刚选中的那套，与请求实际带的是同一个值 ——
-// 见 ask），回退到后端标记 active 的那套。拿不到任何方案时返回 null，
-// 让 paintAssistantHeader 走「綠点」兜底。
-function currentModelBadge() {
-  const id = store.selectedProfileId
-  const p = store.llmProfiles.find(x => x.id === id) ||
-    store.llmProfiles.find(x => x.active) || null
-  if (!p) return null
-  try {
-    return providerTermBadge(p)
-  } catch {
-    return null
-  }
-}
-
-// thinkingDots 记录每块表面当前的思考占位状态：{ timer, frame, width }。
-// 用非响应式 Map（存的是定时器与函数，进响应式毫无意义）。
-const thinkingDots = new Map()
-
-const THINKING_INTERVAL_MS = 400
-// 点数在 0..4 之间循环：`Working` → `Working.` → `Working..` → `Working...`
-// → `Working....` → 回到 `Working`。循环才是「还在转」的通用符号，也不至于
-// 把行撑长。
-const THINKING_MAX_DOTS = 4
-
-// startThinking 在表面上开始滚动 `Working....` 占位。幂等：已在跑就不重开
-// （后端每个 step 都会重发 status=thinking，不能因此叠出多个定时器）。
-function startThinking(key) {
-  if (!key) return
-  if (thinkingDots.has(key)) return
-  const w = surfaceWrite(key)
-  if (!w) return
-  // next 记录「下一个要画的点数」，0..THINKING_MAX_DOTS 循环。
-  const state = { timer: null, next: 0, width: 0 }
-  const tick = () => {
-    const frame = state.next
-    state.next = frame >= THINKING_MAX_DOTS ? 0 : frame + 1
-    state.width = paint.paintThinking(w, frame, state.width) || state.width
-  }
-  state.timer = setInterval(tick, THINKING_INTERVAL_MS)
-  thinkingDots.set(key, state)
-  tick() // 立刻画第一帧，别等一个周期（否则提问后有一瞬空白）
-}
-
-// stopThinking 停掉并擦除某块表面的思考占位。
-function stopThinking(key) {
-  const state = thinkingDots.get(key)
-  if (!state) return
-  clearInterval(state.timer)
-  thinkingDots.delete(key)
-  paint.clearThinking(surfaceWrite(key), state.width)
-}
-
+// 事件处理的具体逻辑已拆到 terminal/termEvents.js。
 export function bindEvents() {
   const r = rt()
   if (!r) return
-  // 测试用的运行时 mock 可能没有 EventsOff，此时跳过清理直接注册。
-  if (typeof r.EventsOff === 'function') r.EventsOff(...EV_NAMES)
-
-  // 流式增量：逐字累加到「活」消息上
-  r.EventsOn('agent:delta', d => {
-    const host = paintHost()
-    const w = surfaceWrite(host)
-    // 正文开始流出：思考占位使命完成，先擦掉再画抬头/正文，避免两者叠在一行。
-    stopThinking(host)
-    const live = liveAssistant(d.step)
-    if (live) {
-      live.content += d.text
-      // 思考已先画到表面上：正文另起一行再落一个●抬头，别和思考挤在同一行
-      if (!live.contentPainted) {
-        live.contentPainted = true
-        if (live.reasoningPainted) {
-          paint.paintAssistantEnd(w)
-          paint.paintAssistantHeader(w, live.badge)
-        }
-      }
-      paint.paintAssistantDelta(w, d.text)
-      return
-    }
-    const badge = currentModelBadge()
-    push({ kind: 'assistant', content: d.text, stream: d.step, streaming: true, badge })
-    paint.paintAssistantHeader(w, badge)
-    paint.paintAssistantDelta(w, d.text)
-  })
-
-  // 推理型模型的思考增量：挂到同一条「活」消息的思考区（归档视图里可折叠），
-  // 同时以弱化灰字画进终端表面——那是主视图，思考过程必须当场可见。
-  // 思考先于正文到达，往往还要先由它建出这条消息。
-  r.EventsOn('agent:reasoning', d => {
-    const host = paintHost()
-    const w = surfaceWrite(host)
-    // 思考内容开始到达：占位的「......」该让位给真正的思考文本了。
-    stopThinking(host)
-    let live = liveAssistant(d.step)
-    if (!live) {
-      const badge = currentModelBadge()
-      push({ kind: 'assistant', content: '', stream: d.step, streaming: true, reasoning: '', reasoningOpen: true, badge })
-      live = liveAssistant(d.step)
-      paint.paintAssistantHeader(w, badge)
-    }
-    live.reasoning = (live.reasoning || '') + d.text
-    live.reasoningOpen = true
-    live.reasoningPainted = true
-    paint.paintAssistantReasoning(w, d.text)
-  })
-
-  r.EventsOn('agent:message', m => {
-    const host = paintHost()
-    const w = surfaceWrite(host)
-    if (m.role !== 'assistant') {
-      push({ kind: 'user', content: m.content })
-      paint.paintUser(w, m.content)
-      return
-    }
-    stopThinking(host)
-    const live = liveAssistant(m.step)
-    if (live) {
-      // 定稿：用后端给的完整内容覆盖一次，纠正任何在传输中丢掉的尾巴。
-      // 表面上 delta 已经流式画过了，这里只补一个换行收尾，不重画全文。
-      live.content = m.content
-      // 记下这条回答是哪个模型给的：界面据此标注，让「选中的模型」与
-      // 「实际回答的模型」对得上，不必靠模型自述去猜。
-      if (m.model) live.model = m.model
-      live.streaming = false
-      // 回答已开始：默认收起思考区，长思考不该一直把正文顶出屏幕，需要时可手动展开
-      live.reasoningOpen = false
-      paint.paintAssistantEnd(w)
-      return
-    }
-    const badge = m.model ? providerTermBadge({ model: m.model, name: m.model }) : currentModelBadge()
-    push({ kind: 'assistant', content: m.content, model: m.model, badge })
-    paint.paintAssistantHeader(w, badge)
-    paint.paintAssistantDelta(w, m.content)
-    paint.paintAssistantEnd(w)
-  })
-
-  r.EventsOn('agent:tool', v => {
-    // 模型已经产出工具调用 = 不再是「还在思考」：先收掉滚动占位。
-    // **实时**画一行（非 shell 风格），让人当场看到 agent 在调什么工具。
-    stopThinking(paintHost())
-    upsertTool(v)
-    paint.paintToolCall(surfaceWrite(paintHost()), v)
-  })
-
-  r.EventsOn('agent:toolResult', res => {
-    // 同上：工具结果是一大段会往表面写的输出，必须先结束占位，避免两者交错。
-    stopThinking(paintHost())
-    push({
-      kind: 'result',
-      toolId: res.id,
-      exitCode: res.exitCode,
-      content: res.content,
-      redacted: res.redacted || 0,
-      injection: res.injection || []
-    })
-    // 一行紧凑状态（完成 / 失败）；输出与详情进「对话归档」。
-    // TTY 交接还要把命令写进常驻终端 —— 那是「把交互式程序交给用户操作」。
-    paint.paintToolResultLine(surfaceWrite(paintHost()), res)
-    if (res.tty && res.command && res.hostId) {
-      writeTerminal(res.hostId, res.sessionId, textToBase64(res.command + '\n'))
-    }
-  })
-
-  // agent:context 是「本次请求的上下文用量」：后端每步请求前推一次
-  // （见 agent.EvContext）。放进 store 而不是组件本地 state ——
-  // 归档视图将来也要显示它，而事件只应有一个消费者入口（bindEvents）。
-  r.EventsOn('agent:context', d => {
-    if (!d) return
-    store.contextUsage.tokens = d.tokens || 0
-    store.contextUsage.window = d.window || 0
-    store.contextUsage.messages = d.messages || 0
-  })
-
-  r.EventsOn('agent:injection', e => {
-    stopThinking(paintHost())
-    push({
-      kind: 'injection',
-      findings: e.findings || [],
-      command: e.command || '',
-      hostName: e.hostName || ''
-    })
-    paint.paintInjection(surfaceWrite(paintHost()), e)
-  })
-
-  r.EventsOn('agent:approval', v => {
-    stopThinking(paintHost())
-    store.pending = v
-    // 审批条/弹窗是交互入口；表面上只补一行注记说明「为什么停住了」。
-    paint.paintApproval(surfaceWrite(paintHost()), v)
-  })
-
-  // 审批失效（后端超时或被中断）。必须按 id 比对再清 —— 事件可能在
-  // 「上一张已失效、下一张已经来了」之后才被派发，无条件清会把新的一条也抹掉。
-  r.EventsOn('approval:expired', d => {
-    const id = d && d.id
-    if (!id || !store.pending || store.pending.id !== id) return
-    store.pending = null
-    const reason = (d && d.reason) || '已失效'
-    push({ kind: 'system', content: `审批${reason}，Agent 不会执行该命令。` })
-  })
-
-  r.EventsOn('agent:status', s => {
-    store.running = s.status === 'thinking'
-    // 后端发出 status=thinking 即「用户提问已被受理、模型开始思考」——
-    // 这正是要显示「......」的时刻（见需求：用户发完自然语言就转圈）。
-    if (store.running) startThinking(paintHost())
-  })
-
-  r.EventsOn('agent:error', e => {
-    store.running = false
-    stopThinking(paintHost())
-    // 出错即本轮已终止，agent 自己的工具审批条要一并清掉，否则输入框锁死。
-    // 但人敲命令的审批（name=shell）不属于 agent 回合：它由 shellGate 在后端
-    // 单独等待（见 app_shell.go），清掉会让审批条凭空消失、后端还在等
-    // （最长 5 分钟），期间回车提交全部排队 —— 表现为「控制台无法输入」。
-    if (!isHumanShellApproval(store.pending)) store.pending = null
-    freezeStreams()
-    push({ kind: 'error', content: e.message })
-    paint.paintError(surfaceWrite(paintHost()), e.message)
-  })
-
-  // 审计写入失败。这不是「本次任务失败」，而是「审计轨迹可能已不完整」，
-  // 因此不塞进对话流（会被后续输出冲走），而是挂在 store 上做持久横幅，
-  // 直到用户显式关掉 —— 用户必须知道审计日志不再可信。
-  r.EventsOn('audit:error', e => {
-    store.auditError = String(e && e.message ? e.message : e)
-    push({ kind: 'error', content: store.auditError })
-  })
-
-  r.EventsOn('agent:done', () => {
-    store.running = false
-    stopThinking(paintHost())
-    // 同 agent:error：人敲命令的审批（name=shell）不随 agent 回合收场。
-    // agent 自己的工具审批在回合结束时必须清掉（回合已终止，批准无意义）。
-    if (!isHumanShellApproval(store.pending)) store.pending = null
-    freezeStreams()
-  })
-
-  // 交互终端的输出。解成字节后直接交给 xterm ——
-  // 让它的 UTF-8 解码器去处理跨块的续字节（这正是它存在的意义）。
-  r.EventsOn('term:data', d => {
-    const k = bucketKey(d && d.hostId, d && d.sessionId)
-    const sink = termSinks.get(k)
-    // 没有落点就直接丢掉：那是「界面还没建好实例」的那一小段，
-    // 而终端只在用户真的打开它之后才会有输出。
-    if (!sink) return
-    // 远端真的吐字节了：光标即将被这段输出推走，思考占位不再安全 —— 立即收掉。
-    // 不先收的话，占位那一行会被 PTY 输出顶到别处、`\r` 再也回不去，残留成幽灵
-    // `Working`（用户截图里 `Working..` 和 shell 提示符挤在同一行就是这个）。
-    stopThinking(k)
-    try {
-      sink(base64ToBytes(d.data))
-      // 有人等着「这轮输出画完」：续期静默计时器（见 afterTermQuiet）。
-      armQuietTimer(k)
-    } catch (e) {
-      push({ kind: 'error', content: '终端输出解码失败：' + String(e && e.message ? e.message : e) })
-    }
-  })
-
-  // 远端是否被全屏程序接管（vim/top/htop）。后端只在状态**变化**时发。
-  // 前端拿它给「终端内直接输入」让路：接管期间整体透传按键，绝不抢键。
-  r.EventsOn('term:tui', d => {
-    const st = termState(d && d.hostId, d && d.sessionId)
-    if (st) st.tuiActive = !!(d && d.active)
-  })
-
-  // 远端是否有一条命令正在跑（OSC 133;C..D 之间）。后端只在状态**变化**时发。
-  //
-  // 前端据此把按键让给正在等输入的程序：bt 菜单、read、REPL、sudo 口令这类
-  // **非全屏**的交互程序没有别的让路信号，只能靠这一档 —— 漏掉时用户答菜单
-  // 的 `14` 会被本地行编辑按「数字编号回复」路由给 LLM（截图 bug：表面画出
-  // `Ai-Shell > 14` + `Working...`，而菜单一直等不到输入）。
-  r.EventsOn('term:cmd', d => {
-    const st = termState(d && d.hostId, d && d.sessionId)
-    if (st) st.cmdActive = !!(d && d.active)
-  })
-
-  // 远端 shell 的当前目录（来自 OSC 7）。后端只在目录**变化**时发。
-  //
-  // 这是文件管理弹窗「默认定位到当前控制台目录」的数据来源：目录状态住在
-  // 远端那条 shell 里，前端只看得见渲染好的字符，猜不出用户 cd 去了哪。
-  // 按 host+session 分别记 —— 每块终端表面可能停在不同目录，混用一个
-  // 全局值会让「切到另一条任务再打开文件管理」定位到别人的目录。
-  r.EventsOn('term:cwd', d => {
-    const k = bucketKey(d && d.hostId, d && d.sessionId)
-    if (!d || !d.cwd) return
-    store.termCwd[k] = d.cwd
-    // 弹窗正开着且看的就是这块表面：跟着目录走，否则用户在终端里 cd
-    // 之后弹窗还停在旧目录，看起来像没刷新。
-    if (store.fileManager.open && store.fileManager.key === k) {
-      store.fileManager.cwd = d.cwd
-    }
-  })
-
-  // 文件传输进度（下载）。后端每落盘一块就推一次（app_files.go 的
-  // downloadTo → a.emit），这里把它翻译成 fm.progress 的 downloading 相位，
-  // 与上传共用同一个进度条渲染。上传的进度仍由前端自己驱动（读本地文件），
-  // 走不到这条事件。
-  r.EventsOn('fm:transfer', d => {
-    if (!d || d.kind !== 'download') return
-    store.fileManager.progress = {
-      phase: 'downloading',
-      id: d.id,
-      loaded: d.done,
-      total: d.total,
-      name: d.name,
-      bps: d.bps
-    }
-  })
-
-  // agent 侧文件传输进度（download_remote_file 工具）。
-  //
-  // 与上面的 fm:transfer 刻意分开存：那条是「人在弹窗里点下载」，
-  // 这条是「模型发起的传输」。两者可能同时进行（用户下载一个包，
-  // 模型同时把一份日志拉回来），共用一个进度字段会让进度条
-  // 张冠李戴 —— 显示 A 的速度，实际在传 B。
-  //
-  // 落在 store 而不是组件本地 state：控制台将来要在跑长传输时
-  // 显示「正在拉取 xxx」，而事件只应有一个消费者入口（bindEvents）。
-  r.EventsOn('agent:transfer', d => {
-    if (!d || d.kind !== 'download') return
-    store.agentTransfer = {
-      remote: d.remote,
-      name: d.name,
-      dest: d.dest,
-      done: d.done,
-      total: d.total,
-      bps: d.bps
-    }
-  })
-
-  r.EventsOn('term:exit', d => {
-    const st = store.terms[bucketKey(d && d.hostId, d && d.sessionId)]
-    // 只在「开着」的时候才认这条退出：用户自己点关闭时状态已经置回 idle，
-    // 那一次退出不该再弹一条消息。
-    if (!st || (st.status !== 'open' && st.status !== 'opening')) return
-    st.status = 'closed'
-    st.exitReason = (d && d.reason) || '终端已结束'
-    // 终端已经没了，输入态必须跟着归零：后端此后不再有任何屏幕事件，
-    // 残留的 cmdActive/tuiActive 会把按键继续透传给一条死掉的通道
-    // （表现为「敲什么都没反应、也不报错」）。
-    st.cmdActive = false
-    st.tuiActive = false
-  })
-
-  // 终端屏幕快照：模型看的那份净化后文本，原样落一条给人看 ——
-  // 人和模型看到同一份东西，审计才对得上。落点用后端给的
-  // hostId/sessionId 显式指定：快照属于开块那一轮，不属于「此刻在看」的会话。
-  r.EventsOn('agent:snapshot', d => {
-    stopThinking((d && d.hostId) ? bucketKey(d.hostId, d.sessionId) : paintHost())
-    push({
-      kind: 'snapshot',
-      termId: (d && d.termId) || '',
-      text: (d && d.text) || '',
-      redacted: (d && d.redacted) || 0,
-      injection: (d && d.injection) || [],
-      final: !!(d && d.final)
-    }, (d && d.hostId) || undefined, (d && d.sessionId) || undefined)
-    // 表面上只落一行注记，不重画那一帧：定格画面本来就在终端的 scrollback 里，
-    // 重画反而会打乱滚动位置。注记让人和审计对得上「这一屏已进模型上下文」。
-    // 落点按后端给的 hostId/sessionId 组合成表面键：快照属于开块那一轮的任务，
-    // 不属于「此刻在看」的会话；那塊表面已不在（切走已关）时 sink 为空，自然 no-op。
-    const snapKey = (d && d.hostId) ? bucketKey(d.hostId, d.sessionId) : paintHost()
-    paint.paintSnapshotNote(surfaceWrite(snapKey), !!(d && d.final))
-  })
+  bindTerminalEvents(r)
 }
 
 // freezeStreams 收尾所有还在「流式中」的消息。
 // 中断或出错时流不会再有定稿消息，不清掉标记就会留下一个永远闪烁的光标。
-function freezeStreams() {
+export function freezeStreams() {
   for (const e of targetEntries()) {
     if (e.streaming) e.streaming = false
   }
@@ -1073,8 +686,18 @@ export async function switchProfile(id) {
 }
 
 export async function stop() {
+  // 只有真的有任务在跑才落回执：后端 Stop() 对「本来就没在跑」是静默空操作
+  // （agent.go：a.cancel 为 nil 就什么都不做），无条件 push 会在竞态窗口
+  // （回合恰好在点击前一瞬正常收场）里留下一句「已中断」的谎话。
+  const wasActive = store.running || store.busy
   try {
     await api().Stop()
+    // 后端对用户主动中断**静默收场**（agent.go：ctx 取消不是故障，不发
+    // agent:error）—— 否则被取消的 HTTP 请求会把「请求 LLM 失败: context
+    // canceled」画成红字，等于把用户自己的操作报成错误。所以这句回执由
+    // 前端补：灰字系统提示，进归档时间线；表面上的可见反馈是
+    // 「Working 停止 + 输入提示符回来」（ConsolePanel 的 running watch）。
+    if (wasActive) push({ kind: 'system', content: '已中断本轮任务。' })
   } catch (e) {
     push({ kind: 'error', content: `中断失败：${e && e.message ? e.message : e}` })
   } finally {
@@ -1086,48 +709,8 @@ export async function stop() {
   }
 }
 
-// ---- 终端输出静默检测 ----
-
-// afterTermQuiet 在「某块终端的输出安静下来」之后调 fn。
-//
-// 为什么需要它：把一条命令写进 PTY 是**不等它跑完**的 —— 后端写完就返回，
-// 回显、命令输出、新提示符都在之后陆续从网络上飘回来。调用方若拿到返回值就
-// 往屏幕上画东西，那东西会插在命令输出**前面**，看起来就像「命令没执行」：
-//
-//	root@host:~$   提示：这段输出可交给 LLM 分析。   ← 提示抢先画了
-//	install.sh mysql.php tttt.text      ← 真正的输出被挤到下面
-//	root@host:~$
-//
-// 所以凡是「命令跑完之后才该出现」的内容（LLM 提示、裁决说明），都要挂在这里。
-// 判据是输出流静默：不再有新字节到达即认为命令画完了。
-//
-// 静默时长取 400ms：本地环回上 ls 的输出常在几十毫秒内结束，400ms 不会让人
-// 察觉延迟；而慢命令的字节流会不断续期，不会被误判成「已跑完」。
-const TERM_QUIET_MS = 400
-const quietTimers = new Map()   // 表面键 → 静默计时器
-const quietWaiters = new Map()  // 表面键 → 等到静默后要执行的回调
-
-function armQuietTimer(key) {
-  const prev = quietTimers.get(key)
-  if (prev) clearTimeout(prev)
-  const timer = setTimeout(() => {
-    quietTimers.delete(key)
-    const fn = quietWaiters.get(key)
-    if (fn) {
-      quietWaiters.delete(key)
-      fn()
-    }
-  }, TERM_QUIET_MS)
-  quietTimers.set(key, timer)
-}
-
-// afterTermQuiet 登记「静默后执行」。同一块表面同时只保留一个待执行回调：
-// 用户连敲两条命令时，前一条的提示没必要还追着画（屏幕早滚过去了）。
-export function afterTermQuiet(hostId, sessionId, fn) {
-  const key = bucketKey(hostId, sessionId)
-  quietWaiters.set(key, fn)
-  armQuietTimer(key)
-}
+// 终端输出静默检测（afterTermQuiet）已拆到 terminal/termEvents.js；
+// 本模块通过顶部 import 使用它（见 runShellInTerminal）。
 
 // runShellInTerminal：composer 里人敲的 shell 命令，走**常驻终端**通道 ——
 // 策略闸门裁决（高危弹审批）后把这一行写进常驻 PTY，提示符回显、输出、
@@ -1237,43 +820,9 @@ export function textToBase64(s) {
   return bytesToBase64(utf8.encode(s))
 }
 
-// termSinks 是「终端表面（host+session 键）→ 往它的 xterm 实例里写字节」的登记表。
-//
-// 事件是后端推的，而 xterm 实例住在组件里，两者需要一个会合点。
-// 刻意**不放进 reactive**：它存的是函数，被 Vue 代理一遍没有任何意义，
-// 反而会让每次写入都走一遍响应式系统。
-const termSinks = new Map()
-
-// llmHintListeners：每块表面一个「画 LLM 提示占位」的回调，由 ConsolePanel
-// 在创建实例时登记。store 的 runShellInTerminal 在命令画完后触发它 ——
-// 提示占位的起点列只有组件读得到（xterm 光标位置），所以画这件事归组件。
-const llmHintListeners = new Map()
-
-// registerLLMHint 由终端组件登记回调；返回反登记函数。
-export function registerLLMHint(hostId, sessionId, fn) {
-  const key = bucketKey(hostId, sessionId)
-  llmHintListeners.set(key, fn)
-  return () => { if (llmHintListeners.get(key) === fn) llmHintListeners.delete(key) }
-}
-
-// fireLLMHint 触发占位提示绘制（内部用；组件不在场时静默跳过）。
-function fireLLMHint(hostId, sessionId) {
-  const fn = llmHintListeners.get(bucketKey(hostId, sessionId))
-  if (fn) { try { fn() } catch { /* 绘制失败不影响命令结果展示 */ } }
-}
-
-// registerTermSink 由终端组件在**创建实例之后、调用 OpenTerminal 之前**登记。
-// 顺序不能反：远端 shell 一启动就会打印提示符，登记晚了那一段就落进虚空了。
-export function registerTermSink(hostId, sessionId, fn) {
-  termSinks.set(bucketKey(hostId, sessionId), fn)
-}
-
-// unregisterTermSink 只在当前登记的仍是自己时才删。
-// 同一块表面可能被重新挂载，晚挂上的那个不该被早先那次卸载顺手清掉。
-export function unregisterTermSink(hostId, sessionId, fn) {
-  const key = bucketKey(hostId, sessionId)
-  if (termSinks.get(key) === fn) termSinks.delete(key)
-}
+// 终端 sink 登记表、LLM 提示回调与静默检测都已拆到 terminal/termEvents.js。
+// 这里 re-export 三个注册函数，保持测试与旧调用面的导入不变。
+export { registerTermSink, unregisterTermSink, registerLLMHint }
 
 export function termState(hostId, sessionId) {
   const key = bucketKey(hostId, sessionId)

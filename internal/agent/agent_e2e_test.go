@@ -1017,6 +1017,60 @@ func TestAgentEmptyReplyDoesNotRetryNonStream(t *testing.T) {
 	}
 }
 
+// 用户点「中断」时，正在飞的那次 LLM 请求会带着 context canceled 失败。
+// 这是**预期内的收场**，不是故障：原样 emit 会把「请求 LLM 失败: context
+// canceled」画成一条红字，等于把用户自己的操作报成错误（真实发生过的
+// 用户反馈）。中断后只能有 EvDone（前端据此复位运行态），绝不能有 EvError。
+//
+// 时序用 beforeRespond 钩子卡住：请求已到达服务端、还没返回响应时调
+// ag.Stop() —— 比 sleep 赌时序稳定。钩子在 fakeLLM 的锁外调用，可以安全
+// 回过来操作 agent；release 由 defer 保证即使断言失败也会放开，不挂死测试。
+func TestAgentUserInterruptDoesNotEmitError(t *testing.T) {
+	release := make(chan struct{})
+	h := newHarness(t, []string{respContent("慢慢想，还没答完")}, policy.ModeWhitelist, true)
+	h.fake.beforeRespond = func() {
+		h.ag.Stop()
+		<-release // 卡在「请求在飞、响应未出」：保证 cancel 命中这次 HTTP 请求
+	}
+	defer close(release)
+
+	err := runDefault(h.ag, context.Background(), h.hostID, "试试")
+	if err == nil {
+		t.Fatal("中断后 Run 应返回（ctx 取消错误），而不是装作正常结束")
+	}
+	if got := h.fake.requestCount(); got != 1 {
+		t.Fatalf("中断应取消那次在飞的请求，不应重试，实际请求 %d 次", got)
+	}
+	if h.hasEvent(EvError) {
+		t.Fatal("用户中断不应发 agent:error —— context canceled 不是故障，画成红字是把用户自己的操作报成错误")
+	}
+	if !h.hasEvent(EvDone) {
+		t.Fatal("中断后应照常发 agent:done，否则前端永远停在「运行中」")
+	}
+}
+
+// 对照用例：真故障（服务端连接被拒）仍然必须 emit EvError ——
+// 上一个用例钉住「中断安静收场」，这个钉住「安静收场没有吃掉真错误」。
+func TestAgentRealFailureStillEmitsError(t *testing.T) {
+	h := newHarness(t, nil, policy.ModeWhitelist, true)
+	h.srv.Close() // 弄断 SSH 不够 —— 要断的是 LLM；换一个必然连不上的地址
+	key := "test-key"
+	if err := h.v.SetLLM("http://127.0.0.1:1/v1", "test-model", &key); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runDefault(h.ag, context.Background(), h.hostID, "试试")
+	if err == nil {
+		t.Fatal("连不上 LLM 应当报错")
+	}
+	if !h.hasEvent(EvError) {
+		t.Fatal("真故障必须发 agent:error，不能被「中断静默收场」的改动吞掉")
+	}
+	if h.hasEvent(EvDone) != true {
+		t.Fatal("任何结束路径都应发 agent:done")
+	}
+}
+
 // 推理型模型（DeepSeek-R1 等）的思考内容必须以 agent:reasoning 事件
 // 透传给界面，否则用户只看到模型「卡住」再突然蹦出答案，看不到思考过程。
 // 思考内容只进展示：不得回传 API、不得写入会话历史。

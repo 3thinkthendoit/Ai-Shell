@@ -1,20 +1,18 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { Terminal } from '@xterm/xterm'
-import { FitAddon } from '@xterm/addon-fit'
-import '@xterm/xterm/css/xterm.css'
 import {
-  store, ask, approve, stop, clearLog, clearSession, compactSession, push,
-  createSession, refreshSessions, runShellInTerminal, switchProfile, syncWindowTitle,
-  openTerminal, writeTerminal, resizeTerminal, closeTerminal,
-  registerTermSink, unregisterTermSink, termState, textToBase64, reportActiveSession,
+  store, approve, stop, clearLog, clearSession, compactSession, push,
+  createSession, refreshSessions, switchProfile, syncWindowTitle,
+  closeTerminal, reportActiveSession,
   openFileManager, closeFileManager,
-  bucketKey, isPtyDirty, backendAPI, registerLLMHint
+  bucketKey
 } from '../store'
-import { resolveInput } from '../inputRoute'
 import { providerBadge, providerTermBadge } from '../providerLogos'
-import { TERM_THEMES, currentTermTheme } from '../termTheme'
-import * as paint from '../termPaint'
+import {
+  openedKeys, ensureTerm, disposeTerm, doFit, focusTerm, setTheme,
+  setSurfaceEl, getTerm, paintWelcomeHintIfNeeded
+} from '../terminal/termSession'
+import { onTermData, paintInputPromptIfNeeded } from '../terminal/termInput'
 import UiSelect from './UiSelect.vue'
 import FileManagerModal from './FileManagerModal.vue'
 
@@ -23,22 +21,20 @@ import FileManagerModal from './FileManagerModal.vue'
 // 中文/? → Agent，shell 行 → 策略闸门 → 写进同一片 PTY。top/vim 原生全屏接管。
 // 「对话归档」开关把主区切成只读时间线（复用 store.entries 渲染），表面用 v-show
 // 常驻不销毁 —— xterm 实例一销毁滚动回放就没了。
+//
+// xterm 实例生命周期在 terminal/termSession.js，按键行编辑在 terminal/termInput.js，
+// 提交分流在 terminal/termSubmit.js，后端事件在 terminal/termEvents.js（经 store 绑定）。
+// 本组件只保留：布局/挂载协调、审批 UI、剪贴板接线与归档视图派生。
 
 // ---- 常驻终端表面（xterm 实例生命周期，从 InteractiveTerminal 折叠进来）----
 // 表面按「任务」组织：一块表面对应一条 (host, session)，键用 store.bucketKey。
 // 只保留当前聚焦任务的 shell：切换任务时关闭上一任务的表面/PTY，为目标任务
 // 新开一条全新 xterm（回来也是全新的，旧现场丢弃，历史仍在「对话归档」里）。
 const rootEl = ref(null)          // ResizeObserver 的观察目标（.surface）
-const openedKeys = ref([])        // 已建过容器的表面键（bucketKey）
-const surfaceEls = new Map()      // surfaceKey -> 容器元素
-const hintedKeys = new Set()      // 已画过欢迎引导的表面键（见 paintWelcomeHintIfNeeded）
-
-// 欢迎引导比真提示符晚多久出现。远端 shell 从握手到打印提示符约 500ms
-// （ptyprobe 抓包实测），这里取 700ms 留出余量，保证引导落在提示符**之后**。
-const WELCOME_HINT_DELAY_MS = 700
-const terms = new Map()           // surfaceKey -> { term, fit, sink, hostId, sessionId, ... }
 let attachedKey = ''              // 当前附着的那块表面键（切任务时据此关闭旧的）
 let ro = null
+// 已接好 onData/粘贴/选区 回调的表面键（ensureTerm 复用活实例时不重复接线）。
+const wiredHandlers = new Set()
 
 // 对话归档：只读时间线开关。false = 活表面，true = 归档视图。
 const showArchive = ref(false)
@@ -94,242 +90,54 @@ const statusLine = computed(() => {
 const canRetry = computed(() => !!st.value && (st.value.status === 'closed' || st.value.status === 'error'))
 const canClose = computed(() => !!st.value && (st.value.status === 'open' || st.value.status === 'opening'))
 
-function setSurfaceEl(key, el) {
-  if (el) surfaceEls.set(key, el)
-  else surfaceEls.delete(key)
-}
+// 终端配色跟随亮/暗主题：切换时转交 termSession.setTheme（它同步所有已打开实例）。
+watch(() => store.theme, t => setTheme(t))
 
-// 终端配色跟随亮/暗主题；切换时同步所有已打开的实例。
-watch(() => store.theme, t => {
-  const theme = TERM_THEMES[t] || TERM_THEMES.light
-  for (const { term } of terms.values()) term.options.theme = theme
-})
-
-// doFit 只在容器**确实有尺寸**时才测量。隐藏时（切到归档、或不是当前任务）
-// 量到 0x0，fit 会算出 0 列 0 行报给远端，排版彻底乱掉且界面无异常可见。
-function doFit(key) {
-  const t = terms.get(key)
-  if (!t) return
-  const el = surfaceEls.get(key)
-  if (!el || el.clientWidth === 0 || el.clientHeight === 0) return
-  try {
-    t.fit.fit()
-  } catch {
-    // 布局还没稳定时会抛。下一次 ResizeObserver 会再试，不该变成用户可见的报错。
-  }
-}
-
-// focusTerm 把键盘焦点交给该片终端（输入已整体在终端内，composer 输入框已移除）。
-// xterm 替身可能没有 focus，包一层 try 免得主流程被带偏。
-function focusTerm(key) {
-  const t = terms.get(key)
-  if (!t) return
-  try {
-    t.term.focus()
-  } catch {
-    // 忽略：实例已销毁或替身无 focus
-  }
-}
-
-function disposeTerm(key) {
-  const pending = pendingResize.get(key)
-  if (pending) {
-    clearTimeout(pending)
-    pendingResize.delete(key)
-  }
-  // 副本-on-select 的防抖定时器也要停：实例已销毁，回调里的 terms.get 会落空，
-  // 虽然安全但会白跑一次；显式清掉更干净。
+// disposeSurface：销毁本地 xterm 实例（termSession.disposeTerm 负责），并
+// 顺带清掉本组件持有的接线标记与 copy-on-select 防抖。
+function disposeSurface(key) {
   cancelCopyOnSelect(key)
-  lastSentSize.delete(key)
-  const t = terms.get(key)
-  if (t) {
-    unregisterTermSink(t.hostId, t.sessionId, t.sink)
-    t.instanceToken.disposed = true
-    try {
-      t.term.dispose()
-    } catch {
-      // 已经销毁过就算了
-    }
-    terms.delete(key)
-  }
-  openedKeys.value = openedKeys.value.filter(x => x !== key)
-  surfaceEls.delete(key)
-  // 这一条生命周期结束了：清掉去重标记，下次打开（或切回来重建）时重新提示。
-  hintedKeys.delete(key)
+  wiredHandlers.delete(key)
+  disposeTerm(key)
 }
 
-// ---- 尺寸上报：防抖 + 去重 ----
-//
-// 为什么不能「一变就发」：每次 window-change 都会让远端 shell 收到 SIGWINCH，
-// readline 会重绘当前提示符行。空提示符下「重绘」就是把提示符再打一遍，而
-// 光标正好停在上一遍的末尾 —— 拖动窗口、归档切换引发的连续 resize 会在同一行
-// 叠出「[root@host ~]# [root@host ~]# [root@host ~]#」。
-// 防抖把风暴合并成一次（取最新尺寸）；同尺寸重测（归档切回、状态行增减）
-// 直接不发 —— 后端 PTY 创建时就带着当前尺寸，重复 window-change 没有信息量。
-const pendingResize = new Map() // key -> timer
-const lastSentSize = new Map()  // key -> 'cols x rows'
-const RESIZE_DEBOUNCE_MS = 150
-
-function reportResize(key, hostId, sessionId, cols, rows) {
-  const size = cols + 'x' + rows
-  if (lastSentSize.get(key) === size) return
-  const prev = pendingResize.get(key)
-  if (prev) clearTimeout(prev)
-  const timer = setTimeout(() => {
-    pendingResize.delete(key)
-    // PTY 还在创建中（opening）：此刻的尺寸是布局稳定期的中间态，发出去必是
-    // 冗余 window-change。慢连接下防抖（150ms）会在 OpenTerminal 返回前到期，
-    // 只靠「打开完成后作废」拦不住 —— 必须在到期那一刻再查一次状态。
-    // 打开完成后 statusLine watcher 必然再 doFit 一次，真实变了尺寸会重新
-    // 走到这里（那时已不是 opening，照常发送）。
-    if (termState(hostId, sessionId).status === 'opening') return
-    lastSentSize.set(key, size)
-    resizeTerminal(hostId, sessionId, cols, rows)
-  }, RESIZE_DEBOUNCE_MS)
-  pendingResize.set(key, timer)
+// ensureSurface：在 termSession 建好/复用实例之后，接上本组件负责的用户交互
+// 回调（onData 本地行编辑、粘贴/复制按键接管、选区复制）。
+async function ensureSurface(hostId, sessionId) {
+  await ensureTerm(hostId, sessionId, store.theme)
+  attachHandlers(bucketKey(hostId, sessionId))
 }
 
-async function ensureTerm(hostId, sessionId) {
-  if (!hostId) return
-  const key = bucketKey(hostId, sessionId)
-  const state = termState(hostId, sessionId)
+// attachHandlers 给某块表面接上交互回调。幂等：ensureTerm 复用活实例时不会
+// 重建对象，此时不能重复挂（否则按键被派发多次）；disposeSurface 会清标记，
+// 下一次重建时重新接线。
+function attachHandlers(key) {
+  const t = getTerm(key)
+  if (!t || wiredHandlers.has(key)) return
+  wiredHandlers.add(key)
+  const term = t.term
 
-  if (terms.has(key)) {
-    if (state.status === 'closed' || state.status === 'error') {
-      // 上一次会话已结束：换掉旧实例，否则新画面会接在上一段后面像「重连没清屏」。
-      disposeTerm(key)
-    } else {
-      await nextTick()
-      doFit(key)
-      return
-    }
-  }
-
-  // 先把容器渲染出来再 open：xterm 在 open 那一刻就要测量容器、建渲染层。
-  // 容器不存在时量到 0x0，画布按错尺寸建，之后再 fit 也修不回来。
-  if (!openedKeys.value.includes(key)) openedKeys.value.push(key)
-  await nextTick()
-
-  const el = surfaceEls.get(key)
-  if (!el) return
-
-  const term = new Terminal({
-    cursorBlink: true,
-    // 光标样式：默认是**块状**（一个实心方块盖住整个字符格），在等宽中文字体下
-    // 那个方块格外厚重，看着像「有个字符被反白了」。改成竖线（bar），紧跟字符
-    // 右缘，与编辑器里的手感一致。宽度 2px：1px 在非整数缩放屏上会被渲染成
-    // 半透明灰边，反而糊。
-    cursorStyle: 'bar',
-    cursorWidth: 2,
-    // 回放行数：给足但不无限。终端的价值一半在「翻回去看」，每行都占内存。
-    scrollback: 5000,
-    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-    fontSize: 12.5,
-    theme: currentTermTheme(store.theme)
-  })
-  const fit = new FitAddon()
-  term.loadAddon(fit)
-  term.open(el)
-  // 表面不再预写任何提示行：输入文案已在顶部 banner 常驻，重连也不留装饰性
-  // 空行 —— 让终端直接落到远端 shell 的提示符。
-
-  const sink = bytes => {
-    const st = terms.get(key)
-    // 远端又画了东西：屏幕已经不是我们离开时那一屏了，占位符的列位置随之作废。
-    // 这里**只作废标记、不试图擦除** —— 行的内容已被远端改写，按旧列号擦会
-    // 误伤真实输出。提示被盖住就盖住了，下次切回会重新提示。
-    if (st) st.hintCols = 0
-    if (st && st.line && !st.passthrough) {
-      // 本地行编辑期间收到外部 PTY 输出（提示符重绘 / 后台打印）。旧的 startCol
-      // 确实不可信了，但**不能**像旧实现那样把缓冲 flush 给 PTY 换透传 ——
-      // 那等于把还没回车的半行直接交给 bash 执行：用户接着打的自然语言会整行
-      // 变成 command not found，Agent 分流整个被绕过（提示符晚到半秒就会踩中，
-      // 绝不是罕见路径）。改用 readline 的做法：擦掉本地回显 → 让输出画完 →
-      // 在新光标位置把这一行重画出来。行编辑始终归本地，回车才走分流。
-      eraseLocalLine(st, st.line)
-      // 光标位置必须等这段输出**画完**再读：xterm 的 write 是异步解析的，
-      // 写完立刻读 cursorX 拿到的是输出之前的旧位置（测试替身是同步的，
-      // 这个错只在真机上暴露）。write 的回调在解析完本块后触发。
-      term.write(bytes, () => {
-        if (terms.get(key) !== st) return
-        if (isFullscreen(key)) {
-          // 全屏程序接管（vim/top 启动）：回显已在切换到备用屏前擦净，
-          // 这半行就地作废，绝不能画进程序的界面里。
-          st.line = ''
-          st.lineSynthetic = false
-        } else {
-          st.startCol = cursorCol(st)
-          if (st.lineSynthetic) {
-            // 行首的合成 ❯ 不随缓冲走：在新的光标位置重新画一个，
-            // 否则回车时按「合成行」整行擦除会擦错地方。
-            paint.paintInputPrompt(s => term.write(s))
-            st.startCol = cursorCol(st)
-          }
-          term.write(st.line)
-        }
-      })
-      return
-    }
-    term.write(bytes)
-  }
-  // 顺序不能反：先登记落点再 OpenTerminal。远端 shell 一启动就打印提示符，
-  // 登记晚了那一段就落进虚空了。
-  registerTermSink(hostId, sessionId, sink)
-  // LLM 提示占位（命令跑完画在提示符后面那行灰字）也归组件管：store 通知、
-  // 组件画 —— 起点列只有这里的 xterm 实例读得到。token 用来判断回调到达时
-  // 这条实例是否已被销毁/重建（disposeTerm 会置 disposed=true）。
-  const instanceToken = { disposed: false }
-  const unregisterHint = registerLLMHint(hostId, sessionId, () => {
-    const cur = terms.get(key)
-    if (!cur || instanceToken.disposed || terms.get(key) !== cur) return
-    if (cur.line || cur.passthrough || cur.lineSynthetic) return
-    if (isFullscreen(key)) return
-    const startCol = cursorCol(cur)
-    const cols = paint.paintLLMHint(surfaceWrite(key), startCol) || 0
-    if (cols) { cur.llmHintCols = cols; cur.llmHintStart = startCol }
-  })
-  terms.set(key, {
-    term, fit, sink, hostId, sessionId, instanceToken,
-    line: '', startCol: 0, passthrough: false, lineSynthetic: false,
-    hintCols: 0, hintPromptCols: 0, // 欢迎占位符的宽度与它起点列（见 clearWelcomeHint）
-    llmHintCols: 0, llmHintStart: 0 // LLM 提示占位（同一机制，见 clearLLMHint）
-  })
-
-  // 用户按键 → 本地行编辑（见 onTermData）：常态下可打印字符本地回显、
-  // 回车时分类；全屏程序接管或控制键则原样透传。不再是无脑逐字符进 PTY。
+  // 用户按键 → 本地行编辑（见 termInput.onTermData）。
   term.onData(d => onTermData(key, d))
 
   // 粘贴接线：xterm 本身**不处理剪贴板** —— Ctrl+V 会被浏览器/WebView2 先截走，
-  // 结果就是一个字节都进不了 onData，onTermData 里那个「多字符 = 粘贴」的分支
-  // 永远等不到输入（现象：Ctrl+V 毫无反应）。
-  //
-  // 所以这里必须自己接管按键：拦下键事件（返回 false 阻止 xterm 再处理），
-  // 异步读剪贴板后把整段文本喂进 onTermData —— 复用已有的分类逻辑：
-  // 含换行会逐行提交，纯命令走本地行编辑，全屏程序 / Agent 运行中由既有分支各自处置。
-  //
-  // 注意读剪贴板不能同步完成，所以 return false 是"这个键我接了"，
-  // 内容稍后到达；不拦住的话浏览器默认行为与我们的写入可能各干一遍。
+  // 结果就是一个字节都进不了 onData。所以这里必须自己接管按键：拦下键事件
+  // （返回 false 阻止 xterm 再处理），异步读剪贴板后把整段文本喂进 onTermData。
   term.attachCustomKeyEventHandler(e => {
     if (e.type !== 'keydown') return true
-
     // e.key 在合成事件/极端环境下可能缺失，统一取小写再比较，避免直接
     // toLowerCase() 抛 TypeError（回调里抛异常会让整个按键链路失效）。
     const k = (e.key || '').toLowerCase()
-
     // 复制（优先级最高）：Ctrl+Shift+C 与 Ctrl+Insert。返回 false 阻止 xterm
     // 继续把按键当输入处理，否则 Ctrl+Insert 会被解析成转义序列打进 PTY。
     const isCopy = (e.ctrlKey && e.shiftKey && k === 'c') ||
                    (e.ctrlKey && k === 'insert')
     if (isCopy) {
       e.preventDefault()
-      // 有选区就复制；没选区时什么都不做（不要清空剪贴板）。
       void copySelection(key)
       return false
     }
-
     // 裸 Ctrl+C 的语义修正：**有选区时复制，无选区时才发 SIGINT**。
-    // 这是所有正经终端（Windows Terminal / iTerm / Termius）的既定行为 ——
-    // 用户框选一段文字后下意识按 Ctrl+C，期待的是复制，不是打断远端程序。
     // 无选区时返回 true 交给原有链路，\x03 照旧透传给 PTY，中断能力不受影响。
     if (e.ctrlKey && !e.shiftKey && !e.altKey && k === 'c') {
       const sel = term.getSelection ? term.getSelection() : ''
@@ -340,7 +148,6 @@ async function ensureTerm(hostId, sessionId) {
       }
       return true
     }
-
     const isPaste = (e.ctrlKey && !e.altKey && k === 'v') ||
                     (e.shiftKey && k === 'insert')
     if (!isPaste) return true
@@ -361,406 +168,31 @@ async function ensureTerm(hostId, sessionId) {
       scheduleCopyOnSelect(key)
     })
   }
-
-  // 尺寸变化 → 后端。少了这一步远端程序会一直按初始尺寸排版。
-  term.onResize(({ cols, rows }) => {
-    reportResize(key, hostId, sessionId, cols, rows)
-  })
-
-  doFit(key)
-  // 布局可能在 open 之后才稳定（状态行出现、工具条换行、字体度量就绪）：
-  // 再补一帧重测量，否则行数停留在偏小值，视口底部留一大段用不上的空白。
-  requestAnimationFrame(() => doFit(key))
-  // 先记下申请 PTY 用的尺寸：下面 await 期间 RAF 的重测可能已把 xterm 改成别的尺寸。
-  const createdSize = term.cols + 'x' + term.rows
-  await openTerminal(hostId, sessionId, term.cols, term.rows)
-  // PTY 已按 createdSize 创建。布局稳定前（状态行出现/消失、字体就绪）积攒的
-  // 待发 resize 一律作废，并把创建尺寸登记为「已发送」：否则打开后必然补发
-  // 一次同尺寸 window-change，SIGWINCH 让 bash 在原地重绘空提示符，与启动的
-  // 那一遍叠成「[root@host ~]# [root@host ~]# [root@host ~]#」。
-  // 之后若真实尺寸又变（拖窗口、归档切换），reportResize 的去重不再命中，照常发出。
-  const pending = pendingResize.get(key)
-  if (pending) {
-    clearTimeout(pending)
-    pendingResize.delete(key)
-  }
-  lastSentSize.set(key, createdSize)
-
-  // 欢迎引导要等真提示符先出来：远端 shell 从登录到打印提示符有几百毫秒
-  // （实测 ~500ms，见 ptyprobe 抓包），立刻画会被后面的横幅/提示符压过去。
-  // 这一行只是「说明文字」，晚一点出现不影响使用，所以用固定延迟等着，
-  // 而不是去嗅探输出里有没有提示符（那要解析 ANSI，得不偿失）。
-  const created = terms.get(key)
-  setTimeout(() => {
-    // 期间用户可能已经切走/关了，或关掉后重开了一条新实例：只有当前登记的
-    // 仍是创建时那一条才画 —— 否则会把引导写进一条已经作废的实例里。
-    if (terms.get(key) !== created) return
-    paintWelcomeHintIfNeeded(key)
-  }, WELCOME_HINT_DELAY_MS)
 }
 
-// 欢迎引导的绘制时机与去重。
-//
-// 「每次打开或回到控制台都要提示」这条需求的难点是**去重的粒度**：
-// ensureTerm 在切任务回来、重试、布局重测时都会被调到，而它内部会复用活着的
-// 那条终端（提前 return）。若只在建实例时画，切走再切回来就看不到了；若每次
-// 调 ensureTerm 都画，同一屏会叠出好几行。所以用集合按「表面键」记，在
-// disposeTerm（关终端/切走）时清掉 —— 于是 ensureTerm 这条路径的语义是：
-//
-//   一次「打开 → 关闭」的生命周期里只提示一次，重新打开会再提示一次。
-//
-// force=true 用于「从归档切回」：那条路径不重建实例，但用户视线刚落到 shell
-// 上，正是提示有效的时刻，且**每次切回都该提示**（这是需求的原话），
-// 所以绕过集合直接画。
-function paintWelcomeHintIfNeeded(key, force = false) {
-  if (!key) return
-  if (!force && hintedKeys.has(key)) return
-  const t = terms.get(key)
-  if (!t) return
-  hintedKeys.add(key)
-  // 占位符只该在「空提示符、没有本地缓冲」时出现：用户已经打了一半字再切回
-  // 归档，回来时把那半行盖掉会很突兀。
-  if (t.line || t.passthrough || t.lineSynthetic) return
-  // 全屏接管、命令运行中都不画：屏幕此刻不是「空提示符」，提示会插进正在
-  // 等输入的程序界面里（bt 菜单、REPL 提示行）。
-  if (isFullscreen(key) || isCmdRunning(key)) return
-  // 提示符末尾的列号必须**在写占位符之前**取。
-  // 写占位符的最后一步是 ESC[<n>G（把光标移到提示文字起点），真实 xterm 会
-  // 因此把 cursorX 改掉 —— 事后再读就拿到提示文字的位置了，擦除会从错误的
-  // 列开始，把提示符一起覆盖掉。测试替身不模拟 ESC[G 的副作用，所以这个顺序
-  // 错了在单测里看不出来，只有真机才会露馅。
-  t.hintPromptCols = cursorCol(t)
-  t.hintCols = paint.paintWelcomeHint(surfaceWrite(key), t.hintPromptCols) || 0
-}
+// doFit/focusTerm/disposeTerm/reportResize/ensureTerm 的具体实现已拆到
+// terminal/termSession.js；本组件通过上面的 ensureSurface/disposeSurface 封装调用。
 
-// ---- 终端内直接输入：在提示符下就地编辑、回车分类 ----
-//
-// 真 PTY 逐字符透传的话，自然语言会被 bash 当命令执行而报错。所以把
-// 「shell 提示符下等待输入一条命令」这一常态改成本地行编辑：可打印字符
-// 本地回显、退格本地删，回车时 resolveInput 决定交给 Agent 还是发回 PTY。
-//
-// 代价：提示符下的 readline 原生历史/补全改由本地接管。因此凡是控制键/转义
-// 序列（Tab、方向键、Ctrl-C、Ctrl-R、Esc…）一律原样透传给 shell；
-// 全屏程序接管（备用屏幕，vim/top/htop）时更是整体透传，绝不抢键。
+// 欢迎引导绘制与光标/擦除/透传判定工具（paintWelcomeHintIfNeeded、isFullscreen、
+// isCmdRunning、cursorCol、displayWidth、eraseLocalLine、clearLocalEcho、
+// flushLocalToPty）都已拆到 terminal/termSession.js；本地行编辑归类见
+// terminal/termInput.js，提交分流见 terminal/termSubmit.js，本组件不再自带。
 
-function isFullscreen(key) {
-  const t = terms.get(key)
-  const buf = t && t.term.buffer && t.term.buffer.active
-  if (buf && buf.type === 'alternate') return true
-  // xterm 的 buffer 只看得到「切了备用屏幕」的全屏程序（vim/htop）。
-  // procps 系的 top 走的是原地重绘、不发备用屏幕，靠后端 Screen.InTUI()
-  // 经 term:tui 推来的 tuiActive 才能识别 —— 两条都得认，否则 top 里敲
-  // q 会被本地行编辑吞掉。
-  return !!t && !!termState(t.hostId, t.sessionId).tuiActive
-}
-
-// isCmdRunning 报告该表面是否有一条命令正在跑（后端 VT 模型从 OSC 133
-// 命令边界推来，见 store 的 term:cmd）。
-//
-// 与 isFullscreen 分开、而不是合并：这个不要求全屏 —— bt 菜单、read、
-// REPL、sudo 口令这类普通交互程序也算，它们同样随时会读 stdin，输入必须
-// 归它们。合并会误伤：全屏判定还用于「丢弃本地半行」等只该在真全屏发生
-// 的场景，而命令运行中不该做那些。
-function isCmdRunning(key) {
-  const t = terms.get(key)
-  return !!t && !!termState(t.hostId, t.sessionId).cmdActive
-}
-
-function cursorCol(t) {
-  const buf = t.term.buffer && t.term.buffer.active
-  return buf && typeof buf.cursorX === 'number' ? buf.cursorX : 0
-}
-
-// displayWidth 近似 wcwidth：CJK/全角占 2 列，其余 1 列。
-// 擦除本地回显时要按**显示宽度**补空格，中文按 1 算会擦不干净。
-function displayWidth(s) {
-  let w = 0
-  for (const ch of String(s)) {
-    const c = ch.codePointAt(0)
-    const wide = (c >= 0x1100 && c <= 0x115f) ||
-      (c >= 0x2e80 && c <= 0xa4cf) ||
-      (c >= 0xac00 && c <= 0xd7a3) ||
-      (c >= 0xf900 && c <= 0xfaff) ||
-      (c >= 0xfe30 && c <= 0xfe6f) ||
-      (c >= 0xff00 && c <= 0xff60) ||
-      (c >= 0xffe0 && c <= 0xffe6)
-    w += wide ? 2 : 1
-  }
-  return w
-}
-
-// eraseLocalLine 用等宽空格覆盖本地回显的字符（空格与回显同起点、同宽度，
-// wrap 路径一致，因此跨行折返也擦得净），再把光标移回输入起点。
-// 比「定位列 + \x1b[K 清到行尾」更能处理超长输入折行的情况。
-function eraseLocalLine(t, line) {
-  if (!line) return
-  const go = '\r\x1b[' + (t.startCol + 1) + 'G'
-  // 覆盖空格前后各补一次 SGR 复位：远端若残留黑底/反视频（某些程序退出时
-  // 不复位），裸空格会继承那个背景，擦完留下一条黑带 —— 必须强制回默认色。
-  t.term.write(go + '\x1b[0m' + ' '.repeat(displayWidth(line)) + '\x1b[0m' + go)
-}
-
-// clearLocalEcho 只擦掉本地回显并清空缓冲，**不**发给 PTY。
-// 用于全屏接管：此时 PTY 在跑 vim/top，把半截字符发过去会当成程序输入。
-function clearLocalEcho(t) {
-  if (!t.line) return
-  eraseLocalLine(t, t.line)
-  t.line = ''
-}
-
-// flushLocalToPty 擦掉本地回显后把缓冲发给 PTY（shell 空闲等输入，安全）。
-// 只用于控制键打断（Tab/方向键把这一行交回 shell 的 readline 接管）。
-// 本地编辑期间来了外部输出**不再走这里**：那会把半行自然语言直接交给
-// bash 执行，绕过 Agent 分流 —— 现在由 sink 原位重画（见 sink 注释）。
-function flushLocalToPty(t) {
-  if (!t.line) return
-  eraseLocalLine(t, t.line)
-  writeTerminal(t.hostId, t.sessionId, textToBase64(t.line))
-  t.line = ''
-}
-
-// submitQueue 让同一块表面（同一任务）的提交串行：onData 是同步回调没法 await，
-// 连敲回车会让多个 runShellInTerminal 并发（store.busy 交错、PTY 输出互踩）。
-const submitQueue = new Map()
-function enqueueSubmit(key, line) {
-  const prev = submitQueue.get(key) || Promise.resolve()
-  const next = prev.then(() => submitLine(key, line)).catch(() => {})
-  submitQueue.set(key, next)
-  return next
-}
-
-async function submitLine(key, line) {
-  const t = terms.get(key)
-  if (!t) return
-  const { hostId, sessionId } = t
-  const text = (line || '').trim()
-  if (!text) {
-    // 空回车：与 composer 同形，只给 PTY 一个换行让 shell 回显新提示符。
-    writeTerminal(hostId, sessionId, textToBase64('\n'))
-    return
-  }
-  // 分流要问一次后端「首词是不是命令」（见 inputRoute.resolveInput）：
-  //   `你是什么模型`  不是命令 → Agent，不弹
-  //   `echo 你好`     是命令   → shell，不弹（中文只是参数）
-  // 未知词（`ceshi`）不再弹窗：后端补一次远端探测，存在就当命令跑，
-  // 不存在才自动转 LLM（见 inputRoute.resolveUnknown / 后端 ResolveUnknownInput）。
-  const route = await resolveInput(text, backendAPI(), hostId)
-  await dispatchLine(key, text, route)
-}
-
-// dispatchLine 真正把一行交出去：agent 走 ask，shell 走策略闸门 + PTY。
-// 从 submitLine 里拆出来，是因为「二选一弹窗」选完之后要能直接复用这一段，
-// 而不能再走一遍 resolveInput（否则会再次弹窗，永远出不去）。
-//
-// route 由调用方传入（已经判过一次），不在这里重判 —— 重判就是又一轮
-// 跨进程往返，且可能与调用方的判断不一致。
-async function dispatchLine(key, text, route) {
-  const t = terms.get(key)
-  if (!t) return
-  const { hostId, sessionId } = t
-  if (route.kind === 'agent') {
-    if (!route.text) {
-      paint.paintSystem(surfaceWrite(key), '输入要问 Agent 的内容，或直接敲一条 shell 命令。')
-      return
-    }
-    // 未知命令自动转 LLM：先在终端时间线上留一句说明，再提问。
-    // 用户敲的是命令，回来的却是对话 —— 不解释一句他会以为命令执行了。
-    // 说明里带上探测结论（未找到），让这条去向改变是**可见**的（本项目
-    // 的诚实原则：不静默改变用户意图）。
-    if (route.missing) {
-      const name = route.binary ? `\`${route.binary}\`` : '这条命令'
-      paint.paintSystem(surfaceWrite(key), `未找到命令 ${name}，已作为问题交给 Agent 理解你的意图…`)
-    }
-    ask(route.text)
-    return
-  }
-  // shell：交回常驻终端通道（策略闸门 + 写进 PTY，PTY 自己回显执行）。
-  await runShellInTerminal(hostId, sessionId, route.text)
-}
-
-function onTermData(key, d) {
-  const t = terms.get(key)
-  if (!t) return
-  const send = s => writeTerminal(t.hostId, t.sessionId, s)
-
-  // 命令运行中（OSC 133;C..D 之间，见 store 的 term:cmd）：输入归命令，
-  // 所有按键原样透传给 PTY。
-  //
-  // 放在最前面（在 agent 吞键与本地行编辑之前）：命令在跑时按键属于**那条
-  // 命令** —— 不归 Agent（它的程序正等着这个输入），也不进本地缓冲（用户答
-  // `bt` 菜单的 `14` 被攒下来、回车时按「数字编号回复」路由给 LLM，就是截图
-  // 里的 bug：表面画出 `Ai-Shell > 14` + `Working...`，而菜单一直等不到输入）。
-  // 非全屏的交互程序全在这一档；全屏程序另有 isFullscreen 覆盖（两者都为真
-  // 时先到这里，效果同样是透传）。
-  //
-  // 为什么不先判断「程序是不是真的在等输入」：判断不出来（tty 不暴露读端
-  // 状态），而且真实终端的语义就是「命令运行期间键入都进那条 tty」—— 不猜。
-  // Ctrl-C 在这里同样透传：SIGINT 属于前台那条命令，不是中断 Agent 回合
-  // （回合要靠工具条的「中断」按钮停）。
-  if (isCmdRunning(key)) {
-    clearWelcomeHint(t)
-    clearLLMHint(t)
-    send(textToBase64(d))
-    return
-  }
-
-  // agent 正在跑：此刻的按键不属于任何命令行，**必须丢掉**。
-  //
-  // 为什么不能攒进本地缓冲：攒下来的半截字符在回合结束时会让
-  // 「补 ❯ 提示符」的 watcher 认为「用户已经打了一半」（见下方 t.line 判断），
-  // 于是不补提示符 —— 用户看到的就是「LLM 答完了却没回到命令输入行」。
-  // 更糟的是这一行会在下一次回车时被当成提问发出去，凭空多跑一轮 LLM。
-  //
-  // Ctrl-C 是例外：它是「等不下去了，中断」唯一的键盘出口，放行给 stop()。
-  if (store.running || store.busy) {
-    if (d.includes('\x03')) stop()
-    return
-  }
-
-  // 占位符撤退：用户开始操作了，先把欢迎引导与 LLM 提示都擦干净再走后续分支。
-  // 放在最前面（而不是各分支里各擦一次）是因为每个分支都会往屏幕上写字，
-  // 漏掉任何一条都会让提示文字和真实输入混在同一行。
-  clearWelcomeHint(t)
-  clearLLMHint(t)
-
-  // 已降级透传（本地缓冲已被控制键 flush 给远端、这一行交给 shell readline 接管）：
-  // 原样送 PTY（多字符也整体送）。回车（这一行交回 shell 处理完）或 Ctrl-C
-  // （中断、回到空提示符）后恢复本地编辑。
-  // 注意：外部输出到达**不再**触发透传（见 sink —— 现在是原位重画），
-  // 这条分支只剩控制键一条入口。
-  if (t.passthrough) {
-    send(textToBase64(d))
-    if (/[\r\n\x03]/.test(d)) t.passthrough = false
-    return
-  }
-
-  // 多字符输入分三类：含换行=多行粘贴，逐字符回放让 \r 走提交分支；
-  // 转义/控制序列（方向键、功能键）=整体透传，绝不能拆散；
-  // 纯可打印（粘贴一段命令）=整体本地缓冲。
-  if (d.length > 1) {
-    if (/[\r\n]/.test(d)) {
-      for (const ch of d) onTermData(key, ch)
-      return
-    }
-    if (/[\x00-\x1f\x7f]/.test(d)) {
-      flushLocalToPty(t)
-      send(textToBase64(d))
-      // 整段控制序列（方向键/粘贴含控制符等）同样把这一行交回 shell 接管：
-      // 缓冲已 flush 给远端，不置透传则后续退格会因本地缓冲已空而被吞掉。
-      t.passthrough = !d.includes('\x03')
-      // 这一行交还 shell 后，行首的合成提示符不再是「我们的」——不能在回车时整行擦除
-      t.lineSynthetic = false
-      return
-    }
-    if (!t.line) t.startCol = cursorCol(t)
-    t.line += d
-    t.term.write(d)
-    return
-  }
-
-  // 全屏程序接管：擦掉残留本地回显后整体透传，绝不抢键、也不污染程序输入。
-  if (isFullscreen(key)) {
-    clearLocalEcho(t)
-    t.lineSynthetic = false
-    send(textToBase64(d))
-    return
-  }
-
-  // 回车：提交本地缓冲的这一行（串行化，避免连敲并发）。
-  if (d === '\r' || d === '\n') {
-    const line = t.line
-    t.line = ''
-    if (t.lineSynthetic) {
-      // 这一行开头的 ❯ 是界面补的合成提示符，不是远端画的：整行清掉，
-      // agent 分支由 paintUser 重画提问行，shell 分支由 PTY 回显命令与真提示符。
-      t.lineSynthetic = false
-      t.term.write('\r\x1b[2K')
-    } else {
-      eraseLocalLine(t, line)
-    }
-    enqueueSubmit(key, line)
-    return
-  }
-
-  // 退格：本地删一个字符。必须按**码点**删（代理对算一个字符），并按它的
-  // **显示宽度**回退擦除 —— 中文/全角占 2 列，只回退擦 1 列会留下右半、
-  // 光标错位（下一字符的 startCol 跟着错），表现为「输入自然语言时删不干净」。
-  if (d === '\x7f') {
-    if (t.line) {
-      const chars = Array.from(t.line)
-      const last = chars.pop()
-      t.line = chars.join('')
-      t.term.write('\b \b'.repeat(displayWidth(last)))
-    }
-    return
-  }
-
-  // 其它控制字符 / 转义序列（Tab、方向键、Ctrl-C、Ctrl-R、Esc…）：
-  // 放弃本地行编辑，把缓冲 flush 给 PTY 后透传该键 —— 从这一下起这一行交给
-  // shell，后续按键（含退格、方向键）原样进 PTY，直到回车再回到本地行编辑。
-  // 关键：必须置 passthrough，否则退格会因本地缓冲已被 flush 清空而被吞掉，
-  // 表现为「按方向键/Tab 编辑一行后删不动」。Ctrl-C 例外：它中断并清空该行，
-  // 远端回到空提示符，故留在本地编辑态。
-  if (/[\x00-\x1f\x7f]/.test(d)) {
-    flushLocalToPty(t)
-    send(textToBase64(d))
-    t.passthrough = !d.includes('\x03')
-    // 这一行交还 shell 后，行首的合成提示符不再是「我们的」——不能在回车时整行擦除
-    t.lineSynthetic = false
-    return
-  }
-
-  // 普通可打印字符：首次进入本行记下起始列（供擦除定位），本地回显 + 缓冲。
-  if (!t.line) t.startCol = cursorCol(t)
-  t.line += d
-  t.term.write(d)
-}
-
-// surfaceWrite 返回往某块表面（按 host+session 键）写字符串的落点，供 termPaint 画 agent 事件。
-// 实例还没建（或已销毁）时返回 undefined —— termPaint 对 undefined 落点安全 no-op。
-function surfaceWrite(key) {
-  const t = terms.get(key)
-  return t ? (s => t.term.write(s)) : undefined
-}
-
-// clearWelcomeHint 把欢迎占位符从屏幕上撤走，留下干净的「提示符 + 光标」。
-//
-// 光标此刻停在提示符与占位符之间（paintWelcomeHint 写完后用 ESC[<n>G 移回来了），
-// 所以要先把光标**移到占位符起点**，再用等宽空格覆盖它 —— 不能用 \r ESC[2K 清整行：
-// 那会把远端画的提示符也一起清掉，而提示符文本我们手里没有，清掉就再也画不回来了。
-// 覆盖后光标自然停在提示符末尾，后续回显（本地行编辑或 PTY 输出）落位正确。
-function clearWelcomeHint(t) {
-  if (!t || !t.hintCols) return
-  const n = t.hintCols
-  const col = t.hintPromptCols || 0
-  t.hintCols = 0
-  t.hintPromptCols = 0
-  // 移到占位符起点（提示符末尾）：列号从 1 起，故 +1。
-  t.term.write('\x1b[' + (col + 1) + 'G' + ' '.repeat(n) + '\x1b[' + (col + 1) + 'G')
-}
-
-// clearLLMHint 擦掉命令跑完后贴在提示符后面的「可交给 LLM 分析」占位提示。
-// 机制与 clearWelcomeHint 完全一致：用户一开始打字，占位就必须让位。
-function clearLLMHint(t) {
-  if (!t || !t.llmHintCols) return
-  const n = t.llmHintCols
-  const col = t.llmHintStart || 0
-  t.llmHintCols = 0
-  t.llmHintStart = 0
-  t.term.write('\x1b[' + (col + 1) + 'G' + ' '.repeat(n) + '\x1b[' + (col + 1) + 'G')
-}
+// 提交队列（enqueueSubmit/submitLine/dispatchLine）、本地行编辑路由（onTermData）、
+// 落点写入（surfaceWrite）与占位符擦除（clearWelcomeHint/clearLLMHint）已全部
+// 拆到 terminal/termSubmit.js 与 terminal/termSession.js。
 
 async function onClose() {
   const hostId = store.currentHostId
   if (!hostId) return
   const key = currentKey.value
   await closeTerminal(hostId, store.currentSessionId)
-  disposeTerm(key)
+  disposeSurface(key)
   if (attachedKey === key) attachedKey = ''
 }
 
 function onRetry() {
-  ensureTerm(store.currentHostId, store.currentSessionId)
+  ensureSurface(store.currentHostId, store.currentSessionId)
 }
 
 // 从归档切回表面时重新测量：隐藏期间容器是 0x0，fit 一直跳过。
@@ -791,14 +223,9 @@ watch(showArchive, async on => {
 // 变成「所以不给你提示符」的理由。用户要的是每次答完都回到命令行。
 watch(() => store.running, (v, ov) => {
   if (ov !== true || v) return
-  const key = currentKey.value
-  const t = terms.get(key)
-  if (!t || t.passthrough) return
-  if (isPtyDirty(t.hostId, t.sessionId)) return
-  // 已有合成 ❯（上一轮补的、用户还没敲）就不重复补。
-  if (t.lineSynthetic) return
-  paint.paintInputPrompt(surfaceWrite(key))
-  t.lineSynthetic = true
+  // 补合成 ❯ 的判定（passthrough / isPtyDirty / 已有合成行）全部下沉到
+  // termInput.paintInputPromptIfNeeded，这里只负责在回合结束时触发。
+  paintInputPromptIfNeeded(currentKey.value)
 })
 
 // 状态行出现/消失会改 surface-body 的高度，但 .surface 自身尺寸不变 ——
@@ -935,10 +362,10 @@ let hostSwitching = false
 // 落实「只留当前任务」：切换任务时上一任务的现场就此丢弃（回来是全新 shell）。
 async function detachSurface(key) {
   if (!key) return
-  const t = terms.get(key)
+  const t = getTerm(key)
   if (!t) return
   await closeTerminal(t.hostId, t.sessionId)
-  disposeTerm(key)
+  disposeSurface(key)
 }
 
 // attachSurface 为目标任务拉起一条全新 shell：关掉当前附着着的其它表面，
@@ -948,7 +375,7 @@ async function attachSurface(hostId, sessionId) {
   if (!hostId) return
   const key = bucketKey(hostId, sessionId)
   if (attachedKey && attachedKey !== key) await detachSurface(attachedKey)
-  await ensureTerm(hostId, sessionId)
+  await ensureSurface(hostId, sessionId)
   attachedKey = key
   reportActiveSession(hostId, sessionId)
   await nextTick()
@@ -1149,7 +576,7 @@ const copyTimers = new Map()   // key -> timer
 //       接着输入字符落在新行、退格却按旧列号定位，表现为擦错位置、字符乱跳。
 // 复制是高频动作，静默完成最稳妥；真要提示应走 UI 层（toast），不碰终端。
 async function copySelection(key) {
-  const t = terms.get(key)
+  const t = getTerm(key)
   if (!t) return false
   const sel = t.term.getSelection ? t.term.getSelection() : ''
   if (!sel) return false
@@ -1224,8 +651,9 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', onWinKeydown)
   // 销毁本地实例（DOM 已经没了），但**不关远端终端**：卸载往往只是换视图，
   // 用户希望切回来时 shell 还在原目录。真正的清理走「关闭终端」与切换任务；
-  // 应用退出时后端 shutdown 会关掉所有终端。
-  for (const key of [...terms.keys()]) disposeTerm(key)
+  // 应用退出时后端 shutdown 会关掉所有终端。实例登记表归 termSession，这里
+  // 遍历当前存活的表面键逐个销毁（disposeSurface 顺带清接线标记）。
+  for (const key of [...openedKeys.value]) disposeSurface(key)
   attachedKey = ''
 })
 </script>

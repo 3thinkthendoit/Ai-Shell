@@ -876,6 +876,14 @@ func (a *Agent) Run(parent context.Context, hostID, sessionID, prompt, profileID
 		})
 		reply, err := a.chatOnce(ctx, client, msgs, step, pol.AllowCrossHost)
 		if err != nil {
+			// 用户点了「中断」：ctx 已取消，HTTP 请求带着 context canceled
+			// 返回是**预期内的收场**，不是故障 —— 原样 emit 会把
+			// 「请求 LLM 失败: context canceled」画成一条红字，等于把用户
+			// 自己的操作报成错误。与循环开头、工具执行后的 ctx 检查保持
+			// 同一套约定：安静结束，回执由前端的 stop() 自己补。
+			if ctx.Err() != nil {
+				return err
+			}
 			a.emit(EvError, map[string]string{"message": err.Error()})
 			return err
 		}

@@ -669,6 +669,12 @@ describe('欢迎引导', () => {
     await nextTick()
   }
 
+  // 模拟远端提示符到达：引导带时序守卫（见 paintWelcomeHintIfNeeded），
+  // 必须等远端真正开口、且输出安静下来才画 —— 测试里先把它喂出来。
+  function remotePromptArrived() {
+    rt.emit('term:data', { hostId: 'h1', data: textToBase64('root@host:~$ ') })
+  }
+
   it('打开终端后出现一次，等真提示符出来再画', async () => {
     vi.useFakeTimers()
     try {
@@ -676,6 +682,7 @@ describe('欢迎引导', () => {
       setup()
       await vi.advanceTimersByTimeAsync(0)
       await attached()
+      remotePromptArrived()
 
       // 计时器还没到点：此刻不该有引导（否则会被远端提示符压过去）。
       expect(instances[0].text()).not.toContain('自然语言')
@@ -692,6 +699,34 @@ describe('欢迎引导', () => {
     }
   })
 
+  // 慢连接回归：引导抢在远端 banner 之前画到 (0,0)，banner 以 \r\n 开头到达后
+  // 这条引导被永久留在 Welcome 行上方（用户截图里的「乱码」行），且远端数据
+  // 一到 hintCols 就被清零、再也擦不掉。守卫必须让它等到输出安静之后。
+  it('慢连接：远端迟迟没输出时到点不画，输出安静后才画、且画在提示符之后', async () => {
+    vi.useFakeTimers()
+    try {
+      withHost()
+      setup()
+      await vi.advanceTimersByTimeAsync(0)
+      await attached()
+
+      // SSH 握手 + 认证 + MOTD 超过了 700ms：引导定时器到点，但远端一个
+      // 字节都没来 —— 此刻绝不能画。
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(instances[0].text()).not.toContain('自然语言')
+
+      // 远端提示符终于来了，之后安静下来：引导这才落笔，且排在提示符之后。
+      rt.emit('term:data', { hostId: 'h1', data: textToBase64('root@host:~$ ') })
+      await vi.advanceTimersByTimeAsync(500)
+      const text = instances[0].text()
+      expect(text).toContain('自然语言')
+      expect(text.indexOf('root@host')).toBeGreaterThan(-1)
+      expect(text.indexOf('自然语言')).toBeGreaterThan(text.indexOf('root@host'))
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('占位符从提示符末尾那一列开始写，光标随后归位到该列', async () => {
     vi.useFakeTimers()
     try {
@@ -699,6 +734,9 @@ describe('欢迎引导', () => {
       setup()
       await vi.advanceTimersByTimeAsync(0)
       await attached()
+      remotePromptArrived()
+      // 提示符字节已进表面；这里要逐字节断言引导自身的写法，先清一次。
+      clearSurface()
 
       const inst = instances[0]
       // 模拟真实提示符 root@VM_0_16_centos:~$ —— 23 列宽，光标停在列 23。
@@ -723,6 +761,7 @@ describe('欢迎引导', () => {
       setup()
       await vi.advanceTimersByTimeAsync(0)
       await attached()
+      remotePromptArrived()
 
       const inst = instances[0]
       // 提示符末尾列号在**写占位符时**读取（见 paintWelcomeHintIfNeeded），
@@ -750,6 +789,7 @@ describe('欢迎引导', () => {
       setup()
       await vi.advanceTimersByTimeAsync(0)
       await attached()
+      remotePromptArrived()
 
       const inst = instances[0]
       // 用户在提示符下已经敲了字，此时切回表面不该把占位符塞进来。
@@ -771,6 +811,7 @@ describe('欢迎引导', () => {
       setup()
       await vi.advanceTimersByTimeAsync(0)
       await attached()
+      remotePromptArrived()
       await runHintTimer()
 
       // 触发一次重测（容器尺寸变化会引起 doFit → 可能再走 ensureTerm）。
@@ -792,6 +833,7 @@ describe('欢迎引导', () => {
       setup()
       await vi.advanceTimersByTimeAsync(0)
       await attached()
+      remotePromptArrived()
       await runHintTimer()
 
       await toArchive()
@@ -813,6 +855,7 @@ describe('欢迎引导', () => {
       setup()
       await vi.advanceTimersByTimeAsync(0)
       await attached()
+      remotePromptArrived()
       // 用户先跑起 bt（菜单在等输入）：无论引导定时器到点，还是从归档切回，
       // 都不能把提示画进菜单界面里。
       rt.emit('term:cmd', { hostId: 'h1', active: true })

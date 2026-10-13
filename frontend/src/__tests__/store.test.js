@@ -318,6 +318,20 @@ describe('bindEvents 事件接线', () => {
 
     expect(store.pending).not.toBe(null)
   })
+
+  // 后端 reason 已是完整句子（「审批超时或已中断」）。前端若再拼「审批」
+  // 前缀就叠出「审批审批超时…」—— 照搬后端的话，不要重写。
+  it('approval:expired 照搬后端 reason，不叠「审批」前缀', () => {
+    install({ runtime: rt, app: makeApp().app })
+    bindEvents()
+    store.pending = { id: 'a1', name: 'shell', command: 'systemctl restart nginx' }
+
+    rt.emit('approval:expired', { id: 'a1', reason: '审批超时或已中断' })
+
+    const last = store.entries.at(-1)
+    expect(last.kind).toBe('system')
+    expect(last.content).toBe('审批超时或已中断，Agent 不会执行该命令。')
+  })
 })
 
 // ---- 审计日志写入失败 ----
@@ -593,6 +607,35 @@ describe('stop 中断', () => {
     expect(store.running).toBe(false)
     expect(store.pending).toBe(null)
     expect(store.entries.at(-1).content).toContain('bridge down')
+  })
+
+  // 后端对用户主动中断静默收场（agent.go：ctx 取消是预期内的，不发
+  // agent:error）—— 回执「已中断本轮任务」由前端补，且必须是灰色系统
+  // 提示（kind: system），不是红色故障记录：把用户自己的操作画成错误
+  // 就是当初那条「请求 LLM 失败: context canceled」红字的教训。
+  it('成功中断后落一条灰色系统回执，而不是错误记录', async () => {
+    const { app, calls } = makeApp()
+    install({ runtime: rt, app })
+    store.running = true
+    await stop()
+    const errEntries = store.entries.filter(e => e.kind === 'error')
+    expect(errEntries, '中断不应产生任何错误记录').toHaveLength(0)
+    const sys = store.entries.at(-1)
+    expect(sys.kind).toBe('system')
+    expect(sys.content).toBe('已中断本轮任务。')
+    expect(calls.filter(c => c.name === 'Stop')).toHaveLength(1)
+  })
+
+  // 后端 Stop() 对「本来就没在跑」是静默空操作：回合可能恰好在点击前一瞬
+  // 正常收场。此时落「已中断本轮任务」是在说谎 —— 空闲时中断必须安静。
+  it('没有任务在跑时中断不落任何回执', async () => {
+    const { app, calls } = makeApp()
+    install({ runtime: rt, app })
+    store.running = false
+    store.busy = false
+    await stop()
+    expect(calls.filter(c => c.name === 'Stop')).toHaveLength(1)
+    expect(store.entries, '空闲中断不应产生任何记录').toHaveLength(0)
   })
 })
 
