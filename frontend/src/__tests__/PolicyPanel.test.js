@@ -321,3 +321,51 @@ describe('PolicyPanel 跨主机执行', () => {
     expect(wrapper.find('.cross-host').element.checked).toBe(true)
   })
 })
+
+// 出网开关（fetch_webpage / search_web）默认必须是关的。
+//
+// 这一条守的是安全默认值：这两个工具让 LLM 具备「把内容送去公网」的
+// 能力，而一台被入侵的主机可以借提示注入诱导它这么做。默认关意味着
+// 老配置与「没注意过这个开关」的用户天然安全。
+describe('PolicyPanel 访问互联网', () => {
+  it('默认关闭，且不勾选时不保存搜索提供方', async () => {
+    setup()
+    const box = wrapper.find('.allow-web')
+    expect(box.element.checked).toBe(false)
+
+    // 没勾选时搜索下拉不该出现（勾了才需要配它）。
+    expect(wrapper.find('select').exists()).toBe(false)
+
+    const saved = await save()
+    expect(saved.args[0].allowWeb).toBe(false)
+    expect(saved.args[0].searchProvider).toBe('')
+  })
+
+  it('勾选后才出现搜索服务下拉', async () => {
+    setup()
+    await wrapper.find('.allow-web').setValue(true)
+    await flushPromises()
+
+    const sel = wrapper.find('select')
+    expect(sel.exists()).toBe(true)
+    expect(sel.findAll('option').length).toBeGreaterThan(1)
+  })
+
+  it('选了搜索提供方后随策略一起保存', async () => {
+    setup()
+    await wrapper.find('.allow-web').setValue(true)
+    await flushPromises()
+    await wrapper.find('select').setValue('duckduckgo')
+
+    const saved = await save()
+    expect(saved.args[0].allowWeb).toBe(true)
+    expect(saved.args[0].searchProvider).toBe('duckduckgo')
+  })
+
+  it('后端已开启时回显为选中', async () => {
+    store.policy = { ...defaultPolicy(), allowWeb: true, searchProvider: 'duckduckgo' }
+    setup()
+    expect(wrapper.find('.allow-web').element.checked).toBe(true)
+    expect(wrapper.find('select').element.value).toBe('duckduckgo')
+  })
+})

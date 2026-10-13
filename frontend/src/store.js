@@ -1,5 +1,6 @@
 import { reactive } from 'vue'
 import * as paint from './termPaint'
+import { providerTermBadge } from './providerLogos'
 
 const api = () => window.go?.main?.App
 const rt = () => window.runtime
@@ -49,6 +50,25 @@ export const store = reactive({
   // llmProfiles 是全部 LLM 配置方案（每项含 active 标记，不含密钥）。
   // 当前使用哪一套以每项的 active 为准，不另存副本 —— 两份数据迟早不一致。
   llmProfiles: [],
+  // selectedProfileId 是「下一轮对话要用的 LLM 方案」。
+  //
+  // 下拉框一改就**同步**写它，请求也直接带它（见 ask）—— 于是「界面上选中的模型」
+  // 和「本轮请求实际带的模型」是同一个值。这样切换是「随请求下发」的即时生效，
+  // 不再依赖「先改全局激活指针、下一轮才读它」那条间接路径：既不会在切换的
+  // 后端回程还没跑完时把请求发到上一套方案上，也省掉了「切了却没换」的观感。
+  selectedProfileId: '',
+
+  // contextUsage 是最近一次请求的上下文用量（估算值，见 internal/agent/tokenbudget.go）。
+  // window 为 0 表示后端认不出该模型的上下文窗口 —— 此时只显示 token 数，不显示占比。
+  contextUsage: { tokens: 0, window: 0, messages: 0 },
+
+  // agentTransfer 是**模型发起**的文件传输进度（download_remote_file 工具）。
+  //
+  // 与 fileManager.progress 分开：后者是人在弹窗里点下载，前者是模型在拉文件，
+  // 两者可能同时进行。共用一个字段会让进度条张冠李戴 —— 显示 A 的速度，
+  // 实际在传 B。null 表示当前没有进行中的传输。
+  agentTransfer: null,
+
   // maxTransferBytes 是文件管理上传/下载的大小上限，来自 Bootstrap。
   //
   // 与 policy 那几个占位值同一个模式：这里只是 Bootstrap 回来之前的默认值，
@@ -308,6 +328,10 @@ export async function bootstrap() {
     store.hosts = info.hosts || []
     store.llm = info.llm || store.llm
     store.llmProfiles = info.llmProfiles || []
+    // 选中的方案若已不存在（被删）或还没定过，落到当前激活的那套上。
+    if (!store.llmProfiles.some(p => p.id === store.selectedProfileId)) {
+      store.selectedProfileId = (store.llmProfiles.find(p => p.active) || {}).id || ''
+    }
     store.policy = info.policy || store.policy
     if (info.maxTransferBytes > 0) store.maxTransferBytes = info.maxTransferBytes
     if (!store.currentHostId && store.hosts.length) store.currentHostId = store.hosts[0].id
@@ -428,7 +452,7 @@ const EV_NAMES = [
   'agent:delta', 'agent:message', 'agent:reasoning', 'agent:tool', 'agent:toolResult',
   'agent:injection', 'agent:approval', 'approval:expired', 'agent:status', 'agent:error',
   'audit:error', 'agent:done', 'term:data', 'term:exit', 'term:tui', 'term:cwd', 'agent:snapshot',
-  'fm:transfer'
+  'fm:transfer', 'agent:transfer'
 ]
 
 // surfaceWrite 返回往某块终端表面（按 host+session 键）写字符串的落点（就是它
@@ -444,6 +468,63 @@ function paintHost() {
   return targetKey()
 }
 
+// ---- 思考占位（「……」动画）----
+
+// currentModelBadge 取「这一轮实际在用的模型方案」的终端徽标信息。
+//
+// 优先用 selectedProfileId（下拉框刚选中的那套，与请求实际带的是同一个值 ——
+// 见 ask），回退到后端标记 active 的那套。拿不到任何方案时返回 null，
+// 让 paintAssistantHeader 走「綠点」兜底。
+function currentModelBadge() {
+  const id = store.selectedProfileId
+  const p = store.llmProfiles.find(x => x.id === id) ||
+    store.llmProfiles.find(x => x.active) || null
+  if (!p) return null
+  try {
+    return providerTermBadge(p)
+  } catch {
+    return null
+  }
+}
+
+// thinkingDots 记录每块表面当前的思考占位状态：{ timer, frame, width }。
+// 用非响应式 Map（存的是定时器与函数，进响应式毫无意义）。
+const thinkingDots = new Map()
+
+const THINKING_INTERVAL_MS = 400
+// 点数在 0..4 之间循环：`Working` → `Working.` → `Working..` → `Working...`
+// → `Working....` → 回到 `Working`。循环才是「还在转」的通用符号，也不至于
+// 把行撑长。
+const THINKING_MAX_DOTS = 4
+
+// startThinking 在表面上开始滚动 `Working....` 占位。幂等：已在跑就不重开
+// （后端每个 step 都会重发 status=thinking，不能因此叠出多个定时器）。
+function startThinking(key) {
+  if (!key) return
+  if (thinkingDots.has(key)) return
+  const w = surfaceWrite(key)
+  if (!w) return
+  // next 记录「下一个要画的点数」，0..THINKING_MAX_DOTS 循环。
+  const state = { timer: null, next: 0, width: 0 }
+  const tick = () => {
+    const frame = state.next
+    state.next = frame >= THINKING_MAX_DOTS ? 0 : frame + 1
+    state.width = paint.paintThinking(w, frame, state.width) || state.width
+  }
+  state.timer = setInterval(tick, THINKING_INTERVAL_MS)
+  thinkingDots.set(key, state)
+  tick() // 立刻画第一帧，别等一个周期（否则提问后有一瞬空白）
+}
+
+// stopThinking 停掉并擦除某块表面的思考占位。
+function stopThinking(key) {
+  const state = thinkingDots.get(key)
+  if (!state) return
+  clearInterval(state.timer)
+  thinkingDots.delete(key)
+  paint.clearThinking(surfaceWrite(key), state.width)
+}
+
 export function bindEvents() {
   const r = rt()
   if (!r) return
@@ -452,7 +533,10 @@ export function bindEvents() {
 
   // 流式增量：逐字累加到「活」消息上
   r.EventsOn('agent:delta', d => {
-    const w = surfaceWrite(paintHost())
+    const host = paintHost()
+    const w = surfaceWrite(host)
+    // 正文开始流出：思考占位使命完成，先擦掉再画抬头/正文，避免两者叠在一行。
+    stopThinking(host)
     const live = liveAssistant(d.step)
     if (live) {
       live.content += d.text
@@ -461,14 +545,15 @@ export function bindEvents() {
         live.contentPainted = true
         if (live.reasoningPainted) {
           paint.paintAssistantEnd(w)
-          paint.paintAssistantHeader(w)
+          paint.paintAssistantHeader(w, live.badge)
         }
       }
       paint.paintAssistantDelta(w, d.text)
       return
     }
-    push({ kind: 'assistant', content: d.text, stream: d.step, streaming: true })
-    paint.paintAssistantHeader(w)
+    const badge = currentModelBadge()
+    push({ kind: 'assistant', content: d.text, stream: d.step, streaming: true, badge })
+    paint.paintAssistantHeader(w, badge)
     paint.paintAssistantDelta(w, d.text)
   })
 
@@ -476,12 +561,16 @@ export function bindEvents() {
   // 同时以弱化灰字画进终端表面——那是主视图，思考过程必须当场可见。
   // 思考先于正文到达，往往还要先由它建出这条消息。
   r.EventsOn('agent:reasoning', d => {
-    const w = surfaceWrite(paintHost())
+    const host = paintHost()
+    const w = surfaceWrite(host)
+    // 思考内容开始到达：占位的「......」该让位给真正的思考文本了。
+    stopThinking(host)
     let live = liveAssistant(d.step)
     if (!live) {
-      push({ kind: 'assistant', content: '', stream: d.step, streaming: true, reasoning: '', reasoningOpen: true })
+      const badge = currentModelBadge()
+      push({ kind: 'assistant', content: '', stream: d.step, streaming: true, reasoning: '', reasoningOpen: true, badge })
       live = liveAssistant(d.step)
-      paint.paintAssistantHeader(w)
+      paint.paintAssistantHeader(w, badge)
     }
     live.reasoning = (live.reasoning || '') + d.text
     live.reasoningOpen = true
@@ -490,35 +579,46 @@ export function bindEvents() {
   })
 
   r.EventsOn('agent:message', m => {
-    const w = surfaceWrite(paintHost())
+    const host = paintHost()
+    const w = surfaceWrite(host)
     if (m.role !== 'assistant') {
       push({ kind: 'user', content: m.content })
       paint.paintUser(w, m.content)
       return
     }
+    stopThinking(host)
     const live = liveAssistant(m.step)
     if (live) {
       // 定稿：用后端给的完整内容覆盖一次，纠正任何在传输中丢掉的尾巴。
       // 表面上 delta 已经流式画过了，这里只补一个换行收尾，不重画全文。
       live.content = m.content
+      // 记下这条回答是哪个模型给的：界面据此标注，让「选中的模型」与
+      // 「实际回答的模型」对得上，不必靠模型自述去猜。
+      if (m.model) live.model = m.model
       live.streaming = false
       // 回答已开始：默认收起思考区，长思考不该一直把正文顶出屏幕，需要时可手动展开
       live.reasoningOpen = false
       paint.paintAssistantEnd(w)
       return
     }
-    push({ kind: 'assistant', content: m.content })
-    paint.paintAssistantHeader(w)
+    const badge = m.model ? providerTermBadge({ model: m.model, name: m.model }) : currentModelBadge()
+    push({ kind: 'assistant', content: m.content, model: m.model, badge })
+    paint.paintAssistantHeader(w, badge)
     paint.paintAssistantDelta(w, m.content)
     paint.paintAssistantEnd(w)
   })
 
   r.EventsOn('agent:tool', v => {
+    // 模型已经产出工具调用 = 不再是「还在思考」：先收掉滚动占位。
+    // **实时**画一行（非 shell 风格），让人当场看到 agent 在调什么工具。
+    stopThinking(paintHost())
     upsertTool(v)
-    paint.paintTool(surfaceWrite(paintHost()), v)
+    paint.paintToolCall(surfaceWrite(paintHost()), v)
   })
 
   r.EventsOn('agent:toolResult', res => {
+    // 同上：工具结果是一大段会往表面写的输出，必须先结束占位，避免两者交错。
+    stopThinking(paintHost())
     push({
       kind: 'result',
       toolId: res.id,
@@ -527,19 +627,26 @@ export function bindEvents() {
       redacted: res.redacted || 0,
       injection: res.injection || []
     })
-    // 双写：结果进归档时间线（上面 push）之外，也在终端表面上画一行退出码 +
-    // 截断输出，让人在同一片流里看到 agent 这条命令跑成了什么样。
-    const w = surfaceWrite(paintHost())
-    paint.paintToolResult(w, res)
-    // 命中 TTY 特征（top/vim 这类）：把命令**交接**到这条任务自己的常驻终端
-    // 表面执行 —— 与人亲手在键盘上敲同形，画面实时可见；模型看到的仍是命令
-    // 退出时定格的屏幕快照（见 agent:snapshot）。
+    // 一行紧凑状态（完成 / 失败）；输出与详情进「对话归档」。
+    // TTY 交接还要把命令写进常驻终端 —— 那是「把交互式程序交给用户操作」。
+    paint.paintToolResultLine(surfaceWrite(paintHost()), res)
     if (res.tty && res.command && res.hostId) {
       writeTerminal(res.hostId, res.sessionId, textToBase64(res.command + '\n'))
     }
   })
 
+  // agent:context 是「本次请求的上下文用量」：后端每步请求前推一次
+  // （见 agent.EvContext）。放进 store 而不是组件本地 state ——
+  // 归档视图将来也要显示它，而事件只应有一个消费者入口（bindEvents）。
+  r.EventsOn('agent:context', d => {
+    if (!d) return
+    store.contextUsage.tokens = d.tokens || 0
+    store.contextUsage.window = d.window || 0
+    store.contextUsage.messages = d.messages || 0
+  })
+
   r.EventsOn('agent:injection', e => {
+    stopThinking(paintHost())
     push({
       kind: 'injection',
       findings: e.findings || [],
@@ -550,6 +657,7 @@ export function bindEvents() {
   })
 
   r.EventsOn('agent:approval', v => {
+    stopThinking(paintHost())
     store.pending = v
     // 审批条/弹窗是交互入口；表面上只补一行注记说明「为什么停住了」。
     paint.paintApproval(surfaceWrite(paintHost()), v)
@@ -567,10 +675,14 @@ export function bindEvents() {
 
   r.EventsOn('agent:status', s => {
     store.running = s.status === 'thinking'
+    // 后端发出 status=thinking 即「用户提问已被受理、模型开始思考」——
+    // 这正是要显示「......」的时刻（见需求：用户发完自然语言就转圈）。
+    if (store.running) startThinking(paintHost())
   })
 
   r.EventsOn('agent:error', e => {
     store.running = false
+    stopThinking(paintHost())
     // 出错即本轮已终止，agent 自己的工具审批条要一并清掉，否则输入框锁死。
     // 但人敲命令的审批（name=shell）不属于 agent 回合：它由 shellGate 在后端
     // 单独等待（见 app_shell.go），清掉会让审批条凭空消失、后端还在等
@@ -591,6 +703,7 @@ export function bindEvents() {
 
   r.EventsOn('agent:done', () => {
     store.running = false
+    stopThinking(paintHost())
     // 同 agent:error：人敲命令的审批（name=shell）不随 agent 回合收场。
     // agent 自己的工具审批在回合结束时必须清掉（回合已终止，批准无意义）。
     if (!isHumanShellApproval(store.pending)) store.pending = null
@@ -605,6 +718,10 @@ export function bindEvents() {
     // 没有落点就直接丢掉：那是「界面还没建好实例」的那一小段，
     // 而终端只在用户真的打开它之后才会有输出。
     if (!sink) return
+    // 远端真的吐字节了：光标即将被这段输出推走，思考占位不再安全 —— 立即收掉。
+    // 不先收的话，占位那一行会被 PTY 输出顶到别处、`\r` 再也回不去，残留成幽灵
+    // `Working`（用户截图里 `Working..` 和 shell 提示符挤在同一行就是这个）。
+    stopThinking(k)
     try {
       sink(base64ToBytes(d.data))
       // 有人等着「这轮输出画完」：续期静默计时器（见 afterTermQuiet）。
@@ -654,6 +771,27 @@ export function bindEvents() {
     }
   })
 
+  // agent 侧文件传输进度（download_remote_file 工具）。
+  //
+  // 与上面的 fm:transfer 刻意分开存：那条是「人在弹窗里点下载」，
+  // 这条是「模型发起的传输」。两者可能同时进行（用户下载一个包，
+  // 模型同时把一份日志拉回来），共用一个进度字段会让进度条
+  // 张冠李戴 —— 显示 A 的速度，实际在传 B。
+  //
+  // 落在 store 而不是组件本地 state：控制台将来要在跑长传输时
+  // 显示「正在拉取 xxx」，而事件只应有一个消费者入口（bindEvents）。
+  r.EventsOn('agent:transfer', d => {
+    if (!d || d.kind !== 'download') return
+    store.agentTransfer = {
+      remote: d.remote,
+      name: d.name,
+      dest: d.dest,
+      done: d.done,
+      total: d.total,
+      bps: d.bps
+    }
+  })
+
   r.EventsOn('term:exit', d => {
     const st = store.terms[bucketKey(d && d.hostId, d && d.sessionId)]
     // 只在「开着」的时候才认这条退出：用户自己点关闭时状态已经置回 idle，
@@ -667,6 +805,7 @@ export function bindEvents() {
   // 人和模型看到同一份东西，审计才对得上。落点用后端给的
   // hostId/sessionId 显式指定：快照属于开块那一轮，不属于「此刻在看」的会话。
   r.EventsOn('agent:snapshot', d => {
+    stopThinking((d && d.hostId) ? bucketKey(d.hostId, d.sessionId) : paintHost())
     push({
       kind: 'snapshot',
       termId: (d && d.termId) || '',
@@ -711,9 +850,13 @@ export async function ask(prompt) {
   // 本轮 PTY 写入标记从零计数：上一轮结束时已消费，期间的零星写入
   // （如空回车让 shell 打新提示符）不代表「本轮 shell 自己打印过提示符」。
   ptyDirty.delete(bucketKey(store.activeHostId, store.activeSessionId))
+  store.contextUsage.tokens = 0
+  store.contextUsage.window = 0
+  store.contextUsage.messages = 0
   store.running = true
   try {
-    await api().Ask(store.currentHostId, store.currentSessionId, prompt)
+    // 带上「这一轮用哪套方案」：切换随请求即时生效，不再依赖全局激活指针。
+    await api().Ask(store.currentHostId, store.currentSessionId, prompt, store.selectedProfileId)
   } catch (e) {
     store.running = false
     push({ kind: 'error', content: String(e) })
@@ -740,6 +883,11 @@ export async function clearSession(hostId, sessionId) {
       return
     }
     const n = (res && res.cleared) || 0
+  // 上下文已清空：用量归零，否则工具条上还挂着上一轮的「87%」——
+  // 用户会以为清空没生效。
+  store.contextUsage.tokens = 0
+  store.contextUsage.window = 0
+  store.contextUsage.messages = 0
     push({
       kind: 'system',
       content: n > 0
@@ -903,6 +1051,9 @@ export async function switchProfile(id) {
   const info = await api().Bootstrap()
   store.llm = info.llm || store.llm
   store.llmProfiles = info.llmProfiles || []
+  // 选中项以用户这次的选择为准，而不是重新从 active 推一遍 ——
+  // 保证「刚选的那套」就是下一轮请求带的那套。
+  store.selectedProfileId = id
 }
 
 export async function stop() {
@@ -927,7 +1078,7 @@ export async function stop() {
 // 回显、命令输出、新提示符都在之后陆续从网络上飘回来。调用方若拿到返回值就
 // 往屏幕上画东西，那东西会插在命令输出**前面**，看起来就像「命令没执行」：
 //
-//	root@host:~$ · 想分析这段输出？…     ← 提示抢先画了
+//	root@host:~$   提示：这段输出可交给 LLM 分析。   ← 提示抢先画了
 //	install.sh mysql.php tttt.text      ← 真正的输出被挤到下面
 //	root@host:~$
 //
@@ -974,7 +1125,8 @@ export async function runShellInTerminal(hostId, sessionId, command) {
   store.busy = true
   try {
     const res = await api().RunShellInTerminal(hostId, sessionId, command)
-    // 放行时 PTY 自己会回显命令与输出；命令跑完提示一句「输出可以直接问 LLM」。
+    // 放行时 PTY 自己会回显命令与输出；命令跑完补一句「输出可交给 LLM 分析」的
+    // **提示**（纯文字，不进 agent —— 见 termPaint.paintLLMHint 的说明）。
     // 被拒/取消/出错由 paintShellVerdict 说明原因，不再叠加提示。
     //
     // 提示必须**等命令输出画完**再落：这个调用返回时命令才刚写进 PTY，
@@ -982,8 +1134,10 @@ export async function runShellInTerminal(hostId, sessionId, command) {
     // 裁决说明同理 —— 它说的是「这条命令的结果如何」，显然该排在结果后面。
     if (res.status === 'done') {
       afterTermQuiet(hostId, sessionId, () => {
-        paint.paintLLMHint(surfaceWrite(key))
         paint.paintShellVerdict(surfaceWrite(key), res)
+        // 「可交给 LLM 分析」的提示由**组件**画：占位符要贴在提示符后面，
+        // 起点列只有组件读得到（xterm 光标位置），store 只有 write 函数。
+        fireLLMHint(hostId, sessionId)
       })
     } else {
       paint.paintShellVerdict(surfaceWrite(key), res)
@@ -1063,6 +1217,24 @@ export function textToBase64(s) {
 // 刻意**不放进 reactive**：它存的是函数，被 Vue 代理一遍没有任何意义，
 // 反而会让每次写入都走一遍响应式系统。
 const termSinks = new Map()
+
+// llmHintListeners：每块表面一个「画 LLM 提示占位」的回调，由 ConsolePanel
+// 在创建实例时登记。store 的 runShellInTerminal 在命令画完后触发它 ——
+// 提示占位的起点列只有组件读得到（xterm 光标位置），所以画这件事归组件。
+const llmHintListeners = new Map()
+
+// registerLLMHint 由终端组件登记回调；返回反登记函数。
+export function registerLLMHint(hostId, sessionId, fn) {
+  const key = bucketKey(hostId, sessionId)
+  llmHintListeners.set(key, fn)
+  return () => { if (llmHintListeners.get(key) === fn) llmHintListeners.delete(key) }
+}
+
+// fireLLMHint 触发占位提示绘制（内部用；组件不在场时静默跳过）。
+function fireLLMHint(hostId, sessionId) {
+  const fn = llmHintListeners.get(bucketKey(hostId, sessionId))
+  if (fn) { try { fn() } catch { /* 绘制失败不影响命令结果展示 */ } }
+}
 
 // registerTermSink 由终端组件在**创建实例之后、调用 OpenTerminal 之前**登记。
 // 顺序不能反：远端 shell 一启动就会打印提示符，登记晚了那一段就落进虚空了。
@@ -1151,7 +1323,21 @@ export async function openFileManager(hostId, sessionId) {
   fm.entries = []
   fm.error = ''
   fm.notice = ''
-  await loadDir(store.termCwd[key] || '')
+  // 目录来源优先级：① 已收过的 term:cwd 事件；② 直接问后端该终端的实时 cwd
+  // （term:cwd 只在「目录变化」时推一次，前端刷新/重启后本地是空的、或弹窗开得
+  // 比 OSC 7 第一次送达还早时，事件靠不住 —— 后端 screen 一直在喂字节，cwd 永远新鲜）。
+  let cwd = store.termCwd[key] || ''
+  if (!cwd && api() && typeof api().CurrentTermCwd === 'function') {
+    try {
+      cwd = (await api().CurrentTermCwd(hostId, sessionId)) || ''
+    } catch {
+      cwd = '' // 后端不可用或终端未开：退回到「让后端列目录时落家目录」
+    }
+  }
+  // await 后端查询期间用户可能已关掉弹窗（或改开了另一块表面）：
+  // 再发 ListRemoteDir 只会是一次注定被 seq 守卫丢弃的请求，直接放弃。
+  if (!fm.open || fm.key !== key) return
+  await loadDir(cwd)
 }
 
 export function closeFileManager() {

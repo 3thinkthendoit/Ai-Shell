@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
@@ -9,10 +9,10 @@ import {
   openTerminal, writeTerminal, resizeTerminal, closeTerminal,
   registerTermSink, unregisterTermSink, termState, textToBase64, reportActiveSession,
   openFileManager, closeFileManager,
-  bucketKey, isPtyDirty, backendAPI
+  bucketKey, isPtyDirty, backendAPI, registerLLMHint
 } from '../store'
 import { resolveInput } from '../inputRoute'
-import { providerBadge } from '../providerLogos'
+import { providerBadge, providerTermBadge } from '../providerLogos'
 import { TERM_THEMES, currentTermTheme } from '../termTheme'
 import * as paint from '../termPaint'
 import UiSelect from './UiSelect.vue'
@@ -42,6 +42,36 @@ let ro = null
 
 // 对话归档：只读时间线开关。false = 活表面，true = 归档视图。
 const showArchive = ref(false)
+
+// 归档时间线：把连续的「工具调用 / 结果」折成一个可展开的组（`N 次工具调用`），
+// 其余条目原样。这样一段对话不会被一串命令 / 退出码刷屏。
+const timeline = computed(() => {
+  const out = []
+  let group = null
+  for (const e of store.entries) {
+    if (e.kind === 'tool' || e.kind === 'result') {
+      if (!group) {
+        group = { kind: 'toolGroup', id: 'tg-' + e.id, calls: [] }
+        out.push(group)
+      }
+      if (e.kind === 'tool') {
+        group.calls.push({ key: 'c-' + e.id, tool: e, result: null })
+      } else {
+        const hit = group.calls.find(c => c.tool && c.tool.toolId === e.toolId)
+        if (hit) hit.result = e
+        else group.calls.push({ key: 'r-' + e.id, tool: null, result: e })
+      }
+      continue
+    }
+    group = null
+    out.push(e)
+  }
+  return out
+})
+
+// 工具组的展开态（默认收起：只显示一行 `N 次工具调用`）。
+const openGroups = reactive({})
+function toggleGroup(id) { openGroups[id] = !openGroups[id] }
 
 const logEl = ref(null)
 
@@ -114,6 +144,7 @@ function disposeTerm(key) {
   const t = terms.get(key)
   if (t) {
     unregisterTermSink(t.hostId, t.sessionId, t.sink)
+    t.instanceToken.disposed = true
     try {
       t.term.dispose()
     } catch {
@@ -203,26 +234,65 @@ async function ensureTerm(hostId, sessionId) {
   // 空行 —— 让终端直接落到远端 shell 的提示符。
 
   const sink = bytes => {
-    // 本地行编辑期间收到外部 PTY 输出 = 环境不安静（后台打印/提示符重绘），
-    // 此刻 startCol 已不可信：把本地缓冲 flush 给 PTY 并降级透传，避免擦错位置。
     const st = terms.get(key)
     // 远端又画了东西：屏幕已经不是我们离开时那一屏了，占位符的列位置随之作废。
     // 这里**只作废标记、不试图擦除** —— 行的内容已被远端改写，按旧列号擦会
     // 误伤真实输出。提示被盖住就盖住了，下次切回会重新提示。
     if (st) st.hintCols = 0
     if (st && st.line && !st.passthrough) {
-      flushLocalToPty(st)
-      st.passthrough = true
+      // 本地行编辑期间收到外部 PTY 输出（提示符重绘 / 后台打印）。旧的 startCol
+      // 确实不可信了，但**不能**像旧实现那样把缓冲 flush 给 PTY 换透传 ——
+      // 那等于把还没回车的半行直接交给 bash 执行：用户接着打的自然语言会整行
+      // 变成 command not found，Agent 分流整个被绕过（提示符晚到半秒就会踩中，
+      // 绝不是罕见路径）。改用 readline 的做法：擦掉本地回显 → 让输出画完 →
+      // 在新光标位置把这一行重画出来。行编辑始终归本地，回车才走分流。
+      eraseLocalLine(st, st.line)
+      // 光标位置必须等这段输出**画完**再读：xterm 的 write 是异步解析的，
+      // 写完立刻读 cursorX 拿到的是输出之前的旧位置（测试替身是同步的，
+      // 这个错只在真机上暴露）。write 的回调在解析完本块后触发。
+      term.write(bytes, () => {
+        if (terms.get(key) !== st) return
+        if (isFullscreen(key)) {
+          // 全屏程序接管（vim/top 启动）：回显已在切换到备用屏前擦净，
+          // 这半行就地作废，绝不能画进程序的界面里。
+          st.line = ''
+          st.lineSynthetic = false
+        } else {
+          st.startCol = cursorCol(st)
+          if (st.lineSynthetic) {
+            // 行首的合成 ❯ 不随缓冲走：在新的光标位置重新画一个，
+            // 否则回车时按「合成行」整行擦除会擦错地方。
+            paint.paintInputPrompt(s => term.write(s))
+            st.startCol = cursorCol(st)
+          }
+          term.write(st.line)
+        }
+      })
+      return
     }
     term.write(bytes)
   }
   // 顺序不能反：先登记落点再 OpenTerminal。远端 shell 一启动就打印提示符，
   // 登记晚了那一段就落进虚空了。
   registerTermSink(hostId, sessionId, sink)
+  // LLM 提示占位（命令跑完画在提示符后面那行灰字）也归组件管：store 通知、
+  // 组件画 —— 起点列只有这里的 xterm 实例读得到。token 用来判断回调到达时
+  // 这条实例是否已被销毁/重建（disposeTerm 会置 disposed=true）。
+  const instanceToken = { disposed: false }
+  const unregisterHint = registerLLMHint(hostId, sessionId, () => {
+    const cur = terms.get(key)
+    if (!cur || instanceToken.disposed || terms.get(key) !== cur) return
+    if (cur.line || cur.passthrough || cur.lineSynthetic) return
+    if (isFullscreen(key)) return
+    const startCol = cursorCol(cur)
+    const cols = paint.paintLLMHint(surfaceWrite(key), startCol) || 0
+    if (cols) { cur.llmHintCols = cols; cur.llmHintStart = startCol }
+  })
   terms.set(key, {
-    term, fit, sink, hostId, sessionId,
+    term, fit, sink, hostId, sessionId, instanceToken,
     line: '', startCol: 0, passthrough: false, lineSynthetic: false,
-    hintCols: 0, hintPromptCols: 0 // 欢迎占位符的宽度与它起点列（见 clearWelcomeHint）
+    hintCols: 0, hintPromptCols: 0, // 欢迎占位符的宽度与它起点列（见 clearWelcomeHint）
+    llmHintCols: 0, llmHintStart: 0 // LLM 提示占位（同一机制，见 clearLLMHint）
   })
 
   // 用户按键 → 本地行编辑（见 onTermData）：常态下可打印字符本地回显、
@@ -424,8 +494,10 @@ function clearLocalEcho(t) {
   t.line = ''
 }
 
-// flushLocalToPty 擦掉本地回显后把缓冲发给 PTY（shell 空闲等输入，安全），
-// 用于控制键打断、或本地编辑期间检测到外部输出需要降级透传。
+// flushLocalToPty 擦掉本地回显后把缓冲发给 PTY（shell 空闲等输入，安全）。
+// 只用于控制键打断（Tab/方向键把这一行交回 shell 的 readline 接管）。
+// 本地编辑期间来了外部输出**不再走这里**：那会把半行自然语言直接交给
+// bash 执行，绕过 Agent 分流 —— 现在由 sink 原位重画（见 sink 注释）。
 function flushLocalToPty(t) {
   if (!t.line) return
   eraseLocalLine(t, t.line)
@@ -456,12 +528,9 @@ async function submitLine(key, line) {
   // 分流要问一次后端「首词是不是命令」（见 inputRoute.resolveInput）：
   //   `你是什么模型`  不是命令 → Agent，不弹
   //   `echo 你好`     是命令   → shell，不弹（中文只是参数）
-  // 只有首词是陌生素词（`foobar --help`）才 uncertain，问用户一次。
-  const route = await resolveInput(text, backendAPI())
-  if (route.uncertain) {
-    pendingRoute.value = { key, text }
-    return
-  }
+  // 未知词（`ceshi`）不再弹窗：后端补一次远端探测，存在就当命令跑，
+  // 不存在才自动转 LLM（见 inputRoute.resolveUnknown / 后端 ResolveUnknownInput）。
+  const route = await resolveInput(text, backendAPI(), hostId)
   await dispatchLine(key, text, route)
 }
 
@@ -479,6 +548,14 @@ async function dispatchLine(key, text, route) {
     if (!route.text) {
       paint.paintSystem(surfaceWrite(key), '输入要问 Agent 的内容，或直接敲一条 shell 命令。')
       return
+    }
+    // 未知命令自动转 LLM：先在终端时间线上留一句说明，再提问。
+    // 用户敲的是命令，回来的却是对话 —— 不解释一句他会以为命令执行了。
+    // 说明里带上探测结论（未找到），让这条去向改变是**可见**的（本项目
+    // 的诚实原则：不静默改变用户意图）。
+    if (route.missing) {
+      const name = route.binary ? `\`${route.binary}\`` : '这条命令'
+      paint.paintSystem(surfaceWrite(key), `未找到命令 ${name}，已作为问题交给 Agent 理解你的意图…`)
     }
     ask(route.text)
     return
@@ -505,14 +582,17 @@ function onTermData(key, d) {
     return
   }
 
-  // 占位符撤退：用户开始操作了，先把提示擦干净再走后续分支。
+  // 占位符撤退：用户开始操作了，先把欢迎引导与 LLM 提示都擦干净再走后续分支。
   // 放在最前面（而不是各分支里各擦一次）是因为每个分支都会往屏幕上写字，
   // 漏掉任何一条都会让提示文字和真实输入混在同一行。
   clearWelcomeHint(t)
+  clearLLMHint(t)
 
-  // 已降级透传（本地编辑期间来过外部输出，或本地缓冲已被控制键 flush 给远端）：
+  // 已降级透传（本地缓冲已被控制键 flush 给远端、这一行交给 shell readline 接管）：
   // 原样送 PTY（多字符也整体送）。回车（这一行交回 shell 处理完）或 Ctrl-C
   // （中断、回到空提示符）后恢复本地编辑。
+  // 注意：外部输出到达**不再**触发透传（见 sink —— 现在是原位重画），
+  // 这条分支只剩控制键一条入口。
   if (t.passthrough) {
     send(textToBase64(d))
     if (/[\r\n\x03]/.test(d)) t.passthrough = false
@@ -624,6 +704,17 @@ function clearWelcomeHint(t) {
   t.term.write('\x1b[' + (col + 1) + 'G' + ' '.repeat(n) + '\x1b[' + (col + 1) + 'G')
 }
 
+// clearLLMHint 擦掉命令跑完后贴在提示符后面的「可交给 LLM 分析」占位提示。
+// 机制与 clearWelcomeHint 完全一致：用户一开始打字，占位就必须让位。
+function clearLLMHint(t) {
+  if (!t || !t.llmHintCols) return
+  const n = t.llmHintCols
+  const col = t.llmHintStart || 0
+  t.llmHintCols = 0
+  t.llmHintStart = 0
+  t.term.write('\x1b[' + (col + 1) + 'G' + ' '.repeat(n) + '\x1b[' + (col + 1) + 'G')
+}
+
 async function onClose() {
   const hostId = store.currentHostId
   if (!hostId) return
@@ -691,6 +782,53 @@ const statusLabel = s => ({
 }[s] || s)
 
 const streamingNow = computed(() => store.entries.some(e => e.streaming))
+
+// 上下文用量：后端每步请求前推一次 agent:context（见 agent.EvContext），
+// 由 store 收进 store.contextUsage —— 事件只有一个消费者入口（bindEvents）。
+//
+// 为什么要显示：上下文保护靠的是三个字节上限「盲估」，真爆窗口时是服务端报错、
+// 界面只能显示一条看不懂的 400。有了它，用户能提前看到「已经 87% 了」。
+const ctxUsage = computed(() => {
+  const { tokens, window: win, messages } = store.contextUsage
+  if (!tokens) return { text: '', level: '', title: '' }
+  const text = '约 ' + fmtTokens(tokens) + ' tokens'
+  if (!win) {
+    return { text, level: 'unknown', title: '未能识别该模型的上下文窗口，仅显示估算 token 数' }
+  }
+  const pct = Math.round(tokens * 100 / win)
+  const level = pct >= 95 ? 'danger' : pct >= 80 ? 'warn' : pct >= 60 ? 'mid' : 'ok'
+  return {
+    text: `${text} · ${pct}%`,
+    level,
+    title: `本次请求约 ${tokens.toLocaleString()} tokens，` +
+      `占模型窗口（${win.toLocaleString()}）的 ${pct}%\n` +
+      `${messages} 条消息。接近上限时服务端会直接报错 —— ` +
+      '可减少单次命令的输出量，或点「压缩上下文 / 清空上下文」。'
+  }
+})
+
+// fmtTokens 把 token 数压成好读的形式：128000 → 128K，12345 → 12.3K。
+function fmtTokens(n) {
+  if (n >= 1000) {
+    const k = n / 1000
+    return (k >= 100 ? Math.round(k) : Math.round(k * 10) / 10) + 'K'
+  }
+  return String(n)
+}
+
+// archiveBadge 给归档里每条 assistant 消息算一个「模型图标 + 名字」的展示对象。
+//
+// **只认这条消息自己的信息**（e.badge 由 store 在推入时算好、或退一步用 e.model）——
+// 刻意不做「回退到当前选中方案」：归档是历史，历史消息该显示它当时用的模型，
+// 用此刻选中的方案去补历史消息会张冠李戴（也更容易与「这条回复是什么模型给的」
+// 的语义冲突）。拿不到就返回 null，模板退化成角色名。
+function archiveBadge(e) {
+  if (e && e.badge) return e.badge
+  if (e && e.model) {
+    try { return providerTermBadge({ model: e.model, name: e.model }) } catch { return null }
+  }
+  return null
+}
 
 // ---- 审批倒计时 ----
 //
@@ -825,7 +963,11 @@ const hostOptions = computed(() =>
 )
 watch(currentSessionName, name => syncWindowTitle(name), { immediate: true })
 
-const activeProfileId = computed(() => store.llmProfiles.find(p => p.active)?.id || '')
+// 选中的方案：优先用 store.selectedProfileId（用户刚点的那个，同步写入），
+// 回退到后端标记的 active。前者保证「界面上显示选中的」与「本轮请求带的」一致。
+const activeProfileId = computed(() =>
+  store.selectedProfileId || (store.llmProfiles.find(p => p.active) || {}).id || ''
+)
 const modelOptions = computed(() =>
   store.llmProfiles.map(p => ({
     value: p.id,
@@ -836,6 +978,8 @@ const modelOptions = computed(() =>
 async function onSwitchModel(id) {
   if (!id || id === activeProfileId.value) return
   const p = store.llmProfiles.find(x => x.id === id)
+  // 同步生效：先把选中项写上，紧接着这一轮的请求就会带上它（见 store.ask）。
+  store.selectedProfileId = id
   try {
     await switchProfile(id)
   } catch {
@@ -863,28 +1007,7 @@ async function onCompactSession() {
   await compactSession(store.currentHostId, store.currentSessionId)
 }
 
-// ---- 弹窗：新建任务 / 命令详细 / 输入去向 ----
-
-// pendingRoute 非空时说明用户敲了一行「首词不认识」的输入，正等他选「给谁」。
-// 值是 { key, text } —— key 是那块表面（选完要往正确的那块发），
-// text 是原始输入（不能只存 trim 后的，命令原文要保留）。
-const pendingRoute = ref(null)
-
-// 选完即发。两个动作都清 pendingRoute：不清的话弹窗不关，用户被卡在里面 ——
-// 这正是这次要修的那类「进得去出不来」。
-async function chooseRoute(kind) {
-  const p = pendingRoute.value
-  pendingRoute.value = null
-  if (!p) return
-  // 直接构造 route，不再借 `?` / `!` 前缀绕 —— 前缀是给用户输入的语法，
-  // 内部调用没必要模拟一遍，也避免 dispatchLine 的签名被前缀语义再次污染。
-  if (kind === 'agent') {
-    await dispatchLine(p.key, p.text, { kind: 'agent', text: p.text })
-    return
-  }
-  // 给 shell：不论首词认不认识，用户已经明确表态了，直接当命令发。
-  await dispatchLine(p.key, p.text, { kind: 'shell', text: p.text })
-}
+// ---- 弹窗：新建任务 / 命令详细 ----
 
 const showNewModal = ref(false)
 const newName = ref('')
@@ -1031,12 +1154,6 @@ function openFiles() {
 function onWinKeydown(e) {
   // 新建任务弹窗在顶层时这里让路，避免一次 Esc 同时关掉两层。
   if (showNewModal.value) return
-  // 输入去向弹窗同样必须能用 Esc 退出：它拦住了一次提交，
-  // 若只能点按钮，键盘用户会觉得「敲什么都不对」。
-  if (e.key === 'Escape' && pendingRoute.value) {
-    pendingRoute.value = null
-    return
-  }
   // 文件管理弹窗最外层优先：它盖住整个界面，Esc 应该先关它。
   if (e.key === 'Escape' && store.fileManager.open) {
     closeFileManager()
@@ -1162,80 +1279,104 @@ onBeforeUnmount(() => {
 
     <!-- 对话归档：只读时间线（复用 store.entries 渲染，不接活事件、无交互按钮） -->
     <div class="log archive" ref="logEl" v-show="showArchive">
-      <div v-for="e in store.entries" :key="e.id" class="entry" :class="'entry-' + e.kind">
-        <!-- 屏幕快照：模型读的那份净化文本，人看同一份，审计才对得上 -->
-        <div v-if="e.kind === 'snapshot'" class="result">
-          <div class="result-head">
-            <span v-if="e.final" class="badge warn">终端结束画面 · 进模型上下文</span>
-            <span v-else class="badge warn">终端屏幕快照 · 进模型上下文</span>
-            <span v-if="e.redacted" class="badge warn">已脱敏 {{ e.redacted }} 处</span>
-            <span class="muted tiny">{{ e.final ? '全屏 TUI 退出/终端结束时定格的最后一屏（净化文本）' : '常驻终端静止后的可见屏幕（净化文本）' }}</span>
+      <div v-for="it in timeline" :key="it.id" class="entry" :class="'entry-' + it.kind">
+        <!-- 工具调用组：连续的「调用 / 结果」折成一行 `N 次工具调用`，点开看详情 -->
+        <div v-if="it.kind === 'toolGroup'" class="tool-group">
+          <div class="tool-group-head" role="button" tabindex="0" @click="toggleGroup(it.id)">
+            <span class="tg-arrow">{{ openGroups[it.id] ? '▾' : '▸' }}</span>
+            <span class="tg-label">{{ it.calls.length }} 次工具调用</span>
           </div>
-          <pre>{{ e.text }}</pre>
-          <div v-if="e.injection && e.injection.length" class="tool-reason">
-            检测到疑似提示注入：{{ e.injection.join('、') }}（内容已标记为不可信）
-          </div>
-        </div>
-
-        <div v-else-if="e.kind === 'user'" class="msg user">
-          <div class="msg-role">你</div>
-          <div class="msg-body">{{ e.content }}</div>
-        </div>
-
-        <div v-else-if="e.kind === 'assistant'" class="msg assistant">
-          <div class="msg-role">LLM</div>
-          <div class="msg-body">
-            <div v-if="e.reasoning" class="reasoning">
-              <div class="reasoning-head" @click="e.reasoningOpen = !e.reasoningOpen">
-                {{ e.streaming && !e.content ? '思考中…' : '思考过程' }}
-                <span class="reasoning-arrow">{{ e.reasoningOpen ? '▾' : '▸' }}</span>
+          <div v-show="openGroups[it.id]" class="tool-group-body">
+            <div v-for="c in it.calls" :key="c.key" class="tool-call">
+              <div v-if="c.tool" class="tool">
+                <div class="tool-head">
+                  <span class="tool-name mono">{{ c.tool.tool.name }}</span>
+                  <span class="badge" :class="decisionClass(c.tool.tool.decision)">
+                    {{ decisionLabel(c.tool.tool.decision) }}
+                  </span>
+                  <span class="badge neutral">{{ statusLabel(c.tool.tool.status) }}</span>
+                  <span class="muted" v-if="c.tool.tool.hostName">@{{ c.tool.tool.hostName }}</span>
+                  <span class="muted right" v-if="c.tool.tool.durationMs">{{ c.tool.tool.durationMs }}ms</span>
+                </div>
+                <pre v-if="c.tool.tool.command" class="tool-cmd">{{ c.tool.tool.command }}</pre>
+                <div v-if="c.tool.tool.reason" class="tool-reason">{{ c.tool.tool.reason }}</div>
               </div>
-              <div v-show="e.reasoningOpen" class="reasoning-body">{{ e.reasoning }}</div>
+              <div v-if="c.result" class="result">
+                <div class="result-head">
+                  <span class="muted">退出码 {{ c.result.exitCode }}</span>
+                  <span v-if="c.result.redacted" class="badge warn">已脱敏 {{ c.result.redacted }} 处</span>
+                  <span class="muted tiny">原始输出 · 发给 LLM 前已脱敏并标记为不可信</span>
+                </div>
+                <pre>{{ c.result.content }}</pre>
+              </div>
             </div>
-            {{ e.content }}<span v-if="e.streaming" class="caret"></span><span v-if="!e.content && !e.reasoning && !e.streaming" class="muted tiny">（模型返回了空回复）</span>
           </div>
         </div>
 
-        <div v-else-if="e.kind === 'tool'" class="tool">
-          <div class="tool-head">
-            <span class="tool-name mono">{{ e.tool.name }}</span>
-            <span class="badge" :class="decisionClass(e.tool.decision)">
-              {{ decisionLabel(e.tool.decision) }}
-            </span>
-            <span class="badge neutral">{{ statusLabel(e.tool.status) }}</span>
-            <span class="muted" v-if="e.tool.hostName">@{{ e.tool.hostName }}</span>
-            <span class="muted right" v-if="e.tool.durationMs">{{ e.tool.durationMs }}ms</span>
-          </div>
-          <pre v-if="e.tool.command" class="tool-cmd">{{ e.tool.command }}</pre>
-          <div v-if="e.tool.reason" class="tool-reason">{{ e.tool.reason }}</div>
-        </div>
-
-        <div v-else-if="e.kind === 'result'" class="result">
+        <!-- 屏幕快照：模型读的那份净化文本，人看同一份，审计才对得上 -->
+        <div v-else-if="it.kind === 'snapshot'" class="result">
           <div class="result-head">
-            <span class="muted">退出码 {{ e.exitCode }}</span>
-            <span v-if="e.redacted" class="badge warn">已脱敏 {{ e.redacted }} 处</span>
-            <span class="muted tiny">原始输出 · 发给 LLM 前已脱敏并标记为不可信</span>
+            <span v-if="it.final" class="badge warn">终端结束画面 · 进模型上下文</span>
+            <span v-else class="badge warn">终端屏幕快照 · 进模型上下文</span>
+            <span v-if="it.redacted" class="badge warn">已脱敏 {{ it.redacted }} 处</span>
+            <span class="muted tiny">{{ it.final ? '全屏 TUI 退出/终端结束时定格的最后一屏（净化文本）' : '常驻终端静止后的可见屏幕（净化文本）' }}</span>
           </div>
-          <pre>{{ e.content }}</pre>
+          <pre>{{ it.text }}</pre>
+          <div v-if="it.injection && it.injection.length" class="tool-reason">
+            检测到疑似提示注入：{{ it.injection.join('、') }}（内容已标记为不可信）
+          </div>
         </div>
 
-        <div v-else-if="e.kind === 'injection'" class="injection">
+        <div v-else-if="it.kind === 'user'" class="msg user">
+          <div class="msg-role msg-logo" title="Ai-Shell">Ai-Shell &gt;</div>
+          <div class="msg-body">{{ it.content }}</div>
+        </div>
+
+        <div v-else-if="it.kind === 'assistant'" class="msg assistant">
+          <div class="msg-role">
+            <!-- 与终端表面同一套语法：`厂商 >` 表示「这是模型在回答」 -->
+            <span
+              v-if="archiveBadge(it)"
+              class="model-badge"
+              :style="{ color: archiveBadge(it).color }"
+              :title="archiveBadge(it).name"
+            >{{ archiveBadge(it).mark }}</span>
+            <span v-else class="model-mark-fallback">LLM</span>
+            <span class="model-chevron">&gt;</span>
+          </div>
+          <div class="msg-body">
+            <div v-if="archiveBadge(it) && archiveBadge(it).name" class="msg-model" title="这条回答实际使用的模型">
+              {{ archiveBadge(it).name }}<span v-if="it.model && archiveBadge(it).name !== it.model" class="msg-model-id"> · {{ it.model }}</span>
+            </div>
+            <div v-else-if="it.model" class="msg-model" title="这条回答实际使用的模型">{{ it.model }}</div>
+            <div v-if="it.reasoning" class="reasoning">
+              <div class="reasoning-head" @click="it.reasoningOpen = !it.reasoningOpen">
+                {{ it.streaming && !it.content ? '思考中…' : '思考过程' }}
+                <span class="reasoning-arrow">{{ it.reasoningOpen ? '▾' : '▸' }}</span>
+              </div>
+              <div v-show="it.reasoningOpen" class="reasoning-body">{{ it.reasoning }}</div>
+            </div>
+            {{ it.content }}<span v-if="it.streaming" class="caret"></span><span v-if="!it.content && !it.reasoning && !it.streaming" class="muted tiny">（模型返回了空回复）</span>
+          </div>
+        </div>
+
+        <div v-else-if="it.kind === 'injection'" class="injection">
           <div class="injection-title">远端输出中检测到疑似提示注入</div>
-          <div class="injection-body">命中话术：{{ e.findings.join('、') }}</div>
-          <pre v-if="e.command" class="injection-cmd">{{ e.command }}</pre>
+          <div class="injection-body">命中话术：{{ it.findings.join('、') }}</div>
+          <pre v-if="it.command" class="injection-cmd">{{ it.command }}</pre>
           <div class="injection-hint">
-            该内容来自 <span class="mono">{{ e.hostName }}</span> 的执行结果，已被标记为不可信数据，
+            该内容来自 <span class="mono">{{ it.hostName }}</span> 的执行结果，已被标记为不可信数据，
             不会作为指令执行。建议排查该主机上这段文本的来源。
           </div>
         </div>
 
-        <div v-else-if="e.kind === 'error'" class="msg error">
+        <div v-else-if="it.kind === 'error'" class="msg error">
           <div class="msg-role">错误</div>
-          <div class="msg-body">{{ e.content }}</div>
+          <div class="msg-body">{{ it.content }}</div>
         </div>
 
         <div v-else class="msg system">
-          <div class="msg-body">{{ e.content }}</div>
+          <div class="msg-body">{{ it.content }}</div>
         </div>
       </div>
 
@@ -1244,36 +1385,38 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <!-- 审批条：overlay 在表面之上，交互入口照旧 -->
-    <div v-if="store.pending" class="approval">
-      <div class="approval-head">
-        <span class="badge warn">需要你的批准</span>
-        <span class="mono">{{ store.pending.name }}</span>
-        <span class="muted" v-if="store.pending.hostName">@{{ store.pending.hostName }}</span>
-        <!-- 倒计时：告诉用户「不回答的代价」是什么。没有它，用户以为可以
-             无限期挂起，实际上后端 5 分钟后就放弃了。 -->
-        <span
-          v-if="approvalCountdown"
-          class="muted approval-countdown"
-          :class="{ urgent: approvalRemainSec !== null && approvalRemainSec <= 30 }"
-        >{{ approvalCountdown }} 后失效</span>
-        <button class="sm right" @click="showCmdDetail = true">详细</button>
-      </div>
-      <pre class="approval-cmd">{{ store.pending.command || store.pending.args }}</pre>
-      <div class="approval-reason">{{ store.pending.reason }}</div>
-      <div class="row" style="margin-top: 10px">
-        <button class="ok" @click="approve(true)">批准执行</button>
-        <!-- 拒绝与跳过在后端是同一个动作（不执行），差别只在**语义**：
-             「拒绝」读起来像在否决 Agent 的判断，用户不确定拒绝了要不要
-             给个理由；「跳过」是中性词，不想回答这条就直接跳过。
-             两个按钮并存是为了让「不想回答」有一个心理成本最低的出口。 -->
-        <button class="danger" @click="approve(false)">拒绝</button>
-        <button class="sm" @click="approve(false)">跳过</button>
-      </div>
-    </div>
-
-    <!-- 底部 composer：输入框 + 工具条 -->
+    <!-- 底部 composer：审批浮层 + 工具条 -->
     <div class="composer-bar">
+      <!-- 审批条：必须是**浮层**（绝对定位、不占布局）。
+           一旦它占布局，出现/消失就会改变 .surface 的高度 → 触发终端 resize →
+           远端 shell 收到 SIGWINCH 重绘提示符 → 看起来像「agent 干活干到一半
+           突然回到了命令行」。实测：审批出现与消失各触发一次重绘。 -->
+      <div v-if="store.pending" class="approval">
+        <div class="approval-head">
+          <span class="badge warn">需要你的批准</span>
+          <span class="mono">{{ store.pending.name }}</span>
+          <span class="muted" v-if="store.pending.hostName">@{{ store.pending.hostName }}</span>
+          <!-- 倒计时：告诉用户「不回答的代价」是什么。没有它，用户以为可以
+               无限期挂起，实际上后端 5 分钟后就放弃了。 -->
+          <span
+            v-if="approvalCountdown"
+            class="muted approval-countdown"
+            :class="{ urgent: approvalRemainSec !== null && approvalRemainSec <= 30 }"
+          >{{ approvalCountdown }} 后失效</span>
+          <button class="sm right" @click="showCmdDetail = true">详细</button>
+        </div>
+        <pre class="approval-cmd">{{ store.pending.command || store.pending.args }}</pre>
+        <div class="approval-reason">{{ store.pending.reason }}</div>
+        <div class="row" style="margin-top: 10px">
+          <button class="ok" @click="approve(true)">批准执行</button>
+          <!-- 拒绝与跳过在后端是同一个动作（不执行），差别只在**语义**：
+               「拒绝」读起来像在否决 Agent 的判断，用户不确定拒绝了要不要
+               给个理由；「跳过」是中性词，不想回答这条就直接跳过。
+               两个按钮并存是为了让「不想回答」有一个心理成本最低的出口。 -->
+          <button class="danger" @click="approve(false)">拒绝</button>
+          <button class="sm" @click="approve(false)">跳过</button>
+        </div>
+      </div>
       <div class="composer-tools">
         <span
           v-if="store.running && !store.pending && !streamingNow"
@@ -1289,14 +1432,22 @@ onBeforeUnmount(() => {
             </g>
             <path class="thinking-spark" d="M19 1.6l.7 1.9 1.9.7-1.9.7-.7 1.9-.7-1.9-1.9-.7 1.9-.7z" fill="currentColor" stroke="none" />
           </svg>
-          Thinking
+          Working<span class="thinking-dots" aria-hidden="true"><i>.</i><i>.</i><i>.</i><i>.</i></span>
         </span>
+        <!-- 上下文用量：本轮请求约多少 token、占模型窗口几成。
+             没有它，用户只能等服务端返回 400 才知道自己撑爆了窗口。 -->
+        <span
+          v-if="ctxUsage.text"
+          class="ctx-usage"
+          :class="ctxUsage.level"
+          :title="ctxUsage.title"
+        >{{ ctxUsage.text }}</span>
         <UiSelect
           class="model-select"
           :model-value="activeProfileId"
           :options="modelOptions"
           :disabled="store.running || !store.llmProfiles.length"
-          placeholder="（暂无方案，请到「设置」添加）"
+          placeholder="（暂无服务商，请到「设置」添加）"
           @change="onSwitchModel"
         />
         <button
@@ -1311,27 +1462,6 @@ onBeforeUnmount(() => {
         <span class="composer-sep"></span>
         <button class="sm" @click="clearLog" :disabled="store.running || store.busy">清空记录</button>
         <button v-if="store.running || store.busy" class="sm danger" @click="stop">中断</button>
-      </div>
-    </div>
-
-    <!-- 输入去向确认：含中文且没表态的一行交给谁。
-         这次不确定就当场问清楚，比默默替你决定安全 —— 猜错的话
-         轻则白跑一轮 LLM，重则把中文当命令发给远端。 -->
-    <div v-if="pendingRoute" class="overlay" @click.self="pendingRoute = null">
-      <div class="modal route-modal">
-        <h3>这一行交给谁？</h3>
-        <pre class="route-text">{{ pendingRoute.text }}</pre>
-        <div class="modal-hint">
-          第一个词不是认识的命令，判断不出你想当命令跑还是当问题问。选一个：
-        </div>
-        <div class="modal-actions">
-          <button class="sm" @click="pendingRoute = null">取消</button>
-          <button class="sm" @click="chooseRoute('shell')">当 shell 命令</button>
-          <button class="sm primary" @click="chooseRoute('agent')">问 LLM</button>
-        </div>
-        <div class="modal-hint">
-          下次想省这一步：<code>?</code> 开头 = 问 LLM，<code>!</code> 开头 = 当命令。
-        </div>
       </div>
     </div>
 
@@ -1399,24 +1529,6 @@ onBeforeUnmount(() => {
 
 .cmd-modal { width: min(760px, calc(100% - 60px)); }
 
-/* 输入去向确认：原文要能看清（用户据此决定给谁），所以用与命令预览同款的
-   等宽内嵌块，而不是一行小字。 */
-.route-text {
-  margin: 0;
-  max-height: 30vh;
-  overflow: auto;
-  background: var(--inset-bg);
-  border-radius: 7px;
-  padding: 8px 10px;
-  white-space: pre-wrap;
-  word-break: break-all;
-}
-.route-modal code {
-  background: var(--inset-bg);
-  border-radius: 4px;
-  padding: 1px 4px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-}
 .cmd-detail {
   margin: 0;
   max-height: 55vh;
@@ -1444,7 +1556,10 @@ onBeforeUnmount(() => {
   color: var(--text-2);
 }
 .seg button.on { background: var(--accent-bg); color: var(--accent); font-weight: 500; }
-.model-select { flex: 0 1 300px; min-width: 200px; }
+/* 模型选择器：宽度随内容自适应（不再固定 300px，否则名字短时右侧会空一大截）。
+   class="model-select" 会透传到 UiSelect 的根元素（就是 .uis），所以这里直接生效：
+   width:max-content 让按钮"文字多宽、按钮多宽"；max-width 兜住超长名字。 */
+.model-select { flex: 0 1 auto; width: max-content; max-width: 340px; }
 
 .sess-banner {
   flex-shrink: 0;
@@ -1521,6 +1636,69 @@ onBeforeUnmount(() => {
   color: var(--accent);
 }
 .msg.assistant .msg-body { padding: 3px 0; }
+
+/* 用户行左侧：Ai-Shell 软件 wordmark（与终端表面同款文字语法 `Ai-Shell >`） */
+.msg-logo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding-top: 3px;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+/* `Ai-Shell` 青 + `>` 紫 —— 与 termPaint.userPromptMark 同色 */
+.msg-logo { color: #22d3ee; }
+.msg-logo::after { content: ' >'; color: #8b5cf6; }
+
+/* assistant 行左侧：模型图标 + 紫色 `>`（与终端表面 paintAssistantHeader 同语法） */
+.model-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 18px;
+  padding: 0 4px;
+  border-radius: 5px;
+  border: 1px solid currentColor;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+}
+.model-mark-fallback { color: var(--text-3); font-size: 10px; font-weight: 700; }
+.model-chevron { color: #8b5cf6; font-weight: 700; font-family: var(--mono, ui-monospace, monospace); }
+.msg-model-id { color: var(--text-3); }
+/* 这条回答实际使用的模型：让「选中的模型」和「回答的模型」对得上，不必靠模型自述 */
+.msg-model {
+  font-size: 11px;
+  color: var(--text-3);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  margin-bottom: 4px;
+}
+
+/* 工具调用组：折叠成一行 `N 次工具调用`，点开看每条命令 / 结果 */
+.tool-group { margin: 6px 0; }
+.tool-group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-3);
+  cursor: pointer;
+  user-select: none;
+}
+.tool-group-head:hover { color: var(--text-2); }
+.tg-arrow { font-size: 10px; }
+.tg-label { font-family: var(--font-mono, ui-monospace, monospace); }
+.tool-group-body {
+  margin: 6px 0 0 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.tool-call { display: flex; flex-direction: column; gap: 4px; }
 
 /* 思考过程：弱化的折叠块，思考中自动展开，回答开始后收起 */
 .reasoning { margin: 2px 0 6px; border-left: 2px solid var(--border); padding-left: 8px; }
@@ -1609,14 +1787,20 @@ onBeforeUnmount(() => {
 }
 .injection-hint { font-size: 12px; color: var(--text-2); margin-top: 7px; line-height: 1.65; }
 
+/* 审批浮层：bottom 锚在 composer 上方，**不占布局**。
+   占布局的代价见模板注释：出现/消失会 resize 终端 → SIGWINCH → 远端重绘提示符。 */
 .approval {
-  margin: 0 18px 10px;
+  position: absolute;
+  left: 18px;
+  right: 18px;
+  bottom: calc(100% + 10px);
+  z-index: 50; /* 低于 modal 的 200，高于表面内容 */
   border: 1px solid var(--warn);
   background: var(--warn-bg);
   border-radius: var(--radius);
   padding: 12px 14px;
-  flex-shrink: 0;
-  max-height: 70%;
+  max-height: 60vh;
+  box-shadow: 0 -8px 28px rgba(0, 0, 0, 0.14);
   display: flex;
   flex-direction: column;
 }
@@ -1638,6 +1822,7 @@ onBeforeUnmount(() => {
 
 .composer-bar {
   flex-shrink: 0;
+  position: relative; /* 审批浮层的锚：bottom:100% 即浮在工具条正上方 */
   border-top: 1px solid var(--border);
   background: var(--surface);
   padding: 8px 18px;
@@ -1657,13 +1842,43 @@ onBeforeUnmount(() => {
 }
 .thinking-icon { flex-shrink: 0; display: block; }
 .thinking-spark { transform-origin: 19px 5px; animation: thinking-spark 1.8s ease-in-out infinite; }
+.thinking-dots { display: inline-block; margin-left: 1px; }
+.thinking-dots i {
+  font-style: normal;
+  animation: thinking-dot 1.4s ease-in-out infinite;
+  opacity: 0.25;
+}
+.thinking-dots i:nth-child(1) { animation-delay: 0s; }
+.thinking-dots i:nth-child(2) { animation-delay: 0.15s; }
+.thinking-dots i:nth-child(3) { animation-delay: 0.3s; }
+.thinking-dots i:nth-child(4) { animation-delay: 0.45s; }
+@keyframes thinking-dot { 0%, 100% { opacity: 0.25; } 50% { opacity: 1; } }
 @keyframes thinking-breathe { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
 @keyframes thinking-spark { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) {
-  .thinking-inline, .thinking-spark { animation: none; opacity: .8; }
+  .thinking-inline, .thinking-spark, .thinking-dots i { animation: none; opacity: .8; }
+  .thinking-dots i { opacity: 1; }
 }
 
 .composer-tools { display: flex; align-items: center; gap: 8px; }
+/* 上下文用量指示：常驻工具条，颜色随占用率升级（ok → mid → warn → danger）。
+   认不出模型窗口时用中性色（unknown），不吓人也不装作知道。 */
+.ctx-usage {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-family: var(--mono, ui-monospace, monospace);
+  color: var(--text-3);
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  cursor: help;
+  white-space: nowrap;
+}
+.ctx-usage.ok { color: var(--text-2); }
+.ctx-usage.mid { color: var(--warn); background: var(--warn-bg); }
+.ctx-usage.warn { color: var(--warn); background: var(--warn-bg); font-weight: 600; }
+.ctx-usage.danger { color: var(--danger); background: var(--danger-bg); font-weight: 600; }
+.ctx-usage.unknown { color: var(--text-3); }
 .composer-sep { width: 1px; height: 18px; background: var(--border); margin: 0 4px; flex-shrink: 0; }
 .grow-hint { margin-left: auto; }
 </style>

@@ -525,7 +525,7 @@ func (a *App) probeMissingBinary(hostID, cmd string, whitelist []string) *missin
 //
 // 只做**本地**判断，不发远端探测：分流发生在用户敲回车的那一刻，
 // 不能因为查远端而卡住输入。未知第三方（可能是自定义脚本）一律返回 false，
-// 由前端问一次用户 —— 那正是 needsRouteChoice 要覆盖的唯一场景。
+// 交给 ResolveUnknownInput（见下）做一次远端探测再定去向。
 //
 // 返回值刻意用「是否是命令」而不是 kind 字符串：前端的既有规则
 // （? / ! 前缀、中文提问、英文问句、多行）保持不变，只在
@@ -545,6 +545,85 @@ func (a *App) ClassifyShellInput(text string) bool {
 		wl = a.v.Policy().Whitelist
 	}
 	return policy.IsKnownBinary(bin, wl)
+}
+
+// RouteDecision 是「首词不认识的一行」该交给谁的裁决结果。
+//
+// 与 ClassifyShellInput 的分工：那个是**纯本地**判断（敲回车当场就要答案，
+// 不能等远端）；这个是**补一次远端探测**后的最终去向 —— 只在
+// ClassifyShellInput 已经说了「不认识」时才需要它。因此它带网络往返，
+// 只在前端确认「需要这一步」时才调用。
+type RouteDecision struct {
+	// Kind 是最终去向："shell"（当命令跑）或 "agent"（交给 LLM 理解）。
+	Kind string `json:"kind"`
+	// Binary 是抽出的首词（命令名），供前端在「未找到」提示里回显。
+	Binary string `json:"binary"`
+	// Missing 仅在探测证明「远端不存在该命令」时为 true。
+	//
+	// 它是整个自动转 LLM 的安全闸门：只有它为 true 时前端才会把这一行
+	// 交给 LLM。之所以这个闸门成立 —— 一个**不存在**的命令，执行它没有
+	// 任何副作用，因此「交给 LLM 理解」最坏只是得到一句无用的话，
+	// 而不会删/改任何东西。反之，探测**存在**的命令一律当 shell 交策略引擎，
+	// 绝不自动转 LLM（那会把「执行」静默变成「提问」，违背本项目的诚实原则）。
+	Missing bool `json:"missing"`
+}
+
+// ResolveUnknownInput 对「首词不在本地命令库」的一行做远端探测，决定去向。
+//
+// 只应在 ClassifyShellInput 返回 false 后调用。逻辑：
+//
+//  1. 抽不出首词（纯标点/空白）→ 没什么可执行的，按命令走（让 shell 自己报错）；
+//  2. 路径形命令（./x、/opt/x）→ 人明确在指定可执行文件，按命令走，不探测；
+//  3. 远端 `command -v <词>` 成功 → 该命令存在（可能是自定义脚本），按命令走；
+//  4. 探测失败（不存在）→ Missing=true，Kind="agent"，交给 LLM 理解意图。
+//
+// 探测是**零副作用**的纯查询（`command -v` 只查 PATH，不执行）。这正是
+// 「直接执行、失败才介入」得以安全成立的前提：危险命令（rm 等）的首词在
+// 本地命令库里，根本走不到这里；即便走到，`command -v` 也只是查一下是否
+// 存在，不会真的运行它。
+func (a *App) ResolveUnknownInput(hostID, text string) RouteDecision {
+	bin := policy.PrimaryBinary(text)
+	if bin == "" {
+		// 抽不出首词：当作命令交给 shell，让它自己报语法错误，
+		// 比在这里猜「是不是提问」更诚实。
+		return RouteDecision{Kind: "shell"}
+	}
+	base := policy.BaseName(bin)
+	if strings.Contains(bin, "/") {
+		// 路径形：人已明确指定可执行文件，按命令走（是否存在交给 shell）。
+		return RouteDecision{Kind: "shell", Binary: base}
+	}
+	// 远端探测。hostID 为空或 SSH 不可达时，退回「当命令跑」——
+	// 宁可让 shell 报 command not found，也不要因为探测失败就擅自转 LLM。
+	if strings.TrimSpace(hostID) == "" || a.ssh == nil {
+		return RouteDecision{Kind: "shell", Binary: base}
+	}
+	check := fmt.Sprintf("command -v -- %s >/dev/null 2>&1", shellQuote(bin))
+	res, err := a.ssh.Exec(hostID, check, 15*time.Second)
+	if err != nil {
+		// 探测本身失败（网络等）：保守按命令走，把判断权还给 shell 与用户。
+		return RouteDecision{Kind: "shell", Binary: base}
+	}
+	if res.ExitCode != 0 {
+		// 远端确实没有这个命令 —— 安全闸门打开，交给 LLM 理解意图。
+		//
+		// 必须留痕：这是一次「去向/性质发生变化」的事件 —— 用户敲的是命令，
+		// 系统把它改成了提问。项目里每条人工 shell 命令都写审计，这条
+		// 特殊的改道若不记，事后翻日志只会看到凭空多出的一条 agent_run，
+		// 无从知道它起源于一条被判为「不存在」的用户命令。
+		a.auditLog(audit.Entry{
+			Kind:     audit.KindDirect,
+			HostID:   hostID,
+			HostName: hostNameOf(a.v, hostID),
+			Command:  text,
+			Decision: "reroute",
+			Rule:     "not_found_reroute",
+			Note:     "未知命令「" + base + "」远端不存在，已自动转交 LLM 理解用户意图",
+		})
+		return RouteDecision{Kind: "agent", Binary: base, Missing: true}
+	}
+	// 命令存在（可能是用户自己的脚本）：按命令走，过策略引擎。
+	return RouteDecision{Kind: "shell", Binary: base}
 }
 
 func (a *App) resolveShell(id string, approved bool) bool {

@@ -109,88 +109,92 @@ onMounted(load)
 
 <template>
   <div class="panel">
-    <header class="panel-head">
-      <div>
-        <h2>审计日志</h2>
-        <p class="muted">
-          每一次对远端主机的操作、每一次人工批准或拒绝、每一次配置变更都在这里留下记录。
-          日志逐条用主密钥加密落盘，并以哈希链串联 —— 任何删改都会被检出。
-          达到体积上限后自动轮转归档，最旧的段按保留策略丢弃，丢弃动作本身也会记入链中。
-        </p>
-      </div>
-      <div class="head-actions">
-        <button :disabled="loading" @click="load">{{ loading ? '刷新中…' : '刷新' }}</button>
-        <button :disabled="verifying" @click="verify">
-          {{ verifying ? '校验中…' : '校验完整性' }}
-        </button>
-        <button @click="exportPlain">导出明文</button>
-      </div>
-    </header>
-
-    <div v-if="err" class="card error-card">{{ err }}</div>
-
-    <div v-if="verifyResult" class="card verify" :class="verifyResult.ok ? 'ok' : 'bad'">
-      <b>{{ verifyResult.ok ? '哈希链完整' : '校验未通过' }}</b>
-      <span>{{ verifyResult.message }}</span>
-      <div v-if="verifyResult.truncated" class="verify-note">
-        注意：校验起点是第 {{ verifyResult.startSeq }} 条，更早的记录已不在。
-        若下方能看到「日志轮转」记录，说明是本程序的保留策略丢弃；
-        但看不到也不能据此认定被篡改 —— 那条声明本身也可能已被后续轮转丢弃。
-      </div>
-    </div>
-
-    <div class="meta">
-      <span class="muted">共 {{ entries.length }} 条 · {{ fmtSize(size) }}</span>
-      <span v-if="segments > 1" class="muted">
-        （已轮转为 {{ segments }} 个段，最旧的段会按保留策略丢弃）
-      </span>
-      <span v-else class="muted">（单段，达到上限后自动轮转归档）</span>
-    </div>
-
-    <div class="filters">
-      <button
-        v-for="k in kinds"
-        :key="k.key"
-        class="sm"
-        :class="{ on: filter === k.key }"
-        @click="filter = k.key"
-      >
-        {{ k.label }}
-      </button>
-    </div>
-
-    <div v-if="!shown.length && !err" class="card muted">暂无记录。</div>
-
-    <div v-else class="list">
-      <div v-for="e in shown.slice().reverse()" :key="e.seq" class="row">
-        <div class="row-top">
-          <span class="seq mono">#{{ e.seq }}</span>
-          <span class="badge neutral">{{ kindLabel(e.kind) }}</span>
-          <span v-if="e.decision" class="badge" :class="decisionClass(e.decision)">
-            {{ decisionLabel(e.decision) }}
-          </span>
-          <span v-if="e.approved === false" class="badge danger">已拒绝</span>
-          <span v-if="e.approved === true" class="badge ok">已批准</span>
-          <span v-if="e.injection && e.injection.length" class="badge danger">
-            注入 {{ e.injection.length }}
-          </span>
-          <span v-if="e.redacted" class="badge warn">脱敏 {{ e.redacted }}</span>
-          <span class="time muted">{{ fmtTime(e.time) }}</span>
+    <div class="panel-inner">
+      <header class="panel-head">
+        <div>
+          <h2>审计日志</h2>
+          <p class="muted">
+            每一次对远端主机的操作、每一次人工批准或拒绝、每一次配置变更都在这里留下记录。
+            日志逐条用主密钥加密落盘，并以哈希链串联 —— 任何删改都会被检出。
+            达到体积上限后自动轮转归档，最旧的段按保留策略丢弃，丢弃动作本身也会记入链中。
+          </p>
         </div>
-
-        <div class="row-body">
-          <span v-if="e.hostName" class="host mono">{{ e.hostName }}</span>
-          <span v-if="e.tool" class="tool mono">{{ e.tool }}</span>
-          <span v-if="e.command" class="cmd mono">{{ e.command }}</span>
+        <div class="head-actions">
+          <button :disabled="loading" @click="load">{{ loading ? '刷新中…' : '刷新' }}</button>
+          <button :disabled="verifying" @click="verify">
+            {{ verifying ? '校验中…' : '校验完整性' }}
+          </button>
+          <button @click="exportPlain">导出明文</button>
         </div>
+      </header>
 
-        <div class="row-foot">
-          <span v-if="e.exitCode !== undefined && e.exitCode !== null" class="muted">
-            退出码 {{ e.exitCode }}
+      <div v-if="err" class="card error-card">{{ err }}</div>
+
+      <div v-if="verifyResult" class="card verify" :class="verifyResult.ok ? 'ok' : 'bad'">
+        <b>{{ verifyResult.ok ? '哈希链完整' : '校验未通过' }}</b>
+        <span>{{ verifyResult.message }}</span>
+        <div v-if="verifyResult.truncated" class="verify-note">
+          注意：校验起点是第 {{ verifyResult.startSeq }} 条，更早的记录已不在。
+          若下方能看到「日志轮转」记录，说明是本程序的保留策略丢弃；
+          但看不到也不能据此认定被篡改 —— 那条声明本身也可能已被后续轮转丢弃。
+        </div>
+      </div>
+
+      <!-- 概览行 + 筛选器合成一条工具栏：左边是规模，右边是筛选。 -->
+      <div class="toolbar">
+        <div class="meta">
+          <span class="muted">共 {{ entries.length }} 条 · {{ fmtSize(size) }}</span>
+          <span v-if="segments > 1" class="muted">
+            · 已轮转为 {{ segments }} 个段
           </span>
-          <span v-if="e.durationMs" class="muted">{{ e.durationMs }}ms</span>
-          <span v-if="e.rule" class="muted mono">规则 {{ e.rule }}</span>
-          <span v-if="e.note" class="note">{{ e.note }}</span>
+          <span v-else class="muted">· 单段</span>
+        </div>
+        <div class="filters">
+          <button
+            v-for="k in kinds"
+            :key="k.key"
+            class="sm"
+            :class="{ on: filter === k.key }"
+            @click="filter = k.key"
+          >
+            {{ k.label }}
+          </button>
+        </div>
+      </div>
+
+      <div v-if="!shown.length && !err" class="card muted empty">暂无记录。</div>
+
+      <div v-else class="list">
+        <div v-for="e in shown.slice().reverse()" :key="e.seq" class="row">
+          <div class="row-top">
+            <span class="seq mono">#{{ e.seq }}</span>
+            <span class="badge neutral">{{ kindLabel(e.kind) }}</span>
+            <span v-if="e.decision" class="badge" :class="decisionClass(e.decision)">
+              {{ decisionLabel(e.decision) }}
+            </span>
+            <span v-if="e.approved === false" class="badge danger">已拒绝</span>
+            <span v-if="e.approved === true" class="badge ok">已批准</span>
+            <span v-if="e.injection && e.injection.length" class="badge danger">
+              注入 {{ e.injection.length }}
+            </span>
+            <span v-if="e.redacted" class="badge warn">脱敏 {{ e.redacted }}</span>
+            <span class="time muted">{{ fmtTime(e.time) }}</span>
+          </div>
+
+          <div class="row-body">
+            <span v-if="e.hostName" class="host mono">{{ e.hostName }}</span>
+            <span v-if="e.tool" class="tool mono">{{ e.tool }}</span>
+            <span v-if="e.command" class="cmd mono">{{ e.command }}</span>
+          </div>
+
+          <div class="row-foot">
+            <span v-if="e.exitCode !== undefined && e.exitCode !== null" class="muted">
+              退出码 {{ e.exitCode }}
+            </span>
+            <span v-if="e.durationMs" class="muted">{{ e.durationMs }}ms</span>
+            <span v-if="e.rule" class="muted mono">规则 {{ e.rule }}</span>
+            <span v-if="e.note" class="note">{{ e.note }}</span>
+          </div>
         </div>
       </div>
     </div>
@@ -198,9 +202,12 @@ onMounted(load)
 </template>
 
 <style scoped>
-.panel { padding: 22px 26px; overflow-y: auto; height: 100%; }
-.panel-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; margin-bottom: 16px; }
-.panel-head h2 { font-size: 15px; margin: 0 0 6px; }
+.panel { padding: 24px 28px 36px; overflow-y: auto; height: 100%; }
+/* 内容列：窗口再宽也不把卡片 / 命令块拉成一条 —— 保持稳定的阅读宽度。 */
+.panel-inner { max-width: 900px; }
+
+.panel-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; margin-bottom: 18px; }
+.panel-head h2 { font-size: 16px; margin: 0 0 6px; }
 .panel-head p { margin: 0; font-size: 12px; line-height: 1.7; max-width: 620px; }
 .head-actions { display: flex; gap: 8px; flex-shrink: 0; }
 
@@ -218,12 +225,14 @@ onMounted(load)
   line-height: 1.65;
 }
 
-.meta { display: flex; gap: 10px; font-size: 12px; margin-bottom: 10px; }
-
-.filters { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+/* 工具栏：规模信息在左、筛选器在右，一行放下；放不下时筛选器整段换行。 */
+.toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+.meta { display: flex; gap: 4px; font-size: 12px; }
+.filters { display: flex; flex-wrap: wrap; gap: 6px; margin-left: auto; }
 .filters .on { background: var(--accent-bg); color: var(--accent); border-color: var(--accent); font-weight: 500; }
 
 .list { display: flex; flex-direction: column; gap: 8px; }
+.empty { padding: 28px 16px; text-align: center; }
 
 .row {
   border: 1px solid var(--border);

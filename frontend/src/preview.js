@@ -99,7 +99,18 @@ window.go = {
         return { status: 'done', decision: 'allow', reason: '', rule: 'auto_safe', risk: 'low' }
       },
       // 报告「当前看着哪条会话」，后端用它路由 PTY 定格快照。预览里静默即可。
-      ReportActiveSession: async () => {}
+      ReportActiveSession: async () => {},
+      // 命令识别：预览里只认几个常见命令，未知词默认「探测不存在」→ 交给 LLM，
+      // 与真实后端（app_shell.go ClassifyShellInput / ResolveUnknownInput）同形。
+      ClassifyShellInput: async text => {
+        const first = String(text || '').trim().split(/\s+/)[0] || ''
+        const base = first.replace(/^.*\//, '')
+        return ['ls', 'echo', 'grep', 'cat', 'df', 'docker', 'systemctl', 'nginx', 'cd', 'pwd'].includes(base)
+      },
+      ResolveUnknownInput: async (hostId, text) => {
+        const first = String(text || '').trim().split(/\s+/)[0] || ''
+        return { kind: 'agent', binary: first.replace(/^.*\//, ''), missing: true }
+      }
     }
   }
 }

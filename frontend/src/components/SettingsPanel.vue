@@ -60,6 +60,9 @@ async function refreshLLM() {
   const info = await window.go.main.App.Bootstrap()
   store.llm = info.llm
   store.llmProfiles = info.llmProfiles || []
+  // 「设为当前」/删除/新增都会改激活方案 —— 让「下一轮用哪套」跟着走，
+  // 否则在设置里切了方案，下一轮请求仍带着旧的那套（见 store.ask）。
+  store.selectedProfileId = (store.llmProfiles.find(p => p.active) || {}).id || ''
   if (!profiles.value.some(p => p.id === editingId.value)) {
     editingId.value = profiles.value.find(p => p.active)?.id || ''
   }
@@ -74,9 +77,9 @@ async function activate() {
   try {
     await window.go.main.App.ActivateLLMProfile(id)
     await refreshLLM()
-    push({ kind: 'system', content: `已切换到方案「${form.name}」，下一轮对话生效。` })
+    push({ kind: 'system', content: `已切换到服务商「${form.name}」，下一轮对话生效。` })
   } catch (e) {
-    push({ kind: 'error', content: `切换方案失败：${e && e.message ? e.message : e}` })
+    push({ kind: 'error', content: `切换服务商失败：${e && e.message ? e.message : e}` })
   } finally {
     busy.value = false
   }
@@ -90,9 +93,9 @@ async function removeProfile() {
   try {
     await window.go.main.App.DeleteLLMProfile(id)
     await refreshLLM()
-    push({ kind: 'system', content: '已删除该方案。' })
+    push({ kind: 'system', content: '已删除该服务商。' })
   } catch (e) {
-    push({ kind: 'error', content: `删除方案失败：${e && e.message ? e.message : e}` })
+    push({ kind: 'error', content: `删除服务商失败：${e && e.message ? e.message : e}` })
   } finally {
     busy.value = false
   }
@@ -135,7 +138,7 @@ async function save() {
     // refreshLLM 内部会 loadEditing()：表单对齐到保存后的值
     // （含后端规范化过的 Base URL），并清掉 Key 输入框与测试结果。
     await refreshLLM()
-    push({ kind: 'system', content: `LLM 方案「${saved.name}」已保存` })
+    push({ kind: 'system', content: `服务商「${saved.name}」已保存` })
   } catch (e) {
     push({ kind: 'error', content: String(e) })
   } finally {
@@ -186,129 +189,155 @@ const isLocal = () => /localhost|127\.0\.0\.1|0\.0\.0\.0/.test(form.baseUrl)
 
 <template>
   <div class="panel">
-    <header class="panel-head">
-      <div>
+    <div class="panel-inner">
+      <header class="panel-head">
         <h2>LLM 设置</h2>
         <p class="muted">
           任何兼容 OpenAI <span class="mono">/v1/chat/completions</span> 与 function calling 的服务都能接入。
-          指向本地模型时，数据完全不出你的机器。可以保存多套方案，随时切换。
+          指向本地模型时，数据完全不出你的机器。可以保存多个服务商，随时切换。
         </p>
-      </div>
-    </header>
+      </header>
 
-    <div class="card">
-      <label>配置方案</label>
-      <div class="profile-bar">
-        <UiSelect
-          class="profile-select"
-          v-model="editingId"
-          :options="profileOptions"
-          :disabled="!profiles.length"
-          placeholder="暂无方案"
-          @change="loadEditing"
-        />
-        <button class="sm" @click="newProfile">新建</button>
-        <button class="sm" v-if="editingId && !editingProfile()?.active" :disabled="busy" @click="activate">
-          设为当前
-        </button>
-        <button class="sm danger" v-if="profiles.length > 1 && editingId" :disabled="busy" @click="removeProfile">
-          删除
-        </button>
-      </div>
-      <div class="muted profile-hint" v-if="editingId">
-        {{ editingProfile()?.active
-          ? '这套方案正在被所有对话使用。'
-          : '编辑后点「保存」，再用「设为当前」切换过去。' }}
-      </div>
-    </div>
-
-    <div class="card" style="margin-top: 12px">
-      <label>方案名称</label>
-      <input v-model="form.name" class="profile-name" placeholder="例如：DeepSeek / 本地 Qwen" />
-
-      <label>快速预设</label>
-      <div class="presets">
-        <button v-for="p in presets" :key="p.label" class="sm" @click="applyPreset(p)">
-          {{ p.label }}
-        </button>
-      </div>
-    </div>
-
-    <div class="card" style="margin-top: 12px">
-      <label>Base URL</label>
-      <input v-model="form.baseUrl" class="base-url" placeholder="https://api.openai.com/v1" />
-
-      <label style="margin-top: 14px">模型名</label>
-      <input v-model="form.model" class="model-name" placeholder="gpt-4o-mini" />
-
-      <label style="margin-top: 14px">
-        API Key
-        <span v-if="editingId && editingProfile()?.hasApiKey" class="muted">（已保存，留空表示不修改）</span>
-        <span v-else-if="!editingId && store.llm.hasApiKey" class="muted">（当前方案已保存，新方案需另行填写）</span>
-      </label>
-      <input v-model="form.apiKey" class="api-key" type="password" placeholder="sk-..." />
-
-      <label class="chk" v-if="editingId && editingProfile()?.hasApiKey">
-        <input type="checkbox" v-model="form.clearKey" />
-        清除已保存的 API Key
-      </label>
-
-      <div class="notice">
-        API Key 与主机密码同样走 AES-256-GCM 加密，主密钥在操作系统钥匙串里。
-        它只会出现在发往 LLM 服务的 HTTP 头里，绝不会被写进对话内容。
-      </div>
-
-      <!-- 自动修正提示。用户把完整端点粘进 Base URL 是很常见的手滑，
-           不说一声的话他只会看到「测试通过」，却不知道自己填错了。 -->
-      <div v-if="corrected" class="fix-hint">
-        Base URL 已自动修正为 <span class="mono">{{ corrected }}</span> ——
-        原来的值把端点（<span class="mono">/chat/completions</span>）也填了进去，
-        那会拼成重复路径并返回 404。程序会自己追加这一段，填到
-        <span class="mono">/v1</span> 为止即可。
-      </div>
-
-      <div v-if="testRes" class="test-result" :class="testRes.ok ? 'ok' : 'bad'">
-        <div class="tr-head">
-          <span class="tr-mark">{{ testRes.ok ? '✓' : '✗' }}</span>
-          <span class="tr-msg">{{ testRes.message }}</span>
-          <span v-if="testRes.ok" class="tr-meta">
-            {{ testRes.model }} · {{ testRes.durationMs }}ms
-          </span>
+      <div class="card">
+        <div class="card-title">配置服务商</div>
+        <div class="card-sub">「编辑哪一套」与「用哪一套」分开管：改完点保存，再点「设为当前」切换。</div>
+        <div class="profile-bar">
+          <UiSelect
+            class="profile-select"
+            v-model="editingId"
+            :options="profileOptions"
+            :disabled="!profiles.length"
+            placeholder="暂无服务商"
+            @change="loadEditing"
+          />
+          <button class="sm" @click="newProfile">新建</button>
+          <button class="sm" v-if="editingId && !editingProfile()?.active" :disabled="busy" @click="activate">
+            设为当前
+          </button>
+          <button class="sm danger" v-if="profiles.length > 1 && editingId" :disabled="busy" @click="removeProfile">
+            删除
+          </button>
         </div>
-        <div v-if="testRes.ok && testRes.reply" class="tr-line">
-          模型回复：<span class="mono">{{ testRes.reply }}</span>
-        </div>
-        <!-- 失败时把实际请求的地址摆出来：404 这类问题光看错误码无从下手 -->
-        <div v-if="!testRes.ok && testRes.url" class="tr-line">
-          实际请求：<span class="mono">{{ testRes.url }}</span>
+        <div class="profile-hint muted" v-if="editingId">
+          {{ editingProfile()?.active
+            ? '这个服务商正在被所有对话使用。'
+            : '编辑后点「保存」，再用「设为当前」切换过去。' }}
         </div>
       </div>
 
-      <div class="actions">
-        <span class="test-note">测试会真的发一次最小请求（max_tokens=8），不产生实质费用。</span>
-        <button :disabled="testing" @click="test">{{ testing ? '测试中…' : '测试连接' }}</button>
-        <button class="primary" :disabled="busy" @click="save">{{ busy ? '保存中…' : '保存' }}</button>
+      <div class="card">
+        <div class="card-title">服务商信息</div>
+        <div class="field">
+          <label>服务商名称</label>
+          <input v-model="form.name" class="profile-name" placeholder="例如：DeepSeek / 本地 Qwen" />
+        </div>
+        <div class="field">
+          <label>快速预设</label>
+          <div class="presets">
+            <button v-for="p in presets" :key="p.label" class="sm" @click="applyPreset(p)">
+              {{ p.label }}
+            </button>
+          </div>
+        </div>
       </div>
 
-      <div v-if="isLocal()" class="local-hint">
-        当前指向本地地址 —— 对话内容不会离开这台机器。
+      <div class="card">
+        <div class="card-title">连接参数</div>
+        <div class="field">
+          <label>Base URL</label>
+          <input v-model="form.baseUrl" class="base-url" placeholder="https://api.openai.com/v1" />
+        </div>
+        <div class="field">
+          <label>模型名</label>
+          <input v-model="form.model" class="model-name" placeholder="gpt-4o-mini" />
+        </div>
+        <div class="field">
+          <label>
+            API Key
+            <span v-if="editingId && editingProfile()?.hasApiKey" class="muted">（已保存，留空表示不修改）</span>
+            <span v-else-if="!editingId && store.llm.hasApiKey" class="muted">（当前服务商已保存，新服务商需另行填写）</span>
+          </label>
+          <input v-model="form.apiKey" class="api-key" type="password" placeholder="sk-..." />
+        </div>
+
+        <label class="chk" v-if="editingId && editingProfile()?.hasApiKey">
+          <input type="checkbox" v-model="form.clearKey" />
+          清除已保存的 API Key
+        </label>
+
+        <div class="notice">
+          API Key 与主机密码同样走 AES-256-GCM 加密，主密钥在操作系统钥匙串里。
+          它只会出现在发往 LLM 服务的 HTTP 头里，绝不会被写进对话内容。
+        </div>
+
+        <!-- 自动修正提示。用户把完整端点粘进 Base URL 是很常见的手滑，
+             不说一声的话他只会看到「测试通过」，却不知道自己填错了。 -->
+        <div v-if="corrected" class="fix-hint">
+          Base URL 已自动修正为 <span class="mono">{{ corrected }}</span> ——
+          原来的值把端点（<span class="mono">/chat/completions</span>）也填了进去，
+          那会拼成重复路径并返回 404。程序会自己追加这一段，填到
+          <span class="mono">/v1</span> 为止即可。
+        </div>
+
+        <div v-if="testRes" class="test-result" :class="testRes.ok ? 'ok' : 'bad'">
+          <div class="tr-head">
+            <span class="tr-mark">{{ testRes.ok ? '✓' : '✗' }}</span>
+            <span class="tr-msg">{{ testRes.message }}</span>
+            <span v-if="testRes.ok" class="tr-meta">
+              {{ testRes.model }} · {{ testRes.durationMs }}ms
+            </span>
+          </div>
+          <div v-if="testRes.ok && testRes.reply" class="tr-line">
+            模型回复：<span class="mono">{{ testRes.reply }}</span>
+          </div>
+          <!-- 失败时把实际请求的地址摆出来：404 这类问题光看错误码无从下手 -->
+          <div v-if="!testRes.ok && testRes.url" class="tr-line">
+            实际请求：<span class="mono">{{ testRes.url }}</span>
+          </div>
+        </div>
+
+        <div class="actions">
+          <span class="test-note">测试会真的发一次最小请求（max_tokens=8），不产生实质费用。</span>
+          <button :disabled="testing" @click="test">{{ testing ? '测试中…' : '测试连接' }}</button>
+          <button class="primary" :disabled="busy" @click="save">{{ busy ? '保存中…' : '保存' }}</button>
+        </div>
+
+        <div v-if="isLocal()" class="local-hint">
+          当前指向本地地址 —— 对话内容不会离开这台机器。
+        </div>
       </div>
     </div>
   </div>
 </template>
 
 <style scoped>
-.panel { padding: 22px 26px; overflow-y: auto; height: 100%; }
+.panel { padding: 24px 28px 36px; overflow-y: auto; height: 100%; }
+/* 内容列：窗口再宽也不把表单拉成一条 —— 保持稳定的阅读宽度。 */
+.panel-inner { max-width: 820px; }
+
 .panel-head { margin-bottom: 18px; }
-.panel-head h2 { font-size: 15px; margin: 0 0 6px; }
+.panel-head h2 { font-size: 16px; margin: 0 0 6px; }
 .panel-head p { margin: 0; font-size: 12px; line-height: 1.7; max-width: 640px; }
+
+/* 卡片节奏：统一间距（不再用行内 style 拼），标题与说明做层级 */
+.card { padding: 16px 18px; }
+.card + .card { margin-top: 12px; }
+.card-title { font-size: 13px; font-weight: 600; margin: 0 0 12px; }
+.card-sub { font-size: 12px; color: var(--text-3); line-height: 1.6; margin: -6px 0 12px; }
+
+/* 字段：统一「标签在上、控件在下」的节奏，间距只在这里定义 */
+.field { margin-top: 14px; }
+.field label { margin-bottom: 6px; }
 
 .presets { display: flex; flex-wrap: wrap; gap: 8px; }
 
 .profile-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.profile-select { flex: 1; min-width: 180px; }
-.profile-name { margin-bottom: 12px; }
-.profile-hint { margin-top: 8px; font-size: 12px; }
+/* 方案选择器不必占满整行：给个舒适宽度，按钮紧跟其后 */
+.profile-select { flex: 0 1 340px; min-width: 200px; }
+.profile-hint { margin-top: 10px; font-size: 12px; }
+
+/* 长文本输入给个上限：不随窗口无限拉长 */
+.base-url, .model-name, .api-key, .profile-name { max-width: 620px; }
 
 .notice {
   margin-top: 14px;
@@ -320,7 +349,15 @@ const isLocal = () => /localhost|127\.0\.0\.1|0\.0\.0\.0/.test(form.baseUrl)
   color: var(--text-2);
 }
 
-.actions { display: flex; justify-content: flex-end; align-items: center; gap: 10px; margin-top: 16px; }
+/* 动作区：一条分隔线收尾，和上面的字段区分开 */
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
 .test-note { margin-right: auto; font-size: 11.5px; color: var(--text-3); }
 
 .fix-hint {
@@ -351,7 +388,6 @@ const isLocal = () => /localhost|127\.0\.0\.1|0\.0\.0\.0/.test(form.baseUrl)
 .tr-line .mono { font-size: 11.5px; }
 
 .chk { display: flex; align-items: center; gap: 8px; margin-top: 12px; color: var(--danger); font-size: 12px; }
-.chk input { width: auto; }
 
 .local-hint {
   margin-top: 12px;

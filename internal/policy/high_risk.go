@@ -59,8 +59,15 @@ func IsHighRisk(cmd string) bool {
 
 // HighRiskReason 返回命中的高危规则说明；未命中返回空串。
 // 对 normalizeForRisk 展开的每条候选匹配，避免 VAR=/wrapper/路径绕过。
+//
+// 匹配前先剥掉「丢弃输出」的重定向（> /dev/null、2>&1 等）：这类重定向不写任何
+// 真实文件，不该被「输出重定向写文件」这条规则命中。不剥的话，
+// `systemctl status nginx 2>/dev/null` 会被误判为高危、连白名单模式都要人工确认 ——
+// 而它是运维里最常见的只读诊断写法。真正写文件的重定向（> /tmp/x、2> err.log）
+// 不受影响，照旧命中。剥离用的规则与白名单放行同一套（stripDiscardRedirects），
+// 保证两处判定一致、不会出现「放行算丢弃、高危又算写文件」的自相矛盾。
 func HighRiskReason(cmd string) string {
-	for _, cand := range normalizeForRisk(cmd) {
+	for _, cand := range normalizeForRisk(stripDiscardRedirects(cmd)) {
 		for _, h := range highRisk {
 			if h.re.MatchString(cand) {
 				return h.rule

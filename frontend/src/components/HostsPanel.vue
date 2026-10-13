@@ -209,9 +209,9 @@ const authLabel = m => ({ password: '密码', private_key: '私钥', agent: 'ssh
 </template>
 
 <style scoped>
-.panel { padding: 22px 26px; overflow-y: auto; height: 100%; }
+.panel { padding: 24px 28px 36px; overflow-y: auto; height: 100%; }
 .panel-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; margin-bottom: 18px; }
-.panel-head h2 { font-size: 15px; margin: 0 0 6px; }
+.panel-head h2 { font-size: 16px; margin: 0 0 6px; }
 .panel-head p { margin: 0; font-size: 12px; line-height: 1.7; max-width: 620px; }
 
 .list { display: flex; flex-direction: column; gap: 10px; }
@@ -260,7 +260,6 @@ const authLabel = m => ({ password: '密码', private_key: '私钥', agent: 'ssh
 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
 .chk { display: flex; align-items: center; gap: 8px; margin-top: 14px; color: var(--danger); font-size: 12px; }
-.chk input { width: auto; }
 .hint {
   background: var(--surface-2);
   border-radius: 8px;

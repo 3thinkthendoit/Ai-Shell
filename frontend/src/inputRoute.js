@@ -41,7 +41,10 @@ export function classifyInput(raw) {
   if (trimmed.startsWith('!')) {
     return { kind: 'shell', text: trimmed.slice(1).trim() }
   }
-  if (/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(trimmed)) {
+  if (isNumberedReply(trimmed)) {
+    return { kind: 'agent', text: trimmed }
+  }
+  if (hasCJK(trimmed)) {
     return { kind: 'agent', text: trimmed }
   }
   if (/\?\s*$/.test(trimmed)) {
@@ -51,6 +54,21 @@ export function classifyInput(raw) {
     return { kind: 'agent', text: trimmed }
   }
   return { kind: 'shell', text: trimmed }
+}
+
+// isNumberedReply 判断一行是不是「对编号选项的回复」：整行是数字（`2`），或数字后
+// 跟编号标点/空白（`2.`、`2)`、`2、`、`2 写入`）。
+//
+// 为什么单列一条：用户在回答 LLM 的「1. 换个路径  2. 写入一些内容」这类编号选项时，
+// 常直接回「2」或「2 写入 ...」。shell 里没有以数字命名的真实命令，把 `2` 当命令执行
+// 必然报 `2: command not found` —— 它是选项编号，不是命令，必须交给 LLM。
+// 极少数 fd 重定向写法（`2>file`）不在交互输入场景，且不匹配本规则（数字后不是空格/标点结尾）。
+export function isNumberedReply(trimmed) {
+  return /^\d+[.、)]?(?=\s|$)/.test(trimmed)
+}
+
+function hasCJK(s) {
+  return /[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(s)
 }
 
 // isCommand 问后端「这行首词是不是命令」。
@@ -65,39 +83,99 @@ async function isCommand(text, api) {
   }
 }
 
+// resolveUnknown 对「首词不认识」的一行做一次远端探测，决定去向。
+//
+// 为什么需要它：本地命令库判断不了「用户自己装的脚本 / 第三方工具」——
+// `ceshi` 可能就是用户在远端写的脚本。与其弹窗打断（旧行为），不如
+// 探测一次：存在就当命令跑，不存在才交给 LLM。探测是零副作用的
+// （后端只跑 `command -v`，见 app_shell.go ResolveUnknownInput）。
+//
+// 后端不可用 / 无 hostID 时退回「当 shell 跑」—— 与本地判断的退化一致：
+// 宁可让 shell 报 command not found，也不擅自转 LLM。
+//
+// 返回：
+//   { kind: 'shell' }                          → 当命令跑
+//   { kind: 'agent', missing: true, binary }   → 交给 LLM 理解意图
+async function resolveUnknown(text, api, hostId) {
+  if (!api || typeof api.ResolveUnknownInput !== 'function' || !hostId) {
+    return { kind: 'shell' }
+  }
+  try {
+    const d = await api.ResolveUnknownInput(hostId, text)
+    if (d && d.kind === 'agent') {
+      return { kind: 'agent', missing: true, binary: d.binary || '' }
+    }
+    return { kind: 'shell' }
+  } catch {
+    return { kind: 'shell' }
+  }
+}
+
+// unknownToQuestion 把「一条远端不存在的命令」包装成给 LLM 的问题。
+//
+// 刻意**只转这一句**，不把原文直接当提问 —— 原文可能被模型当成「用户要我执行
+// 这条命令」的指令（诱导风险）。这里明确告诉模型：这是一条**未找到**的命令，
+// 请你理解用户意图；原文只作为被引用的对象出现，位于反引号内。
+export function unknownToQuestion(binary, text) {
+  const name = binary ? `\`${binary}\`` : '这条命令'
+  return `我输入了一条命令 ${name}，但目标主机上不存在该命令。` +
+    `请帮我理解我可能想做什么（我的输入原文：\`${text}\`）。`
+}
+
 /**
  * resolveInput 是**界面实际该用的入口**：在同步规则之上补一次命令识别。
  *
  * 为什么需要它：`echo 你好` 含中文，同步规则会判成 Agent；
  * 但首词 echo 是明确的命令，应该走 shell。这一步只能在问过后端后才知道。
  *
+ * 未知词（首词不在命令库）**不再弹窗问用户**：改为补一次远端探测
+ * （见 resolveUnknown）—— 存在就当命令跑，不存在才自动交给 LLM 理解意图。
+ * 这样「直接执行、失败才介入」的默认成立，且只有「证明不存在」这条
+ * 零副作用的路径才会触发介入（安全闸门，见 ResolveUnknownInput 注释）。
+ *
  * @param {string} raw
  * @param {object} api 后端绑定（window.go.main.App），可空
- * @returns {Promise<{ kind: 'agent'|'shell', text: string, uncertain: boolean }>}
- *   uncertain=true 表示首词不认识、判断不了，界面该问用户一次。
+ * @param {string} hostId 当前主机 id（探测需要），可空
+ * @returns {Promise<{ kind: 'agent'|'shell', text: string, missing?: boolean, binary?: string }>}
+ *   missing=true 表示该命令在远端不存在，text 已包装成给 LLM 的问题。
  */
-export async function resolveInput(raw, api) {
+export async function resolveInput(raw, api, hostId) {
   const trimmed = String(raw ?? '').trim()
   const base = classifyInput(trimmed)
-  if (!trimmed) return { ...base, uncertain: false }
+  if (!trimmed) return base
 
   // 显式表态（? / !）与纯语言特征（问号结尾、多行）已经定了，不必再问后端：
   // 少一次跨进程往返，用户敲回车到发出提问之间没有额外延迟。
   if (trimmed.startsWith('?') || trimmed.startsWith('？') || trimmed.startsWith('!')) {
-    return { ...base, uncertain: false }
+    return base
   }
   if (/\?\s*$/.test(trimmed) || trimmed.includes('\n')) {
-    return { ...base, uncertain: false }
+    return base
+  }
+  // 数字编号回复（`2`、`2.`、`2 写入...`）直接交给 Agent，**不**去问命令库。
+  // 否则 `2` 会被当成首词命令去探测/执行，报 `2: command not found`（用户截图里的 bug）。
+  if (isNumberedReply(trimmed)) {
+    return { kind: 'agent', text: trimmed }
   }
 
-  // 到这里只剩两类要问后端：含中文的（可能是 `echo 你好`）与纯英文的
-  // （可能是 `df -h`，也可能是 `foobar --help`）。
+  // 到这里只剩两类要问后端命令库：含中文的（可能是 `echo 你好`）与纯英文的
+  // （可能是 `df -h`，也可能是 `ceshi`）。
   if (await isCommand(trimmed, api)) {
-    return { kind: 'shell', text: trimmed, uncertain: false }
+    return { kind: 'shell', text: trimmed }
   }
-  // 首词不是命令。含中文 → 中文提问，直接 Agent；纯英文 → 真的拿不准。
-  if (/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(trimmed)) {
-    return { kind: 'agent', text: trimmed, uncertain: false }
+  // 首词不是本地已知命令。含中文 → 中文提问，直接 Agent（`看看磁盘`）。
+  if (hasCJK(trimmed)) {
+    return { kind: 'agent', text: trimmed }
   }
-  return { kind: 'shell', text: trimmed, uncertain: true }
+  // 纯英文未知词：补一次远端探测，决定当命令跑还是交给 LLM。
+  const decided = await resolveUnknown(trimmed, api, hostId)
+  if (decided.kind === 'agent') {
+    return {
+      kind: 'agent',
+      text: unknownToQuestion(decided.binary, trimmed),
+      missing: true,
+      binary: decided.binary
+    }
+  }
+  return { kind: 'shell', text: trimmed }
 }

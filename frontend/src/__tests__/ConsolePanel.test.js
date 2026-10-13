@@ -47,6 +47,13 @@ function makeApp(impl = {}) {
       const base = first.replace(/^.*\//, '')
       return ['ls', 'echo', 'grep', 'cat', 'df', 'docker', 'systemctl', 'nginx', 'cd'].includes(base)
     },
+    // 未知命令的远端探测（首词不在命令库时调用）：默认「不存在」→ 交给 LLM。
+    // 各用例可按需覆盖（改成存在即当命令跑）。
+    ResolveUnknownInput: async (hostId, text) => {
+      const first = String(text || '').trim().split(/\s+/)[0] || ''
+      const base = first.replace(/^.*\//, '')
+      return { kind: 'agent', binary: base, missing: true }
+    },
     // 会话列表：默认只有一条默认会话，与后端的不变式一致。
     // 不给这个实现的话，切主机触发的 refreshSessions 会抛异常、
     // 在对话流里插一条红色报错，把别的断言全带偏。
@@ -193,6 +200,17 @@ describe('ConsolePanel 审批条', () => {
     expect(bar.text()).toContain('systemctl restart nginx')
     expect(bar.text()).toContain('需要确认的重启操作')
     expect(bar.text()).toContain('@web')
+  })
+
+  // 结构不变式：审批条必须挂在 composer 里做**浮层**（绝对定位），不能是
+  // surface 与 composer 之间的普通流子元素 —— 一旦它占布局，出现/消失就会
+  // resize 终端 → 远端 shell 收到 SIGWINCH 重绘提示符 → agent 干活到一半
+  // 看起来像「突然回到了命令行」。这条用例把「挂载点」钉住。
+  it('审批条挂在 composer 内（浮层锚点，不占布局）', async () => {
+    setup()
+    store.pending = { id: 'a0', name: 'run_command', command: 'ls' }
+    await nextTick()
+    expect(wrapper.find('.composer-bar .approval').exists()).toBe(true)
   })
 
   it('write_file 这类没有 command 的调用退化为展示 args', async () => {
@@ -380,19 +398,19 @@ describe('ConsolePanel 运行指示', () => {
     expect(wrapper.text()).toContain('中断')
   })
 
-  it('运行中且无审批时显示「Thinking」', async () => {
+  it('运行中且无审批时显示「Working」', async () => {
     store.running = true
     setup()
     await nextTick()
-    expect(wrapper.text()).toContain('Thinking')
+    expect(wrapper.text()).toContain('Working')
   })
 
-  it('等待审批时不显示「Thinking」（此时在等人，不是在算）', async () => {
+  it('等待审批时不显示「Working」（此时在等人，不是在算）', async () => {
     store.running = true
     store.pending = { id: 'a1', name: 'run_command', command: 'ls' }
     setup()
     await nextTick()
-    expect(wrapper.text()).not.toContain('Thinking')
+    expect(wrapper.text()).not.toContain('Working')
   })
 })
 
@@ -450,22 +468,28 @@ describe('ConsolePanel 表面渲染', () => {
     expect(msg.content).toBe('第一行\n第二行')
   })
 
-  it('工具块画 `$ cmd`', async () => {
+  it('工具调用实时画进活表面（非 shell 风格）', async () => {
     await setupAttached()
     rt.emit('agent:tool', {
       id: 'c1', name: 'run_command', command: 'systemctl status nginx',
       decision: 'allow', status: 'running', hostName: 'web'
     })
     await nextTick()
-    expect(surfaceText()).toContain('$ systemctl status nginx')
+    const t = surfaceText()
+    expect(t).toContain('run_command')
+    expect(t).toContain('systemctl status nginx')
+    expect(t).toContain('▸')
+    expect(t).not.toContain('$ systemctl')   // 不是 shell 的 `$ cmd`
   })
 
-  it('工具结果画退出码与截断输出', async () => {
+  it('工具结果实时画一行状态（完成 / 失败），输出不铺到表面', async () => {
     await setupAttached()
     rt.emit('agent:toolResult', { id: 'c1', exitCode: 0, content: 'active (running)', hostId: 'h1' })
     await nextTick()
-    expect(surfaceText()).toContain('退出码 0')
-    expect(surfaceText()).toContain('active (running)')
+    const t = surfaceText()
+    expect(t).toContain('完成')
+    expect(t).not.toContain('退出码')
+    expect(t).not.toContain('active (running)')
   })
 
   it('审批注记画进表面（交互入口仍在审批条）', async () => {
@@ -527,17 +551,17 @@ describe('ConsolePanel 表面渲染', () => {
     expect(msg.content).toBe('Docker 正常。')
   })
 
-  it('纯问答轮结束后补回输入提示符 ❯（提问没走 PTY，shell 不会打印新提示符）', async () => {
+  it('纯问答轮结束后补回输入提示符（与提问行同款 Ai-Shell >，提问没走 PTY）', async () => {
     await setupAttached()
     // 走真实 ask()：回合开始清零 PTY 写入标记（之前测试留下的标记不代表本轮）
     await ask('本机 docker 正常么')
     await nextTick()
     rt.emit('agent:done', {})
     await nextTick()
-    expect(surfaceText()).toContain('❯')
+    expect(surfaceText()).toContain('Ai-Shell')
   })
 
-  it('本轮 PTY 有写入（如 top 交接）时 shell 自己回到提示符，不补 ❯', async () => {
+  it('本轮 PTY 有写入（如 top 交接）时 shell 自己回到提示符，不补输入提示符', async () => {
     await setupAttached()
     await ask('看看负载')
     await nextTick()
@@ -545,14 +569,16 @@ describe('ConsolePanel 表面渲染', () => {
     await writeTerminal('h1', 'default', textToBase64('q'))
     rt.emit('agent:done', {})
     await nextTick()
-    expect(surfaceText()).not.toContain('❯')
+    // 提问走 ask() 不触发 paintUser，故表面上任何 Ai-Shell 都只能是「补的提示符」——
+    // 本轮 PTY 有写入时不该补，于是不该出现。
+    expect(surfaceText()).not.toContain('Ai-Shell')
   })
 
   // 「LLM 答完就回到控制台」必须是必达的。
   // 曾经有一条 `t.line`（本地缓冲非空就跳过补提示符）的拦截 —— 用户在
   // LLM 回复期间随手敲了几个键，那些字符攒进缓冲，回合结束时提示符就不补了，
   // 用户看到的是「答完了却没回到命令行」，像是卡在某个模式里出不来。
-  it('LLM 回复期间敲的键被丢弃，不再拦住回合结束时的 ❯', async () => {
+  it('LLM 回复期间敲的键被丢弃，不再拦住回合结束时的输入提示符', async () => {
     await setupAttached()
     const term = instances[0]
     await ask('本机 docker 正常么')
@@ -566,7 +592,7 @@ describe('ConsolePanel 表面渲染', () => {
 
     rt.emit('agent:done', {})
     await nextTick()
-    expect(surfaceText()).toContain('❯')
+    expect(surfaceText()).toContain('Ai-Shell')
   })
 
   it('运行期间按 Ctrl-C 走中断（唯一的键盘逃生口）', async () => {
@@ -580,34 +606,35 @@ describe('ConsolePanel 表面渲染', () => {
     expect(store.running).toBe(false)
   })
 
-  it('回合结束时不再重复补 ❯（已有合成提示符就跳过）', async () => {
+  it('回合结束时不再重复补输入提示符（已有合成提示符就跳过）', async () => {
     await setupAttached()
     await ask('本机 docker 正常么')
     await nextTick()
     rt.emit('agent:done', {})
     await nextTick()
-    const first = surfaceText().split('❯').length - 1
-    // 再触发一次 running 的 true→false（如第二轮纯问答）：不该叠出第二个 ❯
+    const first = surfaceText().split('Ai-Shell').length - 1
+    // 再触发一次 running 的 true→false（如第二轮纯问答）：不该叠出第二个提示符
     await ask('那磁盘呢')
     await nextTick()
     rt.emit('agent:done', {})
     await nextTick()
-    // 第二轮是新的提问轮，paintUser 会画自己的行，但 ❯ 不该重复堆积在空行上
-    expect(surfaceText().split('❯').length - 1).toBeGreaterThanOrEqual(first)
+    // 第二轮是新的提问轮，paintUser 会画自己的行，但提示符不该重复堆积在空行上
+    expect(surfaceText().split('Ai-Shell').length - 1).toBeGreaterThanOrEqual(first)
   })
 })
 
-// ---- 输入去向确认 ----
+// ---- 输入去向：未知命令不弹窗，直接执行/探测后转 LLM ----
 //
 // 判断标准是「首词像不像命令」，由**后端**回答（见 app_shell.go
 // ClassifyShellInput —— 它复用 policy 的命令库）。前端不再自带命令清单：
 // 手抄的清单把 `nginx 起不来了` 判成了命令，而它是句中文提问。
 //
-// 弹窗只留给**首词是陌生素词**这一种真正两可的情况：
+// 未知词（首词不在命令库）**不再弹窗**，改为补一次远端探测
+// （见 app_shell.go ResolveUnknownInput）：
 //   `你是什么模型`  不是命令 → 直接 Agent
 //   `echo 你好`     是命令   → 直接 shell（中文只是参数）
-//   `foobar --help` 不认识   → 问用户一次
-describe('ConsolePanel 输入去向确认', () => {
+//   `ceshi`         不认识   → 探测：存在当命令跑 / 不存在自动转 LLM
+describe('ConsolePanel 输入去向', () => {
   async function typeLine(s) {
     const term = instances[0]
     for (const ch of s) term.emitData(ch)
@@ -616,7 +643,6 @@ describe('ConsolePanel 输入去向确认', () => {
     await nextTick()
   }
 
-  // 这一条是你截图里那个场景：`你是什么模型` 毫无歧义，不该弹窗。
   it('中文自然语言提问（非命令首词）：直接问 LLM，不弹窗', async () => {
     await setupAttached()
     await typeLine('你是什么模型')
@@ -625,11 +651,8 @@ describe('ConsolePanel 输入去向确认', () => {
     expect(store.running).toBe(true)
   })
 
-  it('中文描述问题的句子（首词是命令名也不算）：走 Agent，不弹窗', async () => {
+  it('中文描述问题的句子（首词不是命令）：走 Agent，不弹窗', async () => {
     await setupAttached()
-    // nginx 是命令名，但「起不来了」是描述 —— 后端命令库只认首词，
-    // 这里由「含中文且首词判定为命令」的反面覆盖：替身认得 nginx，
-    // 但真实后端同样会判成命令意图。这条用 `看看磁盘` 锁住「非命令 → Agent」。
     await typeLine('看看磁盘')
     await nextTick()
     expect(wrapper.find('.route-modal').exists()).toBe(false)
@@ -645,66 +668,48 @@ describe('ConsolePanel 输入去向确认', () => {
     expect(shells.some(c => c.args.includes('echo 你好'))).toBe(true)
   })
 
-  it('首词不认识：弹二选一，不擅自决定', async () => {
+  it('未知命令：不弹窗；探测不存在 → 自动转 LLM，且终端上有说明', async () => {
     await setupAttached()
-    await typeLine('foobar --help')
+    await typeLine('ceshi')
     await nextTick()
-    expect(wrapper.find('.route-modal').exists()).toBe(true)
-    expect(wrapper.find('.route-text').text()).toContain('foobar --help')
-    // 还没选，就绝不能已经发出去了
-    expect(calls.filter(c => c.name === 'RunShellInTerminal')).toHaveLength(0)
-    expect(store.running).toBe(false)
-  })
-
-  it('选「问 LLM」把这一行作为提问发出去', async () => {
-    await setupAttached()
-    await typeLine('foobar --help')
-    await nextTick()
-    const buttons = wrapper.findAll('.route-modal .modal-actions button')
-    await buttons[2].trigger('click') // 问 LLM
-    await flushPromises()
-    await nextTick()
+    // 不再弹窗
     expect(wrapper.find('.route-modal').exists()).toBe(false)
+    // 走了探测
+    expect(calls.some(c => c.name === 'ResolveUnknownInput')).toBe(true)
+    // 自动转 LLM：进入 agent 运行
     expect(store.running).toBe(true)
+    // 没有当命令发给远端
+    expect(calls.filter(c => c.name === 'RunShellInTerminal')).toHaveLength(0)
   })
 
-  it('选「当 shell 命令」把原文交给策略闸门', async () => {
-    await setupAttached()
-    await typeLine('foobar --help')
-    await nextTick()
-    const buttons = wrapper.findAll('.route-modal .modal-actions button')
-    await buttons[1].trigger('click') // 当 shell 命令
-    await flushPromises()
+  it('未知命令但远端存在：探测后当命令跑，不转 LLM', async () => {
+    await setupAttached({
+      ResolveUnknownInput: async (hostId, text) => ({ kind: 'shell', binary: 'ceshi' })
+    })
+    await typeLine('ceshi')
     await nextTick()
     expect(wrapper.find('.route-modal').exists()).toBe(false)
     const shells = calls.filter(c => c.name === 'RunShellInTerminal')
-    expect(shells.some(c => c.args.includes('foobar --help'))).toBe(true)
-  })
-
-  it('Esc 取消弹窗，不发出任何东西（出得来）', async () => {
-    await setupAttached()
-    await typeLine('foobar --help')
-    await nextTick()
-    expect(wrapper.find('.route-modal').exists()).toBe(true)
-    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
-    await nextTick()
-    expect(wrapper.find('.route-modal').exists()).toBe(false)
+    expect(shells.some(c => c.args.includes('ceshi'))).toBe(true)
     expect(store.running).toBe(false)
-    expect(calls.filter(c => c.name === 'RunShellInTerminal')).toHaveLength(0)
   })
 
-  it('纯英文命令不弹窗，直接走 shell', async () => {
+
+  it('纯英文已知命令不弹窗，直接走 shell', async () => {
     await setupAttached()
     await typeLine('df -h')
     await nextTick()
     expect(wrapper.find('.route-modal').exists()).toBe(false)
+    expect(calls.filter(c => c.name === 'RunShellInTerminal')).toHaveLength(1)
   })
 
-  it('? 开头的英文不弹窗（显式表态要问 LLM）', async () => {
+  it('? 开头显式表态要问 LLM，不发探测', async () => {
     await setupAttached()
     await typeLine('?docker 正常么')
     await nextTick()
     expect(wrapper.find('.route-modal').exists()).toBe(false)
+    expect(calls.some(c => c.name === 'ResolveUnknownInput')).toBe(false)
+    expect(store.running).toBe(true)
   })
 
   it('! 开头强制当 shell 命令，中文也不弹窗', async () => {
@@ -841,6 +846,25 @@ describe('ConsolePanel 对话归档', () => {
     expect(t.text()).toContain('ls -l')
   })
 
+  it('连续工具调用折叠成一行「N 次工具调用」，点开看详情', async () => {
+    setup()
+    push({ kind: 'tool', toolId: 'c1', tool: { id: 'c1', name: 'run_command', status: 'done', decision: 'allow', command: 'ls -l' } })
+    push({ kind: 'result', toolId: 'c1', exitCode: 0, content: 'ok', redacted: 0, injection: [] })
+    push({ kind: 'tool', toolId: 'c2', tool: { id: 'c2', name: 'run_command', status: 'done', decision: 'allow', command: 'df -h' } })
+    push({ kind: 'result', toolId: 'c2', exitCode: 0, content: 'ok2', redacted: 0, injection: [] })
+    await toArchive()
+    const head = wrapper.find('.tool-group-head')
+    expect(head.exists()).toBe(true)
+    expect(head.text()).toContain('2 次工具调用')
+    // 默认收起：详情不可见
+    expect(wrapper.find('.tool-group-body').isVisible()).toBe(false)
+    // 点开后可见两条命令
+    await head.trigger('click')
+    expect(wrapper.find('.tool-group-body').isVisible()).toBe(true)
+    expect(wrapper.find('.tool-group-body').text()).toContain('ls -l')
+    expect(wrapper.find('.tool-group-body').text()).toContain('df -h')
+  })
+
   it('结果区显示退出码与脱敏计数', async () => {
     setup()
     push({ kind: 'result', toolId: 'c1', exitCode: 0, content: 'out', redacted: 2, injection: [] })
@@ -934,19 +958,19 @@ describe('ConsolePanel 流式输出', () => {
     expect(wrapper.find('.msg.assistant .caret').exists()).toBe(false)
   })
 
-  it('正在逐字输出时不显示「Thinking」（此时在输出，不是在算）', async () => {
+  it('正在逐字输出时不显示「Working」（此时在输出，不是在算）', async () => {
     store.running = true
     setup()
     push({ kind: 'assistant', content: '输出中', stream: 0, streaming: true })
     await nextTick()
-    expect(wrapper.text()).not.toContain('Thinking')
+    expect(wrapper.text()).not.toContain('Working')
   })
 
-  it('思考阶段（还没有任何增量）仍显示「Thinking」', async () => {
+  it('思考阶段（还没有任何增量）仍显示「Working」', async () => {
     store.running = true
     setup()
     await nextTick()
-    expect(wrapper.text()).toContain('Thinking')
+    expect(wrapper.text()).toContain('Working')
   })
 
   it('生成过程中内容增长会触发自动滚动', async () => {

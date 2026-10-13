@@ -49,8 +49,7 @@ const LOGOS = {
 
 // providerBadge 返回 { logo?, mark?, color }：有 logo 用 logo，否则用彩色圆 + mark。
 export function providerBadge(p) {
-  const hay = `${p.model || ''} ${p.baseUrl || ''} ${p.name || ''}`
-  const hit = PROVIDERS.find(x => x.re.test(hay))
+  const hit = matchProvider(p)
   if (hit) {
     if (LOGOS[hit.key]) return { logo: LOGOS[hit.key], color: hit.color }
     return { mark: hit.mark, color: hit.color }
@@ -59,4 +58,70 @@ export function providerBadge(p) {
   const nm = String(p.name || p.model || '?').trim()
   const ch = /[\u4e00-\u9fa5]/.test(nm[0]) ? nm[0] : nm[0].toUpperCase()
   return { mark: ch, color: 'var(--text-3)' }
+}
+
+function matchProvider(p) {
+  const hay = `${p.model || ''} ${p.baseUrl || ''} ${p.name || ''}`
+  return PROVIDERS.find(x => x.re.test(hay))
+}
+
+// 终端场景的图标/颜色：终端里画不了 SVG，只能用**一个字形 + ANSI 颜色**近似。
+// 每个厂商配一个简短 ASCII/CJK 标（`mark` 已有）与一个十六进制色（ANSI 真彩）。
+//
+// 为什么不用 Nerd Font 字形（如 logos 私有区）：那要求用户装了对应字体，
+// 没装就是方框豆腐块，反而更糟。用厂商的通用字母标（DS / AI / C / Q …）在任何
+// 等宽字体下都稳定可读，配合品牌色一眼可辨 —— 与界面里的降级圆标同一套心智。
+const TERM_ICON = {
+  deepseek: 'DS',
+  openai: 'AI',
+  anthropic: 'C',
+  qwen: 'Q',
+  glm: 'Z',
+  kimi: 'K',
+  gemini: 'G',
+  llama: 'L',
+  mistral: 'M',
+  ernie: 'W',
+  doubao: '豆'
+}
+
+// providerTermBadge 返回终端可用的徽标信息：
+//   { mark, color, name } —— mark 是一两个字符的图标，color 是十六进制品牌色，
+//   name 是人可读的展示名（优先用方案名，其次厂商名，最后回退模型串）。
+// 与 providerBadge 共用同一套厂商识别（matchProvider），避免两处规则漂移。
+export function providerTermBadge(p) {
+  const profile = p || {}
+  const hit = matchProvider(profile)
+  // 展示名：方案名最能对上用户在下拉框里看到的东西；没有就用厂商名，再没有就模型串。
+  const rawName = String(profile.name || '').trim()
+  const name = rawName || (hit ? PROVIDER_LABEL[hit.key] : '') || String(profile.model || '').trim()
+  if (hit) {
+    return { mark: TERM_ICON[hit.key] || hit.mark, color: ansiHex(hit.color), name }
+  }
+  // 完全认不出：方案名/模型串首字 + 中性灰。
+  const nm = String(name || profile.model || '?').trim()
+  const ch = /[\u4e00-\u9fa5]/.test(nm[0]) ? nm[0] : (nm[0] || '?').toUpperCase()
+  return { mark: ch, color: '#8a8a86', name }
+}
+
+// 厂商的中文/展示名，供终端抬头在方案名为空时兜底。
+const PROVIDER_LABEL = {
+  deepseek: 'DeepSeek',
+  openai: 'OpenAI',
+  anthropic: 'Claude',
+  qwen: '通义千问',
+  glm: '智谱 GLM',
+  kimi: 'Kimi',
+  gemini: 'Gemini',
+  llama: 'Llama',
+  mistral: 'Mistral',
+  ernie: '文心一言',
+  doubao: '豆包'
+}
+
+// ansiHex 把一个 #RRGGBB 品牌色原样传出（xterm 支持 truecolor，
+// termPaint 会用 \x1b[38;2;r;g;bm 直接落到终端）。这里只做「是不是合法 hex」的
+// 兜底：品牌色表里都是 hex，认不出时给中性灰。
+function ansiHex(hex) {
+  return /^#[0-9a-f]{6}$/i.test(hex || '') ? hex : '#8a8a86'
 }

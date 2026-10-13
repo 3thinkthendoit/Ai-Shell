@@ -111,7 +111,9 @@ button.tonal:hover:not(:disabled) { background: var(--accent-bg); border-color: 
 /* sm 只缩字号与水平内边距，高度与输入框一致 —— 用户明确要求全局对齐。 */
 button.sm { padding: 0 10px; font-size: 12px; }
 
-input, select, textarea {
+/* 文本类控件。checkbox / radio 明确排除 —— 它们有自己的自绘样式（见下），
+   套上这里的 padding/border/width 会被撑成一个大胶囊（用户截图里的问题）。 */
+input:not([type='checkbox']):not([type='radio']), select, textarea {
   font: inherit;
   color: var(--text);
   background: var(--surface);
@@ -121,16 +123,16 @@ input, select, textarea {
   width: 100%;
   outline: none;
 }
-input, textarea { -webkit-appearance: none; appearance: none; }
-input::placeholder, textarea::placeholder { color: var(--text-3); }
+input:not([type='checkbox']):not([type='radio']), textarea { -webkit-appearance: none; appearance: none; }
+input:not([type='checkbox']):not([type='radio'])::placeholder, textarea::placeholder { color: var(--text-3); }
 
 /* ---- UiSelect：自绘下拉框（WKWebView 原生 select 弹层有渲染缺陷） ---- */
 .uis { position: relative; }
 .uis-trigger {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  justify-content: flex-start;      /* 内容整体靠左，绝不撑开留空 */
+  gap: 6px;                          /* badge / 文字 / 箭头之间的固定小间距 */
   width: 100%;
   font: inherit;
   color: var(--text);
@@ -141,9 +143,12 @@ input::placeholder, textarea::placeholder { color: var(--text-3); }
   cursor: pointer;
   text-align: left;
 }
-.uis.open .uis-trigger { border-color: var(--accent); }
+.uis.open .uis-trigger { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-bg); }
 .uis.disabled .uis-trigger { opacity: 0.45; cursor: not-allowed; }
-.uis-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* label 按内容宽度、紧跟 badge；箭头紧随其后 —— 三者紧凑靠左，中间与右侧都不留空。
+   max-width 限制在最坏情况下（超长名字）收缩并显示「…」；flex:0 1 auto + min-width:0
+   保证它能被压缩，箭头 flex-shrink:0 始终可见。 */
+.uis-label { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* 厂商小徽标：彩色圆点 + 1~2 字标记，跟在文字前。 */
 .uis-badge {
   flex-shrink: 0;
@@ -200,7 +205,50 @@ input::placeholder, textarea::placeholder { color: var(--text-3); }
 .uis-item:hover { background: var(--surface-2); }
 .uis-item.selected { color: var(--accent); font-weight: 600; }
 .uis-item.disabled { opacity: 0.45; cursor: not-allowed; }
-input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+input:not([type='checkbox']):not([type='radio']):focus, select:focus, textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-bg);
+}
+
+/* ---- 复选框 / 单选：自绘 ----
+   两个原因：① WKWebView 的原生控件与主题不搭；
+   ② 通用 input 样式（padding/border/width）会把它们撑成一个胶囊。
+   对勾用内联 SVG 画：与盒子几何解耦，不依赖字体、也不怕像素偏移。 */
+input[type='checkbox'], input[type='radio'] {
+  -webkit-appearance: none;
+  appearance: none;
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  padding: 0;
+  border: 1.5px solid var(--border-strong);
+  background-color: var(--surface);
+  background-repeat: no-repeat;
+  background-position: center;
+  cursor: pointer;
+  transition: background-color 0.12s, border-color 0.12s;
+}
+input[type='checkbox'] { border-radius: 5px; background-size: 11px 11px; }
+input[type='radio'] { border-radius: 50%; position: relative; }
+input[type='checkbox']:hover:not(:disabled), input[type='radio']:hover:not(:disabled) { border-color: var(--accent); }
+input[type='checkbox']:checked, input[type='radio']:checked { border-color: var(--accent); }
+input[type='checkbox']:checked {
+  background-color: var(--accent);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.5 8.5l3.2 3.2L12.5 5' fill='none' stroke='%23fff' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+[data-theme='dark'] input[type='checkbox']:checked {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.5 8.5l3.2 3.2L12.5 5' fill='none' stroke='%230a0c0a' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+input[type='radio']:checked::after {
+  content: '';
+  position: absolute;
+  inset: 3px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+input[type='checkbox']:focus-visible, input[type='radio']:focus-visible { box-shadow: 0 0 0 3px var(--accent-bg); }
+input[type='checkbox']:disabled, input[type='radio']:disabled { opacity: 0.45; cursor: not-allowed; }
 textarea { font-family: var(--mono); resize: vertical; line-height: 1.55; }
 label { display: block; font-size: 12px; color: var(--text-2); margin-bottom: 5px; }
 

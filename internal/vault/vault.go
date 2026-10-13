@@ -419,10 +419,10 @@ func (v *Vault) LLMKey(profileID string) string {
 // p.ID 必须非空（生成新 ID 是调用方的职责 —— 那是应用层的关注点）。
 func (v *Vault) SaveLLMProfile(p LLMProfile, apiKey *string) error {
 	if strings.TrimSpace(p.Name) == "" {
-		return errors.New("方案名称不能为空")
+		return errors.New("服务商名称不能为空")
 	}
 	if p.ID == "" {
-		return errors.New("缺少方案 ID")
+		return errors.New("缺少服务商 ID")
 	}
 
 	v.mu.Lock()
@@ -466,7 +466,7 @@ func (v *Vault) SaveLLMProfile(p LLMProfile, apiKey *string) error {
 // 落到旧字段兜底上，那是一条迁移之后没人再维护的死路。
 func (v *Vault) DeleteLLMProfile(id string) error {
 	if strings.TrimSpace(id) == "" {
-		return errors.New("缺少方案 ID")
+		return errors.New("缺少服务商 ID")
 	}
 
 	v.mu.Lock()
@@ -476,10 +476,10 @@ func (v *Vault) DeleteLLMProfile(id string) error {
 	}
 	i := v.indexOfProfileLocked(id)
 	if i < 0 {
-		return errors.New("方案不存在")
+		return errors.New("服务商不存在")
 	}
 	if len(v.st.LLMProfiles) == 1 {
-		return errors.New("至少保留一套配置方案，不能删除最后一套")
+		return errors.New("至少保留一个服务商，不能删除最后一个")
 	}
 	v.st.LLMProfiles = append(v.st.LLMProfiles[:i], v.st.LLMProfiles[i+1:]...)
 	delete(v.st.LLMAPIKeys, id)
@@ -499,7 +499,7 @@ func (v *Vault) ActivateLLMProfile(id string) error {
 		return ErrLocked
 	}
 	if v.indexOfProfileLocked(id) < 0 {
-		return errors.New("方案不存在")
+		return errors.New("服务商不存在")
 	}
 	v.st.ActiveLLM = id
 	return v.saveLocked()
@@ -578,6 +578,34 @@ func (v *Vault) LLM() (LLMSettings, string) {
 		return LLMSettings{BaseURL: p.BaseURL, Model: p.Model}, v.st.LLMAPIKeys[p.ID]
 	}
 	return v.st.LLM, v.st.LLMAPIKey
+}
+
+// LLMFor 按方案 ID 解析一组 LLM 配置。
+//
+// 返回第三个值 found：id 为空时永远视为「可用当前方案」（found=true）；
+// id 非空但找不到时 found=false —— **不静默回落**。回落会让用户以为
+// 自己选的那套在跑、实际是另一套在回答（见 App.Ask 与 TestLLMProfile，
+// 本项目对这类场景的原则是显式报错而不是换一套）。
+//
+// 存在的理由：让「这一轮用哪套方案」可以**随请求下发**，而不是只能读那个
+// 全局的激活指针。用户在下拉框里选了哪套，这一轮就用哪套 —— 不必依赖
+// 「先切全局、下一轮才生效」这条间接路径，也就不会出现「切了却没换」的观感。
+func (v *Vault) LLMFor(id string) (LLMSettings, string, bool) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if id != "" {
+		for i := range v.st.LLMProfiles {
+			if v.st.LLMProfiles[i].ID == id {
+				p := &v.st.LLMProfiles[i]
+				return LLMSettings{BaseURL: p.BaseURL, Model: p.Model}, v.st.LLMAPIKeys[p.ID], true
+			}
+		}
+		return LLMSettings{}, "", false
+	}
+	if p := v.activeProfileLocked(); p != nil {
+		return LLMSettings{BaseURL: p.BaseURL, Model: p.Model}, v.st.LLMAPIKeys[p.ID], true
+	}
+	return v.st.LLM, v.st.LLMAPIKey, true
 }
 
 // ---- 策略 ----

@@ -9,7 +9,7 @@ import {
   store, push, clearLog, clearSession, bootstrap, refreshHosts, refreshSessions, bindEvents,
   ask, approve, stop, dismissAuditError, bucketKey,
   runShellInTerminal, reportActiveSession, selectSession,
-  registerTermSink, unregisterTermSink, textToBase64, bytesToBase64
+  registerTermSink, unregisterTermSink, registerLLMHint, textToBase64, bytesToBase64
 } from '../store.js'
 
 // 桶键由 bucketKey 生成，测试里不要手写 'h1\x00default' 这种字面量 ——
@@ -384,6 +384,76 @@ describe('running 标志的推导', () => {
   })
 })
 
+// ---- 思考占位（Working 滚动）的生命周期 ----
+//
+// 回归背景：思考占位是「就地画进活终端流、靠 \r 原地重画」的一段文字。一旦
+// 期间有别的输出（工具结果、PTY 回显、快照注记）写进同一块表面，光标被推走，
+// \r 就再也回不到占位那一行 —— 占位擦不掉，残留成幽灵 `Working`，还会和 shell
+// 提示符挤在同一行。修复手段是：任何会往该表面写别的内容的事件，都先收掉占位。
+describe('思考占位随输出收尾', () => {
+  let frames
+  function attachRaw(hostId = 'h1', sessionId = '') {
+    frames = []
+    const fn = x => { frames.push(typeof x === 'string' ? x : new TextDecoder().decode(x)) }
+    registerTermSink(hostId, sessionId, fn)
+    store.currentHostId = hostId
+    return () => unregisterTermSink(hostId, sessionId, fn)
+  }
+
+  it('status=thinking 先画出一帧 Working 占位', () => {
+    install({ runtime: rt, app: makeApp().app })
+    bindEvents()
+    const off = attachRaw()
+    try {
+      rt.emit('agent:status', { status: 'thinking' })
+      expect(stripAnsi(frames.join(''))).toContain('Working')
+      // 收尾：让 run 结束，停掉占位定时器，避免残留定时器污染后续用例。
+      rt.emit('agent:done', {})
+    } finally {
+      off()
+    }
+  })
+
+  it('工具事件到达时收掉占位（模型已在执行命令，不再滚动 Working）', () => {
+    install({ runtime: rt, app: makeApp().app })
+    bindEvents()
+    const off = attachRaw()
+    try {
+      rt.emit('agent:status', { status: 'thinking' })
+      const before = frames.length
+      rt.emit('agent:tool', { id: 'c1', name: 'run_command', command: 'ls', status: 'running' })
+      // 收尾表现：stopThinking 会写一段「空格覆盖 + 回行首」。检查它在 tool 行之前发生，
+      // 且 tool 事件之后不再有新的 Working 帧（滚动已停）。
+      const afterTool = frames.slice(before).map(stripAnsi).join('')
+      expect(afterTool).toContain('run_command') // 工具调用实时画出来了（非 shell 风格）
+      expect(afterTool).not.toContain('Working') // 且不再有新的 Working 帧
+      rt.emit('agent:done', {})
+    } finally {
+      off()
+    }
+  })
+
+  it('PTY 输出到达时收掉占位（否则光标被推走，占位永远擦不掉）', () => {
+    install({ runtime: rt, app: makeApp().app })
+    bindEvents()
+    const off = attachRaw()
+    try {
+      rt.emit('agent:status', { status: 'thinking' })
+      const before = frames.length
+      // 远端真的吐字节（如 shell 提示符 / 命令输出）
+      rt.emit('term:data', { hostId: 'h1', sessionId: '', data: btoa('root@host:~$ ') })
+      const after = frames.slice(before).map(stripAnsi).join('')
+      // PTY 字节画出来了
+      expect(after).toContain('root@host:~$')
+      // 且这一段里没有新的 Working 帧 —— 占位已停止滚动
+      expect(after).not.toContain('Working')
+      rt.emit('agent:done', {})
+    } finally {
+      off()
+    }
+  })
+})
+
 // ---- 审批生命周期 ----
 
 describe('审批生命周期', () => {
@@ -472,7 +542,8 @@ describe('ask 发送一轮对话', () => {
     // 用户的提问就会进到另一条对话里 —— 而界面上看不出任何异常。
     store.currentSessionId = 's9'
     await ask('看看磁盘')
-    expect(calls[0].args).toEqual(['h1', 's9', '看看磁盘'])
+    // 第 4 参是「这一轮用哪套 LLM 方案」：切换随请求即时生效（见 store.ask）。
+    expect(calls[0].args).toEqual(['h1', 's9', '看看磁盘', store.selectedProfileId])
     expect(store.running).toBe(true)
   })
 
@@ -992,30 +1063,31 @@ describe('agent 事件双写到终端表面', () => {
     expect(sink.painted()).toContain('磁盘充足')
   })
 
-  it('用户那句话也画到表面（带「❯」符号）', () => {
+  it('用户那句话也画到表面（带「Ai-Shell >」前缀）', () => {
     attach('h1')
     rt.emit('agent:message', { role: 'user', content: 'nginx 挂了' })
 
     expect(store.entries.map(e => e.kind)).toEqual(['user'])
-    expect(sink.painted()).toContain('❯')
+    expect(sink.painted()).toContain('Ai-Shell')
     expect(sink.painted()).toContain('nginx 挂了')
   })
 
-  it('工具块画 `$ 命令`，同时 upsert 一条 tool 记录', () => {
+  it('工具调用实时画一行，同时 upsert 一条 tool 记录', () => {
     attach('h1')
     rt.emit('agent:tool', { id: 'c1', name: 'run_command', command: 'ls -l', status: 'running', decision: 'allow' })
 
     expect(store.entries.filter(e => e.kind === 'tool')).toHaveLength(1)
-    expect(sink.painted()).toContain('$ ls -l')
+    expect(sink.painted()).toContain('ls -l')
+    expect(sink.painted()).not.toContain('$ ls -l')   // 非 shell 风格
   })
 
-  it('工具结果画退出码与截断输出', () => {
+  it('工具结果实时画一行状态，同时落一条 result 记录', () => {
     attach('h1')
     rt.emit('agent:toolResult', { id: 'c1', exitCode: 2, content: 'ls: /nope: No such file', hostId: 'h1' })
 
     expect(store.entries.find(e => e.kind === 'result').exitCode).toBe(2)
-    expect(sink.painted()).toContain('退出码 2')
-    expect(sink.painted()).toContain('No such file')
+    expect(sink.painted()).toContain('失败（码 2）')
+    expect(sink.painted()).not.toContain('No such file')   // 输出不铺到表面
   })
 
   it('审批与错误都画到表面：审批注记 + 错误行', () => {
@@ -1104,8 +1176,8 @@ describe('reportActiveSession 报告活动会话', () => {
 // ---- 常驻终端的 shell 通道 ----
 
 // composer 里人敲的 shell 行走这条通道：后端策略闸门裁决（高危弹审批）后把这一行
-// 写进常驻 PTY。放行时 PTY 自己回显命令与输出，前端只补一句「可问 LLM」的提示；
-// 被拒/取消/出错才在表面上说明原因。
+// 写进常驻 PTY。放行时 PTY 自己回显命令与输出，前端只补一句「可交给 LLM 分析」的
+// **提示**（纯文字，不进 agent）；被拒/取消/出错才在表面上说明原因。
 describe('runShellInTerminal 常驻终端 shell 通道', () => {
   it('放行：把命令交给后端写进 PTY，返回结果并复位 busy', async () => {
     const { app, calls } = makeApp({ RunShellInTerminal: async () => ({ status: 'done' }) })
@@ -1119,21 +1191,46 @@ describe('runShellInTerminal 常驻终端 shell 通道', () => {
     expect(store.busy).toBe(false)
   })
 
-  it('放行后画一句「可问 LLM」提示（这是 done 路径唯一的额外输出）', async () => {
+  it('放行后触发组件画「可交给 LLM 分析」占位（done 路径唯一的额外输出）', async () => {
     vi.useFakeTimers()
     try {
       const { app } = makeApp({ RunShellInTerminal: async () => ({ status: 'done' }) })
       install({ runtime: rt, app })
       const sink = captureSink('h1', 's1')
       store.currentHostId = 'h1'
+      const hintCalls = []
+      const unregister = registerLLMHint('h1', 's1', () => hintCalls.push(1))
       await runShellInTerminal('h1', 's1', 'ls -la')
-      // 提示要等终端输出静默才出现：这个接口返回时命令才刚写进 PTY，
+      // 提示要等终端输出静默才触发：这个接口返回时命令才刚写进 PTY，
       // 回显与输出还在路上，此时画提示会插到命令输出前面。
-      expect(sink.painted()).not.toContain('想分析这段输出')
+      expect(hintCalls).toHaveLength(0)
 
       await vi.advanceTimersByTimeAsync(500)
-      expect(sink.painted()).toContain('想分析这段输出')
-      expect(sink.painted()).toContain('直接用中文问 LLM')
+      expect(hintCalls).toHaveLength(1)
+      unregister()
+      unregisterTermSink('h1', 's1', sink.fn)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('提示不再换行：store 通知组件画占位（用户要求提示不占独立行）', async () => {
+    vi.useFakeTimers()
+    try {
+      const { app } = makeApp({ RunShellInTerminal: async () => ({ status: 'done' }) })
+      install({ runtime: rt, app })
+      const sink = captureSink('h1', 's1')
+      store.currentHostId = 'h1'
+      // 组件侧登记绘制回调（ConsolePanel ensureTerm 的行为）。
+      const unregister = registerLLMHint('h1', 's1', () => hintCalls.push('draw'))
+      const hintCalls = []
+      await runShellInTerminal('h1', 's1', 'ls -la')
+      await vi.advanceTimersByTimeAsync(500)
+      // store 自己不再画「另起一行」的提示（\x1b7…\r\n…\x1b8 那套已废弃），
+      // 而是通知组件在提示符后画占位。
+      expect(sink.painted()).not.toContain('\x1b7\r\n')
+      expect(hintCalls).toEqual(['draw'])
+      unregister()
       unregisterTermSink('h1', 's1', sink.fn)
     } finally {
       vi.useRealTimers()
@@ -1151,16 +1248,17 @@ describe('runShellInTerminal 常驻终端 shell 通道', () => {
       await runShellInTerminal('h1', 's1', 'ls -la')
 
       // 模拟远端的回显 + 输出 + 新提示符分批到达，每批间隔 200ms（小于静默阈值）。
+      const hintCalls = []
+      const unregister = registerLLMHint('h1', 's1', () => hintCalls.push(1))
       for (let i = 0; i < 3; i++) {
         rt.emit('term:data', { hostId: 'h1', sessionId: 's1', data: bytesToBase64(new TextEncoder().encode('out' + i)) })
         await vi.advanceTimersByTimeAsync(200)
-        expect(sink.painted()).not.toContain('想分析这段输出')
+        expect(hintCalls).toHaveLength(0)
       }
-      // 输出停了，再等过静默阈值才出现。
+      // 输出停了，再等过静默阈值才触发。
       await vi.advanceTimersByTimeAsync(500)
-      expect(sink.painted()).toContain('想分析这段输出')
-      // 提示必须排在最后一批输出之后。
-      expect(sink.painted().indexOf('out2')).toBeLessThan(sink.painted().indexOf('想分析这段输出'))
+      expect(hintCalls).toHaveLength(1)
+      unregister()
       unregisterTermSink('h1', 's1', sink.fn)
     } finally {
       vi.useRealTimers()
@@ -1179,7 +1277,7 @@ describe('runShellInTerminal 常驻终端 shell 通道', () => {
       expect(sink.painted()).toContain('命令被策略拒绝')
       expect(sink.painted()).toContain('rm -rf 属于高危命令')
       // 没执行过的命令不该出现「分析输出」提示
-      expect(sink.painted()).not.toContain('想分析这段输出')
+      expect(sink.painted()).not.toContain('这段输出可交给 LLM 分析')
       expect(store.pending).toBe(null)
       expect(store.busy).toBe(false)
     } finally {
@@ -1220,3 +1318,54 @@ describe('runShellInTerminal 常驻终端 shell 通道', () => {
     }
   })
 })
+
+// ---- 护栏：执行 shell 命令**绝不**进入 agent 模式 ----
+//
+// 用户反馈过一个真实误解：命令跑完后屏幕上出现「可交给 LLM 分析」的提示，
+// 被误以为「执行命令进入了 agent 模式」。
+//
+// 事实是：那条提示只往表面写一行字，与 agent 无关。但"读代码相信它不会切模式"
+// 不够 —— 把它变成**被测试锁死的不变式**，任何人日后不小心让 shell 通道调用
+// ask() / 改动 store.running，都会在这里立刻失败。
+describe('护栏：shell 命令不得进入 agent 模式', () => {
+  it('执行任意 shell 命令后：running 为 false、从未调用 Ask', async () => {
+    vi.useFakeTimers()
+    try {
+      const { app, calls } = makeApp({ RunShellInTerminal: async () => ({ status: 'done' }) })
+      install({ runtime: rt, app })
+      const sink = captureSink('h1', 's1')
+      store.currentHostId = 'h1'
+      store.running = false
+
+      await runShellInTerminal('h1', 's1', 'ls -la')
+      // 命令跑完要等静默才触发组件画提示 —— 把这段等完，确保该发生的都发生了。
+      await vi.advanceTimersByTimeAsync(500)
+
+      // 核心断言：shell 通道自始至终不该碰 agent。
+      expect(calls.filter(c => c.name === 'Ask')).toHaveLength(0)
+      expect(store.running).toBe(false)
+      unregisterTermSink('h1', 's1', sink.fn)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('提示文案不出现「模式」类措辞（它是说明，不是入口）', async () => {
+    vi.useFakeTimers()
+    try {
+      const { app } = makeApp({ RunShellInTerminal: async () => ({ status: 'done' }) })
+      install({ runtime: rt, app })
+      const sink = captureSink('h1', 's1')
+      store.currentHostId = 'h1'
+      await runShellInTerminal('h1', 's1', 'pwd')
+      await vi.advanceTimersByTimeAsync(500)
+      const text = sink.painted()
+      expect(text).not.toContain('模式')
+      expect(text).not.toContain('进入')
+      unregisterTermSink('h1', 's1', sink.fn)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+

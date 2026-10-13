@@ -432,9 +432,9 @@ func (a *App) SaveLLMProfile(req SaveLLMProfileRequest) (vault.LLMProfileView, e
 	} else if key != nil {
 		note = "已更新 API Key"
 	}
-	action := "更新 LLM 方案"
+	action := "更新 LLM 服务商"
 	if isNew {
-		action = "新增 LLM 方案"
+		action = "新增 LLM 服务商"
 	}
 	// 只记地址与模型名，绝不记 Key 原文。
 	a.auditLog(audit.Entry{
@@ -467,7 +467,7 @@ func (a *App) DeleteLLMProfile(id string) error {
 	}
 	a.auditLog(audit.Entry{
 		Kind: audit.KindLLM,
-		Note: fmt.Sprintf("删除 LLM 方案「%s」", name),
+		Note: fmt.Sprintf("删除 LLM 服务商「%s」", name),
 	})
 	return nil
 }
@@ -487,7 +487,7 @@ func (a *App) ActivateLLMProfile(id string) error {
 	if name != "" {
 		a.auditLog(audit.Entry{
 			Kind: audit.KindLLM,
-			Note: fmt.Sprintf("切换 LLM 方案到「%s」", name),
+			Note: fmt.Sprintf("切换 LLM 服务商到「%s」", name),
 		})
 	}
 	return nil
@@ -570,7 +570,7 @@ func (a *App) TestLLMProfile(profileID, baseURL, model, apiKey string) LLMTestRe
 	if id := strings.TrimSpace(profileID); id != "" {
 		p, ok := a.v.LLMProfile(id)
 		if !ok {
-			return LLMTestResult{Message: "该方案已不存在（可能已被删除），请刷新后重试。"}
+			return LLMTestResult{Message: "该服务商已不存在（可能已被删除），请刷新后重试。"}
 		}
 		saved = vault.LLMSettings{BaseURL: p.BaseURL, Model: p.Model}
 		savedKey = a.v.LLMKey(id)
@@ -1009,6 +1009,30 @@ func (a *App) WriteTerminal(hostID, sessionID, data string) error {
 	return nil
 }
 
+// CurrentTermCwd 返回该任务常驻终端**此刻**的远端目录（screen 记录的最近一次
+// OSC 7 上报值）。拿不到时返回空串 —— 文件管理弹窗照旧回落到家目录。
+//
+// 为什么需要它：term:cwd 是「目录变化时」才推**一次**的事件，而前端内存里的
+// termCwd 在刷新/重启后是空的，终端也可能在 OSC 7 首次送达前就打开了弹窗。
+// 那种时刻事件靠不住，但后端的 screen 一直在喂字节、cwd 永远是新鲜的 ——
+// 直接问它即可，这是「弹出框默认定位到控制台 pwd 所在目录」的兜底来源。
+//
+// 锁序约定：a.mu → screen.mu。pump 回调从不「持 screen.mu 时取 a.mu」
+// （Feed 的锁在返回前释放），另一方向不存在，所以这里不会死锁。
+func (a *App) CurrentTermCwd(hostID, sessionID string) string {
+	if err := a.ready(); err != nil {
+		return ""
+	}
+	key := termKey(hostID, sessionID)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	vt, ok := a.termVT[key]
+	if !ok || vt == nil || vt.screen == nil {
+		return ""
+	}
+	return vt.screen.Cwd()
+}
+
 // ResizeTerminal 上报终端尺寸变化。
 //
 // 少了这一步，远端程序会一直以为自己还是初始尺寸：top 的进程列表挤在
@@ -1148,7 +1172,12 @@ func (a *App) DeleteSession(hostID, sessionID string) error {
 //
 // sessionID 传空字符串表示「默认会话」—— 调用方不必知道默认会话的 ID 叫什么，
 // 也就不会出现「前端写死了一个 ID、后端改了常量」这种静默错位。
-func (a *App) Ask(hostID, sessionID, prompt string) error {
+//
+// profileID 是这一轮要用的 LLM 方案（模型）。空串表示沿用当前激活方案；
+// 非空时必须是**已存在**的方案，否则直接报错 —— 静默回落到激活方案会让
+// 用户以为自己选的那套在跑，实际却是另一套，和 TestLLMProfile 同一个理由。
+// 有了它，「选哪套就用哪套」是随请求下发的，不依赖「先切全局、下一轮生效」。
+func (a *App) Ask(hostID, sessionID, prompt, profileID string) error {
 	if err := a.ready(); err != nil {
 		return err
 	}
@@ -1157,6 +1186,12 @@ func (a *App) Ask(hostID, sessionID, prompt string) error {
 	}
 	if a.ag == nil {
 		return fmt.Errorf("Agent 尚未初始化")
+	}
+	pid := strings.TrimSpace(profileID)
+	if pid != "" {
+		if _, ok := a.v.LLMProfile(pid); !ok {
+			return fmt.Errorf("所选服务商已不存在（可能已被删除），请刷新后重试。")
+		}
 	}
 	// 先占 lane，再查 Running：避免「查 Running 通过 → shell 插入 → 再占 lane」的窗口，
 	// 也避免双 Ask 都过 Running 检查后抢 Run。
@@ -1179,7 +1214,9 @@ func (a *App) Ask(hostID, sessionID, prompt string) error {
 			}
 		}()
 		// Run 的错误路径自身会 emit EvError（见 agent.go），这里不需要再发。
-		_ = a.ag.Run(a.ctx, hostID, sessionID, prompt)
+		// 转发的是已 TrimSpace 的 pid：校验用的值与 Run 实际拿到的是同一个，
+		// 空白串一律按「未指定」处理，不会出现「校验跳过、字面转发」的错位。
+		_ = a.ag.Run(a.ctx, hostID, sessionID, prompt, pid)
 	}()
 	return nil
 }

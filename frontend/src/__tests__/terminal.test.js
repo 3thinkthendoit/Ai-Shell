@@ -97,6 +97,9 @@ function makeApp(impl = {}) {
       const base = first.replace(/^.*\//, '')
       return ['ls', 'echo', 'grep', 'cat', 'df', 'docker', 'systemctl', 'nginx', 'cd', 'pwd', 'a', 'b', 'uptime', 'tail', 'sed'].includes(base)
     },
+    // 未知命令的远端探测：本文件用例不触发（未知词都含中文或走前缀），
+    // 补一个替身以防将来新增用例掉进「没有实现」的分支。
+    ResolveUnknownInput: async () => ({ kind: 'shell' }),
     ListSessions: async () => [{ id: 'default', name: '', turns: 0, archivedTurns: 0, isDefault: true }],
     CreateSession: async () => ({ id: 's1', name: '新会话', turns: 0, archivedTurns: 0, isDefault: false }),
     RenameSession: async () => undefined,
@@ -1124,7 +1127,7 @@ describe('终端内直接输入自然语言', () => {
     // 却按旧列号定位，表现为擦错位置。复制必须静默。
     //
     // 只比较复制前后的增量，不断言整个流为空：终端本身可能因别的异步链路
-    // （上一条用例跑过 shell 命令，静默 400ms 后画「问 LLM」提示）在后台写入，
+    // （上一条用例跑过 shell 命令，静默 400ms 后画「可交给 LLM」提示）在后台写入，
     // 那不归复制负责。
     const before = inst.written.length
     inst.selection = 'docker ps'
@@ -1137,7 +1140,7 @@ describe('终端内直接输入自然语言', () => {
     const extra = inst.written.slice(before).join('')
     // 复制本身不得产生任何终端输出（尤其不得是「已复制」这类提示）。
     expect(extra).not.toContain('已复制')
-    expect(extra).not.toContain('想分析这段输出')
+    expect(extra).not.toContain('这段输出可交给 LLM 分析')
   })
 
   it('剪贴板被拒时不抛异常、不写出任何字节', async () => {
@@ -1166,20 +1169,54 @@ describe('终端内直接输入自然语言', () => {
     expect(run.map(c => c.args[2])).toEqual(['a', 'b'])
   })
 
-  it('本地编辑期间来外部输出 → flush 本地缓冲并降级透传', async () => {
+  it('本地编辑期间来外部输出 → 擦回显、画完输出、原位重画，绝不发给 PTY', async () => {
     setup()
     withHost()
     await attached()
     const inst = instances[0]
     clearSurface()
     inst.emitData('l') // 本地缓冲 + 回显
-    // 后端推来一段输出（后台打印）：sink 发现正在本地编辑 → flush 'l' 给 PTY 并切透传。
+    // 后端推来一段输出（提示符重绘/后台打印）：本地编辑**不得**被打断 ——
+    // 旧实现会把半行 flush 给 PTY 并切透传，用户接着打的自然语言会被
+    // bash 原样执行（command not found），Agent 分流整个被绕过。
     rt.emit('term:data', { hostId: 'h1', data: textToBase64('X') })
     await flushPromises()
-    inst.emitData('s') // 已降级：透传，不再本地缓冲
+    expect(callsOf('WriteTerminal')).toHaveLength(0)
+    // 输出写进了表面，本地回显也在输出之后重画了出来（用户视觉上不丢字）。
+    expect(inst.text()).toContain('X')
+    expect(inst.text()).toContain('l')
+    inst.emitData('s') // 仍是本地行编辑：继续缓冲，不透传
     await flushPromises()
-    const wt = callsOf('WriteTerminal')
-    expect(wt.map(c => c.args[2])).toEqual([textToBase64('l'), textToBase64('s')])
+    expect(callsOf('WriteTerminal')).toHaveLength(0)
+    inst.emitData('\r')
+    await flushPromises()
+    const run = callsOf('RunShellInTerminal')
+    expect(run.length).toBe(1)
+    expect(run[0].args[2]).toBe('ls')
+  })
+
+  it('中文打到一半提示符才到 → 回车仍进 Agent，绝不当命令发给 shell', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
+    type(inst, '帮我创建一个 test.txt')
+    // 提示符晚到（打开终端立刻打字 / 上一条命令刚跑完都会踩中）：
+    // 此刻本地已有半行中文 —— 旧实现会把它 flush 给 bash 原样执行，
+    // 整句自然语言变成 command not found。
+    rt.emit('term:data', { hostId: 'h1', data: textToBase64('root@host:~$ ') })
+    await flushPromises()
+    type(inst, ' 文件')
+    inst.emitData('\r')
+    await flushPromises()
+    await nextTick()
+    const asks = callsOf('Ask')
+    expect(asks.length).toBe(1)
+    expect(asks[0].args[2]).toBe('帮我创建一个 test.txt 文件')
+    // 自然语言绝不该被当命令发给 shell，也绝不该把半行直接塞给 PTY。
+    expect(callsOf('RunShellInTerminal')).toHaveLength(0)
+    expect(callsOf('WriteTerminal')).toHaveLength(0)
   })
 
   it('中文按显示宽度（2 列）擦除', async () => {

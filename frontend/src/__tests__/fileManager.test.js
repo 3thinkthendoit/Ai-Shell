@@ -148,6 +148,28 @@ describe('文件管理 打开与导航', () => {
     expect(calls[0].args).toEqual(['h1', ''])
   })
 
+  it('本地没目录但后端终端里有：直接用后端的实时 cwd（OSC 7 送达前/前端重启后）', async () => {
+    const { app, calls } = makeApp({ CurrentTermCwd: async () => '/var/lib' })
+    window.go = { main: { App: app } }
+
+    await openFileManager('h1', 's1')
+
+    const list = calls.find(c => c.name === 'ListRemoteDir')
+    expect(list).toBeTruthy()
+    expect(list.args).toEqual(['h1', '/var/lib'])
+  })
+
+  it('后端也没有 cwd 时同样落空串（家目录）', async () => {
+    const { app, calls } = makeApp({ CurrentTermCwd: async () => '' })
+    window.go = { main: { App: app } }
+
+    await openFileManager('h1', 's1')
+
+    const list = calls.find(c => c.name === 'ListRemoteDir')
+    expect(list).toBeTruthy()
+    expect(list.args).toEqual(['h1', ''])
+  })
+
   it('列目录成功后回写实际落到的目录', async () => {
     const { app } = makeApp({
       ListRemoteDir: async () => ({ ok: true, path: '/root', parent: '/', entries: [] })

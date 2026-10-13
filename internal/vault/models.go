@@ -94,6 +94,25 @@ type PolicySettings struct {
 	// 也不给一条用户不知道存在的跨机器通道。
 	AllowCrossHost bool `json:"allowCrossHost"`
 
+	// AllowWeb 决定是否给 Agent 开通出网工具（fetch_webpage / search_web）。
+	//
+	// 默认 false，零值即禁止 —— 老配置反序列化后天然安全。
+	//
+	// 为什么要一个开关：出网工具让 LLM 能把**远端主机上的内容**发到
+	// 第三方站点（或被诱导发过去）。那是本项目其余部分都不具备的能力，
+	// 因此必须由用户显式打开，而不是「装了就带」。
+	AllowWeb bool `json:"allowWeb"`
+
+	// SearchProvider 是搜索服务提供商标识（如 "duckduckgo"）。
+	//
+	// 空串表示未配置：此时 search_web 不可用，fetch_webpage 仍可用
+	// （它只需要一个 URL，不需要任何凭据）。
+	SearchProvider string `json:"searchProvider,omitempty"`
+
+	// SearchAPIKey 是搜索服务的 API Key。为空表示该服务不需要密钥
+	// （DuckDuckGo 的公开端点即如此）。
+	SearchAPIKey string `json:"searchApiKey,omitempty"`
+
 	// SessionOverrides 是**按主机**覆盖上面三个值的表，key 是主机 ID。
 	//
 	// 为什么需要：上面三个是全局的，而主机之间的合适值差异很大 ——

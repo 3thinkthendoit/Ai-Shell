@@ -236,7 +236,11 @@ func matchWhitelist(cmd string, whitelist []string) bool {
 	if len(whitelist) == 0 {
 		return false
 	}
-	segs := splitSegments(cmd)
+	// 先剥掉「丢弃输出」的重定向再切段。必须在 splitSegments **之前**做：
+	// `2>&1` 里含 `&`，而 splitSegments 按 `&` 切段 —— 不先剥就会把它切成
+	// `... 2>` 与 `1` 两段，前一段末尾的 `>` 直接触发闸门，永远进不了白名单。
+	// （`2>/dev/null` 同理：`>` 会被闸门拦下。）
+	segs := splitSegments(stripDiscardRedirects(cmd))
 	if len(segs) == 0 {
 		return false
 	}
@@ -246,6 +250,41 @@ func matchWhitelist(cmd string, whitelist []string) bool {
 		}
 	}
 	return true
+}
+
+// discardRedirectRe 匹配**纯丢弃输出**的重定向：目标只会是 /dev/null、其它
+// 文件描述符（&N）或关闭（-），因此不产生任何文件副作用。仅这些形式才允许
+// 在命中白名单前被剥离。
+//
+// 逐块含义：
+//
+//	(?:^|\s)        前置边界：行首或空白（fd 数字必须自成词，故不能紧贴前词）
+//	(?:&>>?|\d*>>?) 重定向算子：`&>`/`&>>`（stdout+stderr）或 `>`/`>>`，可带 fd（2>、1>>）
+//	\s*             算子与目标之间的空白（`2> /dev/null`）
+//	(?:/dev/null|&\d+|-)
+//	                目标：/dev/null、fd 复制（&1、&2）、或关闭（&-）
+//	([\s;&|]|$)     后置边界：目标必须自成词，且边界字符被**捕获**下来
+//
+// 关键安全性质 1：**只认这三种目标**。`> /tmp/x`、`2> err.log`、`>> log` 这类
+// 会写真实文件的重定向不匹配 —— 它们的 `>` 留在串里，照样被 segmentAllowed 的
+// 元字符闸门拦下，退回人工确认。于是「`ls x 2>/dev/null` 自动放行」与
+// 「`ls x > /etc/passwd` 必须确认」两条同时成立。
+//
+// 关键安全性质 2：边界字符（`;` `|` `&` 或空白）必须**原样保留**，所以它进了
+// 捕获组 `$1`，替换串写 ` $1`。若把它一起吞掉，`ls 2>/dev/null; rm -rf /` 会
+// 变成 `ls rm -rf /` —— 段首仍是 ls，rm 就借壳绕过了闸门，是致命的提权。
+//
+// 末尾的边界用捕获组而非 lookahead：Go 的 regexp 是 RE2，不支持 `(?=...)`。
+var discardRedirectRe = regexp.MustCompile(
+	`(?:^|\s)(?:&>>?|\d*>>?)\s*(?:/dev/null|&\d+|-)([\s;&|]|$)`,
+)
+
+// stripDiscardRedirects 把纯丢弃输出的重定向换成空格，但**保留**其后紧跟的
+// 分隔符/空白（`$1`）。保留是为了不改变命令结构：`a 2>/dev/null; b` 必须仍是
+// 两条命令，`a 2>/dev/null | b` 必须仍是管道；否则会凭空抹掉分段、让后续段首
+// 词借前一段的白名单身份被放行。
+func stripDiscardRedirects(cmd string) string {
+	return discardRedirectRe.ReplaceAllString(cmd, " $1")
 }
 
 func splitSegments(cmd string) []string {

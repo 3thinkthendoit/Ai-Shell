@@ -45,9 +45,12 @@ export class Terminal {
     this.openedIn = el
   }
 
-  write(data) {
+  write(data, callback) {
     if (this.disposed) throw new Error('对已销毁的终端写入')
     this.written.push(data)
+    // 真 xterm 的 write 是异步解析的，回调等解析完才触发；替身同步触发，
+    // 让「写完再读光标位置」这类接线的回调路径在测试里也能跑到。
+    if (callback) callback()
   }
 
   focus() {

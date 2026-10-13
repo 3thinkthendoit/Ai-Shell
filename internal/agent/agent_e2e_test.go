@@ -1077,6 +1077,28 @@ func TestSystemPromptNamesTheSessionHost(t *testing.T) {
 	}
 }
 
+// 白名单免审批的写法必须写进系统提示词。
+//
+// 场景：LLM 把多条命令用 `;` 串成一长串，其中一段含 `$`（如正则 `\s*$`），
+// 于是整条命令无法静态判定只读 → 退回人工确认。用户看到的是一串莫名的审批弹窗，
+// 而模型自己不知道为什么 —— 不告诉它，它每次都踩同一条坑。
+//
+// 这条用例钉住两件事：白名单内容确实下发了，且写明了「拆成单条、避开 $ 等元字符」。
+func TestSystemPromptTeachesWhitelistFriendlyCommands(t *testing.T) {
+	h := newHarness(t, []string{respContent("好的")}, policy.ModeWhitelist, true)
+
+	if err := runDefault(h.ag, context.Background(), h.hostID, "看看 cron"); err != nil {
+		t.Fatalf("运行失败: %v", err)
+	}
+
+	sys := h.fake.messagesAt(0)[0].Content
+	for _, want := range []string{"白名单", "拆成多条", "2>/dev/null", "$"} {
+		if !strings.Contains(sys, want) {
+			t.Errorf("系统提示缺少 %q —— 模型会继续写出会被拦的命令，实得: %.300s", want, sys)
+		}
+	}
+}
+
 // ---- 按主机分组的会话上下文 ----
 
 // brief 把消息链压成一行，用于失败信息 —— 直接打印整个 []Message 没人看得下去。
@@ -1560,7 +1582,7 @@ func TestAgentNoSessionHostDeniesAllTools(t *testing.T) {
 		respContent("没有归属主机，我不执行。"),
 	}, policy.ModeWhitelist, true)
 
-	if err := h.ag.Run(context.Background(), "", DefaultSessionID, "随便看看"); err != nil {
+	if err := h.ag.Run(context.Background(), "", DefaultSessionID, "随便看看", ""); err != nil {
 		t.Fatal(err)
 	}
 	if h.hasEvent(EvApproval) {

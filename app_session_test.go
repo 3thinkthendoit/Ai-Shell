@@ -109,7 +109,7 @@ func waitIdle(t *testing.T, a *App) {
 func TestAskBindingRoutesToTheGivenSession(t *testing.T) {
 	a := newSessionTestApp(t, newFakeLLM(t))
 
-	if err := a.Ask("h1", "s1", "nginx 起不来了"); err != nil {
+	if err := a.Ask("h1", "s1", "nginx 起不来了", ""); err != nil {
 		t.Fatalf("Ask 不该同步报错: %v", err)
 	}
 	waitFor(t, "s1 收到 1 轮", func() bool { return turnsOf(a, "h1", "s1") == 1 })
@@ -124,7 +124,7 @@ func TestAskBindingRoutesToTheGivenSession(t *testing.T) {
 func TestAskBindingEmptySessionIDLandsOnDefault(t *testing.T) {
 	a := newSessionTestApp(t, newFakeLLM(t))
 
-	if err := a.Ask("h1", "", "看看磁盘"); err != nil {
+	if err := a.Ask("h1", "", "看看磁盘", ""); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "默认会话收到 1 轮", func() bool {
@@ -140,13 +140,34 @@ func TestAskBindingRejectsBlankPrompt(t *testing.T) {
 	a := newSessionTestApp(t, newFakeLLM(t))
 
 	for _, p := range []string{"", "   ", "\n\t"} {
-		if err := a.Ask("h1", "s1", p); err == nil {
+		if err := a.Ask("h1", "s1", p, ""); err == nil {
 			t.Errorf("空 prompt %q 应被拒绝", p)
 		}
 	}
 	if n := turnsOf(a, "h1", "s1"); n > 0 {
 		t.Errorf("被拒绝的提问不该留下记录，实得 %d 轮", n)
 	}
+}
+
+// 「随请求下发模型」这条链的负向：选了不存在的方案必须**同步报错**，
+// 而不是静默回落到激活方案 —— 回落会让用户以为选的那套在跑，实际是另一套
+// 在回答（与 TestLLMProfile 对「方案不存在」显式报错是同一个原则）。
+func TestAskBindingRejectsUnknownProfile(t *testing.T) {
+	a := newSessionTestApp(t, newFakeLLM(t))
+
+	if err := a.Ask("h1", "s1", "看看磁盘", "nosuch-profile"); err == nil {
+		t.Fatal("不存在的方案应被同步拒绝")
+	}
+	if n := turnsOf(a, "h1", "s1"); n > 0 {
+		t.Errorf("被拒绝的提问不该留下记录，实得 %d 轮", n)
+	}
+
+	// 空白方案 ID 必须与「未指定」同义（校验与转发的是同一个 TrimSpace 后的值），
+	// 不能「校验时跳过、字面转发」造成双标。
+	if err := a.Ask("h1", "s1", "看看磁盘", "   "); err != nil {
+		t.Fatalf("纯空白方案 ID 应视为未指定并正常发起，实得: %v", err)
+	}
+	waitIdle(t, a)
 }
 
 // 清空只作用于指定的那条会话。
@@ -284,7 +305,7 @@ func TestSessionBindingsRequireVault(t *testing.T) {
 	if err := a.DeleteSession("h1", "s1"); err == nil {
 		t.Error("未就绪时删除应报错")
 	}
-	if err := a.Ask("h1", "s1", "x"); err == nil {
+	if err := a.Ask("h1", "s1", "x", ""); err == nil {
 		t.Error("未就绪时 Ask 应报错")
 	}
 }
@@ -320,7 +341,7 @@ func TestRenameAndCreateBindingsReportFailure(t *testing.T) {
 // fill 在某条会话里跑一轮对话，等它落地。
 func fill(t *testing.T, a *App, sessionID, prompt string) {
 	t.Helper()
-	if err := a.Ask("h1", sessionID, prompt); err != nil {
+	if err := a.Ask("h1", sessionID, prompt, ""); err != nil {
 		t.Fatalf("在 %s 上发起对话失败: %v", sessionID, err)
 	}
 	waitFor(t, sessionID+" 收到 1 轮", func() bool { return turnsOf(a, "h1", sessionID) == 1 })

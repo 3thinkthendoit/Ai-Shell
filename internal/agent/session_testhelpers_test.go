@@ -22,7 +22,7 @@ import (
 // 「这里显式指定了会话」这件事留在调用点上。
 
 func runDefault(ag *Agent, ctx context.Context, hostID, prompt string) error {
-	return ag.Run(ctx, hostID, DefaultSessionID, prompt)
+	return ag.Run(ctx, hostID, DefaultSessionID, prompt, "")
 }
 
 func histDefault(ag *Agent, hostID string) []llm.Message {

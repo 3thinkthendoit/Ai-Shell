@@ -107,6 +107,70 @@ func TestManualModeAlwaysConfirms(t *testing.T) {
 	}
 }
 
+// 丢弃输出的重定向（> /dev/null、2>&1、>&2 等）不该把只读诊断命令挡在白名单外。
+// 这是实际使用里最常见的误伤：运维习惯给命令尾巴挂 `2>/dev/null` 屏蔽噪声，
+// 但 `>` 触发了元字符闸门，导致本该自动放行的只读命令全部退回人工确认。
+func TestWhitelistAllowsDiscardedRedirects(t *testing.T) {
+	wl := []string{"ls", "cat", "ss", "sort", "nginx", "systemctl status", "head", "grep"}
+	for _, c := range []string{
+		"ls /www/wwwroot 2>/dev/null",
+		"ls /www/wwwroot 2> /dev/null", // 算子与目标间有空格
+		"cat /etc/nginx/nginx.conf 2>/dev/null",
+		"systemctl status nginx 2>/dev/null",
+		"grep -i error /var/log/messages 2>/dev/null | head -20",
+		"ss -tulnp 2>/dev/null | sort -k5",
+		"nginx -v 2>&1",
+		"ls /www/wwwroot 2>/dev/null; ls /www/server 2>/dev/null", // 多段、段间 `;`
+		"ls /var/log 2>&1 | head -5",
+		"cat /proc/loadavg >/dev/null", // 纯丢弃 stdout
+	} {
+		v := Evaluate(c, ModeWhitelist, wl)
+		if v.Decision != Allow {
+			t.Errorf("丢弃输出的重定向应仍命中白名单，实际 %s(%s) —— 命令: %s", v.Decision, v.Rule, c)
+		}
+	}
+}
+
+// 反向守卫：会**写真实文件**的重定向不能被当丢弃处理，必须仍退回人工确认。
+// 这是上面那条放宽的安全边界 —— 放宽只针对 /dev/null 与 fd 复制。
+func TestWhitelistStillConfirmsRealRedirects(t *testing.T) {
+	wl := []string{"ls", "cat", "echo", "grep"}
+	for _, c := range []string{
+		"ls > /tmp/out.txt",
+		"ls >> /var/log/x",
+		"cat /etc/hosts > /etc/hosts.bak",
+		"echo hi > ~/.bashrc",
+		"ls 2> err.log",
+		"cat f 2>> err.log",
+		"ls >/dev/nullx",   // 目标是 /dev/null 的「长名」，不是丢弃
+		"ls > /dev/null/x", // /dev/null 下还有子路径，不是丢弃
+	} {
+		v := Evaluate(c, ModeWhitelist, wl)
+		if v.Decision == Allow {
+			t.Errorf("写真实文件的重定向不应自动放行，实际 Allow —— 命令: %s", c)
+		}
+	}
+}
+
+// 反向守卫（最关键）：剥离丢弃重定向时**不能吞掉命令分隔符**。
+//
+// 历史风险：若把 `ls 2>/dev/null; rm -rf /` 里的 `;` 连同重定向一起删掉，
+// 整条会变成 `ls rm -rf /` —— 段首仍是白名单词 ls，rm 就借壳越过了闸门。
+// 因此本用例钉住「分隔符原样保留、每一段各自判定」。
+func TestStripDiscardRedirectKeepsSeparators(t *testing.T) {
+	wl := []string{"ls", "cat"}
+	for _, c := range []string{
+		"ls /tmp 2>/dev/null; rm -rf /tmp/a",
+		"ls /tmp 2>/dev/null && rm -rf /tmp/a",
+		"ls /tmp 2>/dev/null & rm -rf /tmp/a",
+	} {
+		v := Evaluate(c, ModeWhitelist, wl)
+		if v.Decision == Allow {
+			t.Errorf("分隔符后接了高危命令，不应自动放行，实际 Allow —— 命令: %s", c)
+		}
+	}
+}
+
 func TestEvaluateHighRiskOverridesWhitelist(t *testing.T) {
 	wl := []string{"rm", "mkdir", "ls"}
 	v := Evaluate("rm -f /tmp/x", ModeWhitelist, wl)

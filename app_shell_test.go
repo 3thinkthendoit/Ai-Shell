@@ -185,7 +185,7 @@ func TestRunShell_AskBlockedWhileShellPending(t *testing.T) {
 	if id := a.lane.shellHostID(); id != hostID {
 		t.Fatalf("shellHostID=%q want %q", id, hostID)
 	}
-	err := a.Ask(hostID, "", "hello")
+	err := a.Ask(hostID, "", "hello", "")
 	if err == nil {
 		t.Fatal("Ask 应被 shell 占用拒绝")
 	}

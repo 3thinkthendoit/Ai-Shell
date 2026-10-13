@@ -7,6 +7,8 @@ const form = reactive({
   whitelist: (store.policy.whitelist || []).join('\n'),
   redactOutput: store.policy.redactOutput,
   allowCrossHost: store.policy.allowCrossHost ?? false,
+  allowWeb: store.policy.allowWeb ?? false,
+  searchProvider: store.policy.searchProvider || '',
   maxOutput: store.policy.maxOutput,
   maxSteps: store.policy.maxSteps,
   maxSessionTurns: store.policy.maxSessionTurns ?? 8,
@@ -168,7 +170,9 @@ async function save() {
       maxSessionTurns: Number(form.maxSessionTurns) || 8,
       maxStoredToolBytes: kbToBytes(form.maxStoredToolBytesKb, 8),
       maxSessionBytes: kbToBytes(form.maxSessionBytesKb, 256),
-      sessionOverrides: buildOverrides()
+      sessionOverrides: buildOverrides(),
+      allowWeb: form.allowWeb,
+      searchProvider: form.searchProvider || ''
     }
     await window.go.main.App.SavePolicy(payload)
     store.policy = payload
@@ -193,7 +197,7 @@ async function save() {
     </header>
 
     <div class="card">
-      <label>Agent 执行模式</label>
+      <div class="card-title">Agent 执行模式</div>
       <div class="modes">
         <label class="mode" :class="{ on: form.mode === 'manual' }">
           <input type="radio" value="manual" v-model="form.mode" />
@@ -212,16 +216,17 @@ async function save() {
       </div>
     </div>
 
-    <div class="card" style="margin-top: 12px">
+    <div class="card">
       <div class="wl-head">
-        <label>只读命令库 / 白名单（每行一条，按命令前缀匹配）</label>
+        <div class="card-title">只读命令库 / 白名单</div>
         <button class="sm" :disabled="form.mode !== 'whitelist'" @click="restoreDefaults">
           恢复默认
         </button>
       </div>
+      <div class="card-sub">每行一条，按命令前缀匹配。</div>
       <textarea
         v-model="form.whitelist"
-        rows="12"
+        rows="10"
         :disabled="form.mode !== 'whitelist'"
         placeholder="ls&#10;cat&#10;systemctl status"
       ></textarea>
@@ -233,8 +238,8 @@ async function save() {
       </div>
     </div>
 
-    <div class="card" style="margin-top: 12px">
-      <label>执行范围</label>
+    <div class="card">
+      <div class="card-title">执行范围</div>
       <label class="chk">
         <input type="checkbox" v-model="form.allowCrossHost" class="cross-host" />
         允许跨主机执行（默认关闭）
@@ -247,8 +252,38 @@ async function save() {
       </div>
     </div>
 
-    <div class="card" style="margin-top: 12px">
-      <label>回传给 LLM 的内容</label>
+    <div class="card">
+      <div class="card-title">访问互联网（默认关闭）</div>
+      <label class="chk">
+        <input type="checkbox" v-model="form.allowWeb" class="allow-web" />
+        允许 Agent 访问互联网
+      </label>
+      <div class="muted hint">
+        开启后 Agent 可以抓取网页（fetch_webpage）与搜索（search_web），
+        用来查官方文档、确认某个参数的当前用法、看不认识的错误信息。
+        <br />
+        <b>默认关闭</b>：这两个工具让 LLM 具备了本项目其余部分都没有的能力 ——
+        把内容送去公网。而一台已被入侵的主机可以借提示注入诱导它这么做，
+        所以这个开关必须由你显式打开。
+      </div>
+
+      <div v-if="form.allowWeb" class="grid">
+        <div>
+          <label style="margin-top: 12px">搜索服务</label>
+          <select v-model="form.searchProvider">
+            <option value="">不配置（只用 fetch_webpage）</option>
+            <option value="duckduckgo">DuckDuckGo（无需密钥）</option>
+          </select>
+        </div>
+      </div>
+      <div v-if="form.allowWeb" class="muted hint">
+        不配置搜索服务时，search_web 不可用，fetch_webpage 仍可用 ——
+        它只需要一个 URL，不需要任何凭据。
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">回传给 LLM 的内容</div>
       <label class="chk">
         <input type="checkbox" v-model="form.redactOutput" />
         自动脱敏命令输出中的密钥（强烈建议保持开启）
@@ -284,8 +319,8 @@ async function save() {
       </div>
     </div>
 
-    <div class="card" style="margin-top: 12px">
-      <label>会话上下文（模型记得多少）</label>
+    <div class="card">
+      <div class="card-title">会话上下文（模型记得多少）</div>
 
       <div class="grid">
         <div>
@@ -321,8 +356,8 @@ async function save() {
       </div>
     </div>
 
-    <div class="card" style="margin-top: 12px">
-      <label>主机级覆盖（可选）</label>
+    <div class="card">
+      <div class="card-title">主机级覆盖（可选）</div>
       <div class="muted hint">
         上面三个值是<b>全局默认</b>。某台主机需要不一样时在这里单独填 ——
         留空的那一项仍然跟随全局，不必把三项都抄一遍。
@@ -380,8 +415,8 @@ async function save() {
       </div>
     </div>
 
-    <div class="card" style="margin-top: 12px">
-      <label>硬拒绝规则（不可关闭）</label>
+    <div class="card">
+      <div class="card-title">硬拒绝规则（不可关闭）</div>
       <div v-for="r in hardDenied" :key="r.name" class="rule">
         <div class="rule-name">{{ r.name }}</div>
         <div class="rule-detail mono">{{ r.detail }}</div>
@@ -399,10 +434,20 @@ async function save() {
 </template>
 
 <style scoped>
-.panel { padding: 22px 26px; overflow-y: auto; height: 100%; }
+.panel { padding: 24px 28px 36px; overflow-y: auto; height: 100%; }
+/* 内容列：窗口再宽也不把表单 / 文本域拉成一条 —— 保持稳定的阅读宽度。 */
+.panel > * { max-width: 820px; }
+
 .panel-head { margin-bottom: 18px; }
-.panel-head h2 { font-size: 15px; margin: 0 0 6px; }
+.panel-head h2 { font-size: 16px; margin: 0 0 6px; }
 .panel-head p { margin: 0; font-size: 12px; line-height: 1.7; max-width: 640px; }
+
+/* 卡片节奏与标题层级（与「LLM 设置」面板同一套规则） */
+.card + .card { margin-top: 12px; }
+.card-title { font-size: 13px; font-weight: 600; margin: 0 0 12px; }
+.card-sub { font-size: 12px; color: var(--text-3); line-height: 1.6; margin: -6px 0 12px; }
+/* 白名单可能很长：给个高度上限，别把整页顶掉 */
+textarea { max-height: 340px; }
 
 .modes { display: flex; flex-direction: column; gap: 10px; }
 .mode {
@@ -416,17 +461,16 @@ async function save() {
   cursor: pointer;
 }
 .mode.on { border-color: var(--accent); background: var(--accent-bg); }
-.mode input { width: auto; margin-top: 2px; }
+.mode input { margin-top: 2px; }
 .mode-title { font-weight: 500; color: var(--text); }
 .mode-desc { font-size: 12px; color: var(--text-2); margin-top: 3px; line-height: 1.6; }
 
 .hint { font-size: 12px; line-height: 1.7; margin-top: 8px; }
 
 .wl-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.wl-head label { margin: 0; }
+.wl-head .card-title { margin: 0; }
 
 .chk { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 12px; }
-.chk input { width: auto; }
 
 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 
@@ -464,6 +508,13 @@ async function save() {
 .ov-field input { width: 110px; }
 .ov-clear { margin-bottom: 1px; }
 
-.actions { display: flex; justify-content: flex-end; margin-top: 18px; }
+/* 动作区：一条分隔线收尾（与「LLM 设置」一致） */
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
 label { margin-top: 0; }
 </style>

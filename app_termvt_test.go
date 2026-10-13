@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"ai-shell/internal/sshclient"
+	"ai-shell/internal/vault"
 )
 
 // TestDropTermVTIdentityGuard 覆盖 dropTermVT 的身份守卫。
@@ -47,4 +48,26 @@ func TestDropTermVTIdentityGuard(t *testing.T) {
 	// 幂等：主机不在表里时删除不应 panic。
 	a.dropTermVT("nope", nil)
 	a.dropTermVT("nope", vt3)
+}
+
+// CurrentTermCwd 是文件管理弹窗「默认定位到控制台 pwd 目录」的兜底查询：
+// terminal:cwd 只在目录变化时推一次，弹窗打开时直接问后端 screen 的最新值。
+func TestCurrentTermCwd(t *testing.T) {
+	scr := sshclient.NewScreen(40, 3)
+	scr.Feed([]byte("\x1b]7;file://myhost/var/log\x07"))
+
+	a := &App{v: vault.New(t.TempDir())}
+	a.termVT = map[string]*termVTState{
+		termKey("h1", "s1"): {screen: scr, snapper: sshclient.NewSnapshotter(scr, 0, func(string, bool) {})},
+	}
+
+	if got := a.CurrentTermCwd("h1", "s1"); got != "/var/log" {
+		t.Fatalf("应返回 screen 里最近的 cwd，实得 %q", got)
+	}
+	if got := a.CurrentTermCwd("h1", "s2"); got != "" {
+		t.Fatalf("没有 VT 的任务应返回空串，实得 %q", got)
+	}
+	if got := a.CurrentTermCwd("h9", "s1"); got != "" {
+		t.Fatalf("不存在的主机应返回空串，实得 %q", got)
+	}
 }
