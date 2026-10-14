@@ -211,7 +211,7 @@ export async function ensureTerm(hostId, sessionId, currentTheme = 'light') {
   })
 
   terms.set(key, {
-    term, fit, sink, hostId, sessionId, instanceToken,
+    term, fit, sink, hostId, sessionId, instanceToken, wired: false,
     line: '', startCol: 0, passthrough: false, lineSynthetic: false,
     hintCols: 0, hintPromptCols: 0,
     llmHintCols: 0, llmHintStart: 0,
@@ -319,7 +319,11 @@ export function isFullscreen(key) {
 
 export function isCmdRunning(key) {
   const t = terms.get(key)
-  return !!t && !!termState(t.hostId, t.sessionId).cmdActive
+  if (!t) return false
+  const st = termState(t.hostId, t.sessionId)
+  // cmdActive：OSC 133 报的「命令运行中」；cmdPending：刚提交 shell 命令后
+  // 乐观开的透传窗口（shell integration 缺席时的兜底，见 termEvents）。
+  return !!st && !!(st.cmdActive || st.cmdPending)
 }
 
 export function displayWidth(s) {

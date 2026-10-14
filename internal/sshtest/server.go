@@ -977,7 +977,7 @@ func RunCommand(cmd string, ch ssh.Channel, srv *Server) int {
 
 	case strings.HasPrefix(c, "mkdir ") || c == "mkdir" ||
 		strings.HasPrefix(c, "touch ") || c == "touch":
-		// 高危变更类：假远端一律成功，真测的是策略闸门而不是文件系统。
+		// 高危变更类：假远端一律成功，真测的是策略裁决而不是文件系统。
 		return 0
 
 	// rm 必须**真的删**：文件管理弹窗的删除要能端到端验证

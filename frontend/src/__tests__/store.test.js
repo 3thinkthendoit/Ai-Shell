@@ -258,28 +258,6 @@ describe('bindEvents 事件接线', () => {
     expect(store.pending).toBe(null)
   })
 
-  // 人敲命令的审批由后端 shellGate 单独等待：agent 回合结束/出错若把它一并清掉，
-  // 审批条凭空消失、后端还在等（最长 5 分钟），期间回车提交全部排队，
-  // 表现为「控制台无法输入」。只有 agent 自己的工具审批才随回合收场。
-  it('人敲命令的审批（name=shell）不随 agent:done / agent:error 收场', () => {
-    install({ runtime: rt, app: makeApp().app })
-    bindEvents()
-    store.pending = { id: 'shell-1', name: 'shell', command: 'systemctl restart nginx' }
-
-    rt.emit('agent:done', {})
-    expect(store.pending).not.toBe(null)
-    expect(store.pending.id).toBe('shell-1')
-
-    rt.emit('agent:error', { message: '连接断了' })
-    expect(store.pending).not.toBe(null)
-    expect(store.pending.id).toBe('shell-1')
-
-    // agent 自己的工具审批照旧随回合收场
-    store.pending = { id: 'a2', name: 'run_command', command: 'rm -rf /tmp/x' }
-    rt.emit('agent:done', {})
-    expect(store.pending).toBe(null)
-  })
-
   // 审批超时是后端**静默**发生的（time.After 到点返回 false），界面上那张条
   // 却还挂着。用户看到的是「还在等我批准」，直到点下去才被告知「已失效」。
   // 这组用例钉住「后端说失效、界面就收掉」这条链路。
@@ -324,7 +302,7 @@ describe('bindEvents 事件接线', () => {
   it('approval:expired 照搬后端 reason，不叠「审批」前缀', () => {
     install({ runtime: rt, app: makeApp().app })
     bindEvents()
-    store.pending = { id: 'a1', name: 'shell', command: 'systemctl restart nginx' }
+    store.pending = { id: 'a1', name: 'run_command', command: 'systemctl restart nginx' }
 
     rt.emit('approval:expired', { id: 'a1', reason: '审批超时或已中断' })
 
@@ -1219,7 +1197,7 @@ describe('reportActiveSession 报告活动会话', () => {
 
 // ---- 常驻终端的 shell 通道 ----
 
-// composer 里人敲的 shell 行走这条通道：后端策略闸门裁决（高危弹审批）后把这一行
+// composer 里人敲的 shell 行走这条通道：后端仅硬拒绝不可逆/凭据命令后把这一行
 // 写进常驻 PTY。放行时 PTY 自己回显命令与输出，前端只补一句「可交给 LLM 分析」的
 // **提示**（纯文字，不进 agent）；被拒/取消/出错才在表面上说明原因。
 describe('runShellInTerminal 常驻终端 shell 通道', () => {
@@ -1337,35 +1315,19 @@ describe('runShellInTerminal 常驻终端 shell 通道', () => {
     }
   })
 
-  it('被策略拒绝：在表面上说明原因，并清掉可能挂着的过期审批条', async () => {
-    const { app } = makeApp({ RunShellInTerminal: async () => ({ status: 'denied', reason: 'rm -rf 属于高危命令' }) })
+  it('被策略硬拒绝：在表面上说明原因', async () => {
+    const { app } = makeApp({ RunShellInTerminal: async () => ({ status: 'denied', reason: '破坏性操作（递归删除根目录）已被硬拒绝' }) })
     install({ runtime: rt, app })
     const sink = captureSink('h1', 's1')
     store.currentHostId = 'h1'
-    store.pending = { id: 'a1' }
     try {
       const res = await runShellInTerminal('h1', 's1', 'rm -rf /')
       expect(res.status).toBe('denied')
       expect(sink.painted()).toContain('命令被策略拒绝')
-      expect(sink.painted()).toContain('rm -rf 属于高危命令')
+      expect(sink.painted()).toContain('破坏性操作（递归删除根目录）已被硬拒绝')
       // 没执行过的命令不该出现「分析输出」提示
       expect(sink.painted()).not.toContain('这段输出可交给 LLM 分析')
-      expect(store.pending).toBe(null)
       expect(store.busy).toBe(false)
-    } finally {
-      unregisterTermSink('h1', 's1', sink.fn)
-    }
-  })
-
-  it('审批超时/被中断（cancelled）也在表面上说明', async () => {
-    const { app } = makeApp({ RunShellInTerminal: async () => ({ status: 'cancelled' }) })
-    install({ runtime: rt, app })
-    const sink = captureSink('h1', 's1')
-    store.currentHostId = 'h1'
-    try {
-      const res = await runShellInTerminal('h1', 's1', 'systemctl restart nginx')
-      expect(res.status).toBe('cancelled')
-      expect(sink.painted()).toContain('审批超时或被中断')
     } finally {
       unregisterTermSink('h1', 's1', sink.fn)
     }

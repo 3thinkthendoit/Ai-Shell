@@ -90,7 +90,7 @@ window.go = {
       WriteTerminal: async () => {},
       ResizeTerminal: async () => {},
       CloseTerminal: async () => true,
-      // composer 里人敲的 shell 行走这条：策略闸门 + 写进常驻 PTY（无有界捕获）。
+      // composer 里人敲的 shell 行走这条：硬拒绝过滤 + 写进常驻 PTY（无有界捕获）。
       // 预览没有真 PTY，只回一个裁决，够验证 composer 分流与放行/拒绝注记渲染。
       RunShellInTerminal: async (hostId, cmd) => {
         if (/^\s*rm\s+-rf\b/.test(cmd)) {

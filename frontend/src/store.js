@@ -3,7 +3,7 @@ import * as paint from './termPaint'
 import {
   bindTerminalEvents,
   registerTermSink, unregisterTermSink, registerLLMHint,
-  surfaceWrite, fireLLMHint, afterTermQuiet
+  surfaceWrite, fireLLMHint, afterTermQuiet, armCmdPending
 } from './terminal/termEvents.js'
 
 const api = () => window.go?.main?.App
@@ -73,12 +73,6 @@ export const store = reactive({
   // 实际在传 B。null 表示当前没有进行中的传输。
   agentTransfer: null,
 
-  // maxTransferBytes 是文件管理上传/下载的大小上限，来自 Bootstrap。
-  //
-  // 与 policy 那几个占位值同一个模式：这里只是 Bootstrap 回来之前的默认值，
-  // 真实值以后端为准。前端**不自己定义**这个数 —— 它同时决定后端的校验
-  // 与拒绝文案，两处各写一份迟早漂移成「界面放行、后端拒绝」。
-  maxTransferBytes: 32 * 1024 * 1024,
   // 会话上下文的三项上限与后端默认值保持一致（8 / 8KiB / 256KiB）。
   // 这里只是 Bootstrap 回来之前的占位值，真实值以 Bootstrap 为准。
   policy: {
@@ -240,6 +234,17 @@ export function targetEntries() {
   return store.bySession[targetKey()] || NO_ENTRIES
 }
 
+// hasAgentTurn 判断某条会话是否「已经和 Agent 对话过」：时间线里存在 assistant
+// （Agent 回复）或 tool（工具调用）条目即视为处于 agent 对话中。
+//
+// 供输入分流使用（termSubmit）：agent 对话中回车一律当「回复」交给 Agent，
+// 不再做命令识别/执行 —— 回复 Agent 的话（哪怕首词恰好像命令）绝不该被当 shell 命令跑掉。
+export function hasAgentTurn(hostId, sessionId) {
+  const list = store.bySession[bucketKey(hostId, sessionId)]
+  if (!list) return false
+  return list.some(e => e.kind === 'assistant' || e.kind === 'tool')
+}
+
 // dismissAuditError 由界面在用户确认告警后调用。
 // 注意只清本地状态：审计日志里的空洞是永久的，重新校验仍会发现。
 export function dismissAuditError() {
@@ -269,8 +274,6 @@ export function clearLog() {
   store.bySession[bucketKey(store.currentHostId, store.currentSessionId)] = []
   store.pending = null
 }
-
-// 审批性命判断（isHumanShellApproval）随事件处理一起拆到 terminal/termEvents.js。
 
 export function upsertTool(v) {
   const list = targetEntries()
@@ -330,7 +333,6 @@ export async function bootstrap() {
       store.selectedProfileId = (store.llmProfiles.find(p => p.active) || {}).id || ''
     }
     store.policy = info.policy || store.policy
-    if (info.maxTransferBytes > 0) store.maxTransferBytes = info.maxTransferBytes
     if (!store.currentHostId && store.hosts.length) store.currentHostId = store.hosts[0].id
     store.ready = true
   } catch (e) {
@@ -713,12 +715,12 @@ export async function stop() {
 // 本模块通过顶部 import 使用它（见 runShellInTerminal）。
 
 // runShellInTerminal：composer 里人敲的 shell 命令，走**常驻终端**通道 ——
-// 策略闸门裁决（高危弹审批）后把这一行写进常驻 PTY，提示符回显、输出、
+// 仅硬拒绝不可逆/凭据命令，其余直接把这行写进常驻 PTY，提示符回显、输出、
 // top/vim 接管全发生在同一片终端表面上，与人亲手在键盘上敲完全同形。
 //
 // 与已退役的 runShell（有界 Exec，输出喂 LLM）的差别：这里**不捕获**输出文本，
 // 模型看到的是命令结束时定格的屏幕快照（见 agent:snapshot）。
-// busy 覆盖「等审批 + 写入」整段，避免用户连敲把后端打成并发。
+// busy 覆盖「裁决 + 写入」整段，避免用户连敲把后端打成并发。
 export async function runShellInTerminal(hostId, sessionId, command) {
   const key = bucketKey(hostId, sessionId)
   store.busy = true
@@ -732,6 +734,10 @@ export async function runShellInTerminal(hostId, sessionId, command) {
     // 回显与输出还在路上，此时画提示会插到输出前面（见 afterTermQuiet 注释）。
     // 裁决说明同理 —— 它说的是「这条命令的结果如何」，显然该排在结果后面。
     if (res.status === 'done') {
+      // 命令已写进 PTY，接下来屏幕归它。开一个乐观透传窗口：期间的按键直达
+      // PTY，兜住 shell integration 缺席、而程序又在切备用屏前就等输入的场
+      // 景（vim 的 E325、read、菜单），避免按键被本地行编辑吞掉而“卡死”。
+      armCmdPending(hostId, sessionId)
       // 「命令跑完」不能只看输出静默：交互式命令（bt 菜单/read/REPL）在
       // **等输入**时输出同样是停的 —— 静默一到就画，提示会插进程序界面里
       // （bt 菜单里会挂在 "Please enter command number:" 后面），长命令的
@@ -759,9 +765,6 @@ export async function runShellInTerminal(hostId, sessionId, command) {
     return { status: 'error', error: msg }
   } finally {
     store.busy = false
-    // 审批条由 agent:approval 挂上；命令结束后必须清掉，
-    // 否则拒绝/超时返回后界面还挂着一张过期审批。
-    store.pending = null
   }
 }
 
@@ -828,11 +831,12 @@ export function termState(hostId, sessionId) {
   const key = bucketKey(hostId, sessionId)
   if (!store.terms[key]) {
     // tuiActive / cmdActive 是两块「输入让路」信号（全屏接管 / 命令运行中），
-    // 由 term:tui / term:cmd 事件更新。初值必须在场：读到它们的地方不该
-    // 依赖 undefined 的 falsy 语义。
+    // 由 term:tui / term:cmd 事件更新。cmdPending 是提交 shell 命令后乐观开
+    // 的透传窗口（见 termEvents 的 armCmdPending）：兜住 shell integration 缺席、
+    // 程序又在切备用屏前就等输入的场景（vim 的 E325、read、菜单）。初值必须在场。
     store.terms[key] = {
       status: 'idle', error: '', exitReason: '',
-      tuiActive: false, cmdActive: false
+      tuiActive: false, cmdActive: false, cmdPending: false
     }
   }
   return store.terms[key]
@@ -987,8 +991,9 @@ export async function fmGoParent() {
 // 注意：这里**没有** fmDelete。
 //
 // 弹窗只提供「浏览 / 上传 / 下载」，删除要用户走终端自己敲 rm —— 那是一条
-// 看得见、留得下历史、也能被审批闸门拦住的路径。把不可逆的远端删除做成
-// 列表里的一个按钮，误点成本太高（尤其是当列表里混着目录时）。
+// 看得见、留得下审计、且需显式敲命令因而不会误点的路径。注意人工 shell 现在
+// 只硬拒绝不可逆破坏（`rm -rf /` 一类），普通 `rm` 会直接执行 —— 正因如此更
+// 不能把删除做成列表里一个可误点的按钮（尤其当列表里混着目录时）。
 //
 // 后端 App.DeleteRemotePath 仍然保留：它是通用能力（终端、自动化都能用），
 // 只是这个前端入口不再暴露它。
@@ -1013,12 +1018,7 @@ export async function fmGoParent() {
 export async function fmUpload(file) {
   const fm = fmState()
   if (!api() || !file) return
-  // 上限以后端下发的为准（见 store.maxTransferBytes）。
-  const limit = store.maxTransferBytes
-  if (limit > 0 && file.size > limit) {
-    fm.error = `文件超过上限（${fmtBytes(limit)}），当前 ${fmtBytes(file.size)}`
-    return
-  }
+  // 上传不设大小上限（按需求去掉）：任何大小的文件都直接分块读、整体交给后端。
   fm.busy = true
   fm.error = ''
   fm.notice = ''
@@ -1117,7 +1117,13 @@ export function fmtBytes(n) {
 //
 // 拼接用字符串而不是先合 Uint8Array 再转：几十 MB 的文件里，前者只是
 // 字符串相加，后者会额外复制一份完整缓冲，内存峰值翻倍。
-const B64_CHUNK = 1024 * 1024 // 每次读 1 MiB 原始字节
+//
+// B64_CHUNK 必须是 3 的倍数：每块各自 bytesToBase64 后直接字符串拼接，
+// 若某块长度不是 3 的倍数，它的 base64 尾部会补 '='，下一块再接上去就让
+// 整串在块边界出现非法字符 —— 后端 base64.DecodeString 报
+// "illegal base64 data at input byte <块 base64 长度>"（>1 MiB 的文件必挂）。
+// 取 3×349525=1048575（≈1 MiB）既满足约束、又保留原来的分块粒度与进度节奏。
+const B64_CHUNK = 1048575 // =3×349525，≈1 MiB；必须 3 的倍数，见上
 
 function fileToBase64Paced(file, onProgress) {
   return new Promise((resolve, reject) => {
@@ -1184,7 +1190,13 @@ export async function writeTerminal(hostId, sessionId, dataB64) {
     const msg = String(e && e.message ? e.message : e)
     // 终端已经关掉时的写入失败是正常的（用户手快），不打扰用户；
     // 其它错误必须说出来 —— 否则表现为「按键没反应」，最难排查的那种。
-    if (!/没有打开|已关闭/.test(msg)) {
+    // 「已经关掉」以本地状态为准（closed/idle/error）：本地还认为 open 却
+    // 写不进去，说明 PTY 在后端死了而 term:exit 还在路上（或丢了）——
+    // 尤其全屏程序（vim/top）冻在最后一帧时，静默等于把「连接断了」伪装成
+    // 「终端假死」，用户一个像素都看不到变化，必须报出来。
+    const st = store.terms[bucketKey(hostId, sessionId)]
+    const knownGone = !!st && (st.status === 'closed' || st.status === 'idle' || st.status === 'error')
+    if (!knownGone || !/没有打开|已关闭/.test(msg)) {
       push({ kind: 'error', content: '终端输入失败：' + msg })
     }
   }

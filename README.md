@@ -2,7 +2,7 @@
 
 **English** | [中文](README.zh-CN.md)
 
-LLM-powered remote Linux operations console. Manage SSH hosts from a desktop app, ask an agent to diagnose problems in natural language, or run shell commands yourself — with a policy engine that blocks credential reads and dangerous actions, and asks for confirmation on high-risk changes.
+LLM-powered remote Linux operations console. Manage SSH hosts from a desktop app, ask an agent to diagnose problems in natural language, or run shell commands yourself — commands you type run as you with no approval and are only hard-denied when they are irreversible or read credentials; confirmation applies to agent-proposed commands.
 
 Built with [Wails v2](https://wails.io/) (Go + Vue 3).
 
@@ -12,10 +12,10 @@ Built with [Wails v2](https://wails.io/) (Go + Vue 3).
 - **Host key verification** — TOFU fingerprints are pinned per address (via `knownhosts`); you can forget a fingerprint to re-trust on the next connection.
 - **Agent session** — Dual input in one console:
   - Natural language (or a `?` prefix) → LLM agent with tools
-  - Shell-like lines → direct remote `Exec` through the policy engine (no LLM)
+  - Shell-like lines → written into the resident terminal after a hard-deny check (no LLM)
 - **Policy engine**
   - Hard deny: login/credential paths, app credential files (`.env`, `credentials.json`), full environment dumps, destructive ops (`mkfs`, `dd of=/dev/*`, `rm -rf /`, `shutdown`, …)
-  - High-risk confirm: delete/create/chmod, package changes, service restarts, process kills, Docker/Kubernetes mutations, …
+  - High-risk confirm (agent-proposed commands only): delete/create/chmod, package changes, service restarts, process kills, Docker/Kubernetes mutations, …
   - LLM modes: manual (approve every tool) or read-only command whitelist
 - **Interactive terminal** — Full PTY for `top`, `vim`, `htop`, and other TTY programs (bypasses policy; use when you need a real terminal). Each `(host, session)` gets its own shell that is reused when you switch back, so your `cwd` and running processes stay put.
 - **Terminal snapshots into context** — A backend VT screen model tracks the PTY stream, detects when a full-screen TUI takes over, and hands the LLM the frozen final frame when the program exits. Snapshots are transient context: they never enter the session history.
@@ -38,7 +38,7 @@ Built with [Wails v2](https://wails.io/) (Go + Vue 3).
 
 Interactive programs that need a TTY will fail in Agent session (by design). Use a batch form such as `top -b -n 1`, or switch to **Interactive terminal**.
 
-A third path exists inside the Agent session: shell commands **you** type are checked by the policy engine too, but only high-risk ones require confirmation (`EvaluateHuman`). Unknown third-party binaries are probed with `command -v` first, and if they don't exist remotely the app suggests rephrasing the request for the Agent instead.
+A third path exists inside the Agent session: shell commands **you** type are only hard-denied (irreversible destruction and credential reads, `EvaluateHuman`); everything else runs as you without approval. Confirmation applies to agent-proposed commands only. Unknown third-party binaries are probed with `command -v` first, and if they don't exist remotely the app suggests rephrasing the request for the Agent instead.
 
 ## How a terminal snapshot reaches the model
 

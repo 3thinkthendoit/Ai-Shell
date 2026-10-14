@@ -18,7 +18,7 @@ import FileManagerModal from './FileManagerModal.vue'
 
 // 控制台 = 一块整幅 xterm，附着当前主机的常驻 shell PTY（阿里云 Workbench 同款）。
 // 人可以直接在表面里敲（原始按键进 PTY，不过策略）；底部 composer 走分流：
-// 中文/? → Agent，shell 行 → 策略闸门 → 写进同一片 PTY。top/vim 原生全屏接管。
+// 中文/? → Agent，shell 行 → 硬拒绝过滤 → 写进同一片 PTY。top/vim 原生全屏接管。
 // 「对话归档」开关把主区切成只读时间线（复用 store.entries 渲染），表面用 v-show
 // 常驻不销毁 —— xterm 实例一销毁滚动回放就没了。
 //
@@ -33,8 +33,6 @@ import FileManagerModal from './FileManagerModal.vue'
 const rootEl = ref(null)          // ResizeObserver 的观察目标（.surface）
 let attachedKey = ''              // 当前附着的那块表面键（切任务时据此关闭旧的）
 let ro = null
-// 已接好 onData/粘贴/选区 回调的表面键（ensureTerm 复用活实例时不重复接线）。
-const wiredHandlers = new Set()
 
 // 对话归档：只读时间线开关。false = 活表面，true = 归档视图。
 const showArchive = ref(false)
@@ -94,10 +92,9 @@ const canClose = computed(() => !!st.value && (st.value.status === 'open' || st.
 watch(() => store.theme, t => setTheme(t))
 
 // disposeSurface：销毁本地 xterm 实例（termSession.disposeTerm 负责），并
-// 顺带清掉本组件持有的接线标记与 copy-on-select 防抖。
+// 顺带清掉 copy-on-select 防抖。
 function disposeSurface(key) {
   cancelCopyOnSelect(key)
-  wiredHandlers.delete(key)
   disposeTerm(key)
 }
 
@@ -108,13 +105,16 @@ async function ensureSurface(hostId, sessionId) {
   attachHandlers(bucketKey(hostId, sessionId))
 }
 
-// attachHandlers 给某块表面接上交互回调。幂等：ensureTerm 复用活实例时不会
-// 重建对象，此时不能重复挂（否则按键被派发多次）；disposeSurface 会清标记，
-// 下一次重建时重新接线。
+// attachHandlers 给某块表面接上交互回调。幂等标记挂在**实例登记项**上（t.wired）
+// 而不是组件里的模块级 Set：ensureTerm 在 status 变为 closed/error 后会不经
+// disposeSurface 直接 disposeTerm+重建（「重新打开」按钮就是这么走的），按 key
+// 去重的 Set 会残留旧标记，新实例永远接不上 onData —— 表现为画面正常渲染、
+// 按键全部石沉大海的假死（进入 vim 后无法操作的一个直接原因）。
+// 标记随登记项生灭：复用活实例时不重复挂（否则按键派发两次），重建后自动重接。
 function attachHandlers(key) {
   const t = getTerm(key)
-  if (!t || wiredHandlers.has(key)) return
-  wiredHandlers.add(key)
+  if (!t || t.wired) return
+  t.wired = true
   const term = t.term
 
   // 用户按键 → 本地行编辑（见 termInput.onTermData）。
@@ -713,7 +713,7 @@ onBeforeUnmount(() => {
     <div class="sess-banner">
       <span>
         控制台<span v-if="currentHost"> · <b>{{ currentHost.user }}@{{ currentHost.addr }}</b></span>
-        ｜ 在这里可直接敲 <b>Linux 命令</b>执行（先过策略，高危会请你确认），
+        ｜ 在这里可直接敲 <b>Linux 命令</b>执行（以你的身份直接运行、不经审批；仅 <span class="mono">rm -rf /</span> 这类不可逆操作被硬拒绝），
         也能用<b>自然语言</b>（中文 / <span class="mono">?</span> 开头）把需求交给 <b>LLM</b>。
         top/vim 这类程序原生全屏接管，退出后最后一帧定格进模型上下文与审计。
       </span>

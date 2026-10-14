@@ -35,7 +35,7 @@ function makeApp(impl = {}) {
     Ask: async () => undefined,
     Approve: async () => true,
     Stop: async () => undefined,
-    // 终端内直接输入的 shell 行走常驻终端通道（策略闸门 + 写进 PTY），
+    // 终端内直接输入的 shell 行走常驻终端通道（硬拒绝过滤 + 写进 PTY），
     // 默认放行；ReportActiveSession 报当前会话，挂载/切会话时都会调。
     RunShellInTerminal: async () => ({ status: 'done', decision: 'allow', reason: '', rule: 'auto_safe', risk: 'low' }),
     ReportActiveSession: async () => undefined,
@@ -169,12 +169,13 @@ describe('ConsolePanel 空状态与主机选择', () => {
     expect(wrapper.text()).toContain('root@10.0.0.1')
   })
 
-  it('分段按钮是「终端 / 对话归档」，能力横幅标明高危确认与 LLM', () => {
+  it('分段按钮是「终端 / 对话归档」，能力横幅标明直接运行不审批与 LLM', () => {
     setup()
     const segs = wrapper.findAll('.seg button')
     expect(segs[0].text()).toBe('终端')
     expect(segs[1].text()).toBe('对话归档')
-    expect(wrapper.find('.sess-banner').text()).toMatch(/高危/)
+    // 控制台命令不再审批：横幅应诚实说明「以你的身份直接运行、仅硬拒绝不可逆操作」。
+    expect(wrapper.find('.sess-banner').text()).toMatch(/硬拒绝/)
     expect(wrapper.find('.sess-banner').text()).toMatch(/LLM/)
   })
 })
@@ -1287,7 +1288,7 @@ describe('ConsolePanel 上下文存放说明', () => {
     const text = wrapper.find('.console').text()
     expect(text, '会话已经落盘了，不能再声称重启即清空').not.toContain('重启应用即清空')
     expect(text).not.toContain('只存在内存')
-    expect(wrapper.find('.sess-banner').text()).toMatch(/高危|确认/)
+    expect(wrapper.find('.sess-banner').text()).toMatch(/硬拒绝|不经审批/)
   })
 })
 

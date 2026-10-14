@@ -3,7 +3,6 @@ package main
 import (
 	"strings"
 	"testing"
-	"time"
 
 	"ai-shell/internal/audit"
 	"ai-shell/internal/sshclient"
@@ -54,7 +53,7 @@ func newShellTestAppWithServer(t *testing.T, mode vault.PolicyMode, whitelist []
 }
 
 func TestRunShell_SafeAutoAllows(t *testing.T) {
-	// 人敲 shell：非高危自动放行，不依赖白名单/手动模式
+	// 人敲 shell：非硬拒绝命令自动放行，不依赖白名单/手动模式
 	a, hostID := newShellTestApp(t, vault.ModeManual, nil)
 	res := a.RunShell(hostID, "echo hi", "~", 10)
 	if res.Status != "done" {
@@ -79,72 +78,15 @@ func TestRunShell_DenyProtected(t *testing.T) {
 	}
 }
 
-func TestRunShell_HighRiskConfirmThenApprove(t *testing.T) {
+func TestRunShell_HighRiskAutoExecutes(t *testing.T) {
+	// 人工路径不再对高危命令挂审批：mkdir -p 直接执行完成（status=done）。
 	a, hostID := newShellTestApp(t, vault.ModeWhitelist, vault.DefaultWhitelist())
-
-	done := make(chan ShellResult, 1)
-	go func() {
-		done <- a.RunShell(hostID, "mkdir -p /tmp/aishell-hr-test", "~", 10)
-	}()
-
-	deadline := time.Now().Add(2 * time.Second)
-	var id string
-	for time.Now().Before(deadline) {
-		a.shell.mu.Lock()
-		for k := range a.shell.approvals {
-			id = k
-		}
-		a.shell.mu.Unlock()
-		if id != "" {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if id == "" {
-		t.Fatal("高危命令应挂起审批")
-	}
-	if !a.Approve(id, true) {
-		t.Fatal("Approve 应成功")
-	}
-
-	res := <-done
+	res := a.RunShell(hostID, "mkdir -p /tmp/aishell-hr-auto", "~", 10)
 	if res.Status != "done" {
-		t.Fatalf("status=%s error=%s", res.Status, res.Error)
+		t.Fatalf("status=%s error=%s decision=%s", res.Status, res.Error, res.Decision)
 	}
-	if res.Rule != "high_risk" {
-		t.Fatalf("rule=%s want high_risk", res.Rule)
-	}
-}
-
-func TestRunShell_HighRiskConfirmThenReject(t *testing.T) {
-	a, hostID := newShellTestApp(t, vault.ModeManual, nil)
-
-	done := make(chan ShellResult, 1)
-	go func() {
-		done <- a.RunShell(hostID, "rm -f /tmp/aishell-nope", "~", 10)
-	}()
-
-	deadline := time.Now().Add(2 * time.Second)
-	var id string
-	for time.Now().Before(deadline) {
-		a.shell.mu.Lock()
-		for k := range a.shell.approvals {
-			id = k
-		}
-		a.shell.mu.Unlock()
-		if id != "" {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if id == "" {
-		t.Fatal("审批没有挂起")
-	}
-	a.Approve(id, false)
-
-	res := <-done
-	if res.Status != "denied" {
-		t.Fatalf("期望 denied，得 %s", res.Status)
+	if res.Rule != "auto_safe" {
+		t.Fatalf("rule=%s want auto_safe（人工路径不应再命中 high_risk）", res.Rule)
 	}
 }
 
@@ -162,36 +104,6 @@ func TestRunShell_WrapUsesCwd(t *testing.T) {
 	if !strings.HasPrefix(wrapped, "cd '/tmp' && ") {
 		t.Fatalf("wrap=%q", wrapped)
 	}
-}
-
-func TestRunShell_AskBlockedWhileShellPending(t *testing.T) {
-	a, hostID := newShellTestApp(t, vault.ModeManual, nil)
-
-	done := make(chan ShellResult, 1)
-	go func() {
-		done <- a.RunShell(hostID, "touch /tmp/aishell-busy", "~", 10)
-	}()
-
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if a.lane.shellBusy() {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if !a.lane.shellBusy() {
-		t.Fatal("shell 应占用中")
-	}
-	if id := a.lane.shellHostID(); id != hostID {
-		t.Fatalf("shellHostID=%q want %q", id, hostID)
-	}
-	err := a.Ask(hostID, "", "hello", "")
-	if err == nil {
-		t.Fatal("Ask 应被 shell 占用拒绝")
-	}
-
-	a.cancelShellApprovals()
-	<-done
 }
 
 func TestRunShell_EmptyHost(t *testing.T) {

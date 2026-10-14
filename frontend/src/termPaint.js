@@ -235,7 +235,7 @@ export function paintSnapshotNote(write, final) {
   nl(write, DIM + '  ▸ ' + (final ? '终端结束画面' : '终端屏幕快照') + '已进归档与模型上下文。' + RESET)
 }
 
-// 人工 shell 经策略闸门后被拒绝/取消：在表面上说明原因（放行时无需多话，
+// 人工 shell 被硬拒绝或执行失败：在表面上说明原因（放行时无需多话，
 // PTY 的命令回显与输出就是全部）。
 export function paintShellVerdict(write, res) {
   if (!write || !res) return
@@ -243,7 +243,6 @@ export function paintShellVerdict(write, res) {
   if (st === 'done') return
   const msg = {
     denied: '命令被策略拒绝：' + (res.reason || res.error || ''),
-    cancelled: '命令未执行（审批超时或被中断）。',
     error: '命令执行失败：' + (res.error || ''),
     missing: (res.reason || '远端未找到该命令。')
   }[st] || ('命令未执行（' + st + '）。')
@@ -251,7 +250,7 @@ export function paintShellVerdict(write, res) {
 }
 
 // 人工命令跑完后的一句话提示：很多人不知道输出可以直接丢给 LLM 分析。
-// 只在命令真正执行完（done）后出现 —— 被拒/取消/出错各有各的说法，不再叠加。
+// 只在命令真正执行完（done）后出现 —— 被拒/出错各有各的说法，不再叠加。
 //
 // 位置（用户反馈的演进史，别改回去）：
 //   v1 追加在命令输出流里（另起一行）→ 用户误以为「进了 agent 模式」；

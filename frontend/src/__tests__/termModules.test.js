@@ -23,6 +23,7 @@ import {
 } from '../terminal/termSession.js'
 import { onTermData } from '../terminal/termInput.js'
 import { enqueueSubmit } from '../terminal/termSubmit.js'
+import { CMD_PENDING_IDLE_MS } from '../terminal/termEvents.js'
 import { instances, resetInstances } from './stubs/xterm.js'
 
 const toBytes = x => Array.from(x)
@@ -262,7 +263,7 @@ describe('termInput · onTermData 本地行编辑', () => {
 })
 
 describe('termSubmit · enqueueSubmit 分流', () => {
-  it('识别为命令的 shell 行经策略闸门写进常驻 PTY', async () => {
+  it('识别为命令的 shell 行经硬拒绝过滤写进常驻 PTY', async () => {
     withHost()
     const key = await createSurface()
     await enqueueSubmit(key, 'ls -la')
@@ -294,6 +295,67 @@ describe('termSubmit · enqueueSubmit 分流', () => {
     const wt = callsOf('WriteTerminal')
     expect(wt.length).toBe(1)
     expect(toBytes(base64ToBytes(wt[0].args[2]))).toEqual(toBytes(new TextEncoder().encode('\n')))
+  })
+
+  it('agent 对话中回车：像命令的回复也交给 Agent，不碰 PTY', async () => {
+    withHost()
+    // 本会话已有 Agent 回复 → 进入 agent 模式：即便 `ls -la` 是已知命令也当回复交给 Agent。
+    store.bySession[bucketKey('h1', 'default')] = [{ kind: 'assistant', content: '先确认来源 IP。' }]
+    const key = await createSurface()
+    await enqueueSubmit(key, 'ls -la')
+    expect(callsOf('Ask').length).toBe(1)
+    expect(callsOf('RunShellInTerminal')).toEqual([])
+  })
+})
+
+describe('cmdPending · 提交命令后的乐观透传窗口', () => {
+  // 兜住「shell integration 缺席、程序又在切备用屏前就等输入」的卡死：
+  // vim 的 E325、read、菜单都落在这一类。见 termEvents cmdPending 注释。
+  it('提交 shell 命令后开窗口：按键直达 PTY，不再被本地行编辑吞掉', async () => {
+    withHost()
+    const key = await createSurface()
+    await enqueueSubmit(key, 'ls')
+    // 命令写进 PTY 后（status done）乐观窗口应把 isCmdRunning 顶起来，
+    // 让接下来输入的「R/O/Q」这类选项字母走透传分支（termInput line 29）。
+    expect(isCmdRunning(key)).toBe(true)
+    calls.length = 0
+    onTermData(key, 'R')
+    const wt = callsOf('WriteTerminal')
+    expect(wt.length).toBe(1)
+    expect(toBytes(base64ToBytes(wt[0].args[2]))).toEqual(toBytes(new TextEncoder().encode('R')))
+    // 透传的字符不该再进本地缓冲
+    expect(getTerm(key).line).toBe('')
+  })
+
+  it('输出静默 CMD_PENDING_IDLE_MS 后窗口自动关闭，可打印字符回到本地行编辑', async () => {
+    withHost()
+    const key = await createSurface()
+    await enqueueSubmit(key, 'ls')
+    expect(isCmdRunning(key)).toBe(true)
+    // 没有权威接管信号（本文件不 bindTerminalEvents），只靠静默计时兜底关窗。
+    vi.advanceTimersByTime(CMD_PENDING_IDLE_MS)
+    expect(isCmdRunning(key)).toBe(false)
+    calls.length = 0
+    onTermData(key, 'R')
+    // 回到提示符：R 是普通可打印字符，应重新进本地缓冲、不写 PTY。
+    expect(callsOf('WriteTerminal')).toEqual([])
+    expect(getTerm(key).line).toBe('R')
+  })
+
+  it('窗口开着时退回的每个可打印字符都直达 PTY（覆盖 vim E325 连续选项）', async () => {
+    withHost()
+    const key = await createSurface()
+    await enqueueSubmit(key, 'ls')
+    expect(callsOf('RunShellInTerminal').length).toBe(1)
+    calls.length = 0
+    onTermData(key, 'R')
+    onTermData(key, '\r') // E325 里 "Press ENTER" —— 回车也应透传给程序而非本地提交
+    const wt = callsOf('WriteTerminal')
+    expect(wt.length).toBe(2)
+    expect(toBytes(base64ToBytes(wt[0].args[2]))).toEqual(toBytes(new TextEncoder().encode('R')))
+    expect(toBytes(base64ToBytes(wt[1].args[2]))).toEqual(toBytes(new TextEncoder().encode('\r')))
+    // 回车走的是透传分支，没再触发一次提交。
+    expect(callsOf('RunShellInTerminal').length).toBe(0)
   })
 })
 

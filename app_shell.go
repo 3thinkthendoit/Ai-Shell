@@ -1,36 +1,26 @@
 package main
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
-	"ai-shell/internal/agent"
 	"ai-shell/internal/audit"
 	"ai-shell/internal/policy"
 	"ai-shell/internal/sshclient"
 )
-
-// 人工 shell 审批等待上限。与 agent 工具审批同量级：用户可能离开屏幕去核对命令。
-//
-// 做成变量而不是常量（同 agent.approvalTimeout）：测试要把它压到毫秒级
-// 验证超时路径会发 approval:expired。
-var shellApprovalTimeout = 5 * time.Minute
 
 // cwd 哨兵：与 frontend/src/term.js 的 CWD_MARKER 保持一致。
 const cwdMarker = "__AISHELL_CWD__"
 
 // ShellResult 是交互式会话里「人直接敲的一条 shell 命令」的结果。
 //
-// 这条路径**经过策略引擎**（与绕过策略的交互终端相对），再决定是否 Exec。
+// 这条路径**经过策略引擎**（仅硬拒绝不可逆/凭据命令；与绕过策略的
+// 交互终端原始按键相对），再决定是否 Exec。人是命令的所有者，故不弹审批。
 // Status:
 //   - done      —— 已执行（含非零退出码）
-//   - denied    —— 策略硬拒绝，或用户在审批里点了拒绝
-//   - cancelled —— 审批超时 / 被 Stop 打断
+//   - denied    —— 策略硬拒绝（不可逆破坏 / 凭据读取）
 //   - missing   —— 未知第三方命令在远端不存在；提示改走 LLM
 //   - error     —— 本机侧失败（未选主机、SSH 不可达等）
 type ShellResult struct {
@@ -46,80 +36,6 @@ type ShellResult struct {
 	Hint       string `json:"hint"`
 	Truncated  bool   `json:"truncated"`
 	Error      string `json:"error"`
-}
-
-// shellGate 是人工 shell 命令的审批闸门，与 Agent.approvals 分开：
-// Agent 在跑一轮时也可以有工具审批，两者 ID 空间不能混用，
-// 否则一边 Resolve 成功、另一边永远挂起。
-type shellGate struct {
-	mu        sync.Mutex
-	approvals map[string]chan bool
-}
-
-func (g *shellGate) register(id string) chan bool {
-	ch := make(chan bool, 1)
-	g.mu.Lock()
-	if g.approvals == nil {
-		g.approvals = map[string]chan bool{}
-	}
-	g.approvals[id] = ch
-	g.mu.Unlock()
-	return ch
-}
-
-func (g *shellGate) resolve(id string, approved bool) bool {
-	g.mu.Lock()
-	ch, ok := g.approvals[id]
-	if ok {
-		delete(g.approvals, id)
-	}
-	g.mu.Unlock()
-	if !ok {
-		return false
-	}
-	select {
-	case ch <- approved:
-	default:
-	}
-	return true
-}
-
-func (g *shellGate) drop(id string) {
-	g.mu.Lock()
-	delete(g.approvals, id)
-	g.mu.Unlock()
-}
-
-func (g *shellGate) cancelAll() {
-	g.mu.Lock()
-	ids := make([]string, 0, len(g.approvals))
-	for id := range g.approvals {
-		ids = append(ids, id)
-	}
-	g.mu.Unlock()
-	for _, id := range ids {
-		g.resolve(id, false)
-	}
-}
-
-// wait 等到批准/拒绝，或超时/ctx 取消。超时与取消时自行从 map 清掉登记。
-func (g *shellGate) wait(id string, ch <-chan bool, done <-chan struct{}) (approved bool, cancelled bool) {
-	select {
-	case ok := <-ch:
-		return ok, false
-	case <-time.After(shellApprovalTimeout):
-		g.drop(id)
-		return false, true
-	case <-done:
-		g.drop(id)
-		return false, true
-	}
-}
-
-func newShellID() string {
-	var b [8]byte
-	_, _ = rand.Read(b[:])
-	return "shell-" + hex.EncodeToString(b[:])
 }
 
 // shellQuote 用单引号包裹，供远端 bash 安全嵌入路径。
@@ -170,9 +86,9 @@ func parseBareCd(cmd string) *string {
 
 // RunShell 在 Agent 会话里执行一条人敲的 shell 命令。
 //
-// 裁决用**用户原文**（EvaluateHuman：仅高危需确认）；Exec 用包装后命令（带 cwd）。
-// 未知第三方二进制先 command -v；不存在则返回 missing，提示改问 LLM。
-// 高危批准后会再测一次存在性，缩小 check→approve→exec 窗口。
+// 裁决用**用户原文**（EvaluateHuman：仅硬拒绝不可逆/凭据命令，其余直接执行、
+// 不审批）；Exec 用包装后命令（带 cwd）。未知第三方二进制先 command -v；
+// 不存在则返回 missing，提示改问 LLM。
 //
 // cwd 由前端跟踪；空或 "~" 表示家目录。
 //
@@ -240,83 +156,6 @@ func (a *App) RunShell(hostID, command, cwd string, timeoutSec int) ShellResult 
 		return base
 	}
 
-	if verdict.Decision == policy.Confirm {
-		id := newShellID()
-		ch := a.shell.register(id)
-		view := agent.ToolCallView{
-			ID:       id,
-			Name:     "shell",
-			HostID:   hostID,
-			HostName: hostNameOf(a.v, hostID),
-			Command:  cmd,
-			Decision: verdict.Decision,
-			Reason:   verdict.Reason,
-			Rule:     verdict.Rule,
-			Risk:     risk,
-			Status:   "pending",
-			// 与 agent 工具审批同款：把失效时刻下发，界面显示倒计时。
-			DeadlineMs: time.Now().Add(shellApprovalTimeout).UnixMilli(),
-		}
-		a.emit(agent.EvApproval, view)
-
-		var done <-chan struct{}
-		if a.ctx != nil {
-			done = a.ctx.Done()
-		}
-		approved, cancelled := a.shell.wait(id, ch, done)
-		if cancelled {
-			// 超时/中断都要告诉界面把这条收掉，否则它永远挂着（见 EvApprovalExpired）。
-			a.emit(agent.EvApprovalExpired, map[string]string{"id": id, "reason": "审批超时或已中断"})
-			a.auditLog(audit.Entry{
-				Kind:     audit.KindDirect,
-				HostID:   hostID,
-				HostName: hostNameOf(a.v, hostID),
-				Command:  cmd,
-				Decision: string(verdict.Decision),
-				Rule:     verdict.Rule,
-				Note:     "人工 shell 审批超时或已中断",
-			})
-			base.Status = "cancelled"
-			base.Error = "审批超时或已中断"
-			return base
-		}
-		if !approved {
-			denied := false
-			a.auditLog(audit.Entry{
-				Kind:     audit.KindDirect,
-				HostID:   hostID,
-				HostName: hostNameOf(a.v, hostID),
-				Command:  cmd,
-				Decision: string(verdict.Decision),
-				Rule:     verdict.Rule,
-				Approved: &denied,
-				Note:     "用户拒绝执行人工 shell 命令",
-			})
-			base.Status = "denied"
-			base.Reason = "用户拒绝执行"
-			return base
-		}
-		ok := true
-		a.auditLog(audit.Entry{
-			Kind:     audit.KindDirect,
-			HostID:   hostID,
-			HostName: hostNameOf(a.v, hostID),
-			Command:  cmd,
-			Decision: string(verdict.Decision),
-			Rule:     verdict.Rule,
-			Approved: &ok,
-			Note:     "用户批准执行人工 shell 命令",
-		})
-		// 批准后到 Exec 之间再测一次，缩小窗口。
-		if miss := a.probeMissingBinary(hostID, cmd, pol.Whitelist); miss != nil {
-			base.Status = "missing"
-			base.Reason = miss.Reason
-			base.Hint = miss.Hint
-			base.Error = miss.Reason
-			return base
-		}
-	}
-
 	execCmd := wrapShellCommand(cwd, cmd)
 	res, err := a.ssh.Exec(hostID, execCmd, time.Duration(timeoutSec)*time.Second)
 	hint := sshclient.TTYHint(res.Stderr, res.ExitCode)
@@ -330,7 +169,7 @@ func (a *App) RunShell(hostID, command, cwd string, timeoutSec int) ShellResult 
 		Rule:       verdict.Rule,
 		ExitCode:   &res.ExitCode,
 		DurationMs: res.DurationMs,
-		Note:       "人工 shell 执行（经策略引擎）",
+		Note:       "人工 shell 执行（未触发硬拒绝）",
 	}
 	if err != nil {
 		entry.Note = "人工 shell 执行失败：" + err.Error()
@@ -352,11 +191,12 @@ func (a *App) RunShell(hostID, command, cwd string, timeoutSec int) ShellResult 
 	return base
 }
 
-// RunShellInTerminal 把一条人敲的 shell 命令送进常驻终端执行：裁决仍走
-// 策略引擎（高危需确认），但执行路径改成把这一行写进常驻 PTY ——
-// 提示符回显、输出、top/vim 接管全发生在同一块表面上，与人亲手
-// 在键盘上敲完全同形。与 RunShell 的差别是没有有界捕获：输出属于
-// 终端流，模型看到的是命令退出时定格的最后一帧（见 OpenTerminal 的 VT 管线）。
+// RunShellInTerminal 把一条人敲的 shell 命令送进常驻终端执行：裁决仅做
+// 硬拒绝（不可逆/凭据命令，见 EvaluateHuman），普通与高危命令一律直接执行、
+// 不审批；执行路径是把这一行写进常驻 PTY —— 提示符回显、输出、top/vim 接管
+// 全发生在同一块表面上，与人亲手在键盘上敲完全同形。与 RunShell 的差别是
+// 没有有界捕获：输出属于终端流，模型看到的是命令退出时定格的最后一帧
+// （见 OpenTerminal 的 VT 管线）。
 //
 // 不做存在性探测：命令不存在时 shell 自己会报 command not found，
 // 那比后端代猜一句「远端未找到」更自然，也少一次往返。
@@ -394,74 +234,6 @@ func (a *App) RunShellInTerminal(hostID, sessionID, command string) ShellResult 
 		return base
 	}
 
-	if verdict.Decision == policy.Confirm {
-		id := newShellID()
-		ch := a.shell.register(id)
-		a.emit(agent.EvApproval, agent.ToolCallView{
-			ID:       id,
-			Name:     "shell",
-			HostID:   hostID,
-			HostName: hostNameOf(a.v, hostID),
-			Command:  cmd,
-			Decision: verdict.Decision,
-			Reason:   verdict.Reason,
-			Rule:     verdict.Rule,
-			Risk:     base.Risk,
-			Status:   "pending",
-			// 与 agent 工具审批同款：把失效时刻下发，界面显示倒计时。
-			DeadlineMs: time.Now().Add(shellApprovalTimeout).UnixMilli(),
-		})
-
-		var done <-chan struct{}
-		if a.ctx != nil {
-			done = a.ctx.Done()
-		}
-		approved, cancelled := a.shell.wait(id, ch, done)
-		if cancelled {
-			// 超时/中断都要告诉界面把这条收掉，否则它永远挂着（见 EvApprovalExpired）。
-			a.emit(agent.EvApprovalExpired, map[string]string{"id": id, "reason": "审批超时或已中断"})
-			a.auditLog(audit.Entry{
-				Kind:     audit.KindDirect,
-				HostID:   hostID,
-				HostName: hostNameOf(a.v, hostID),
-				Command:  cmd,
-				Decision: string(verdict.Decision),
-				Rule:     verdict.Rule,
-				Note:     "人工 shell 审批超时或已中断（常驻终端）",
-			})
-			base.Status = "cancelled"
-			base.Error = "审批超时或已中断"
-			return base
-		}
-		if !approved {
-			denied := false
-			a.auditLog(audit.Entry{
-				Kind:     audit.KindDirect,
-				HostID:   hostID,
-				HostName: hostNameOf(a.v, hostID),
-				Command:  cmd,
-				Decision: string(verdict.Decision),
-				Rule:     verdict.Rule,
-				Approved: &denied,
-				Note:     "用户拒绝执行人工 shell 命令（常驻终端）",
-			})
-			base.Status = "denied"
-			base.Reason = "用户拒绝执行"
-			return base
-		}
-		ok := true
-		a.auditLog(audit.Entry{
-			Kind:     audit.KindDirect,
-			HostID:   hostID,
-			HostName: hostNameOf(a.v, hostID),
-			Command:  cmd,
-			Decision: string(verdict.Decision),
-			Rule:     verdict.Rule,
-			Approved: &ok,
-			Note:     "用户批准执行人工 shell 命令（常驻终端）",
-		})
-	}
-
 	p := a.ssh.PTY(termKey(hostID, sessionID))
 	if p == nil {
 		base.Status = "error"
@@ -475,7 +247,7 @@ func (a *App) RunShellInTerminal(hostID, sessionID, command string) ShellResult 
 		Command:  cmd,
 		Decision: string(verdict.Decision),
 		Rule:     verdict.Rule,
-		Note:     "人工 shell 在常驻终端执行（经策略引擎）",
+		Note:     "人工 shell 在常驻终端执行（未触发硬拒绝）",
 	})
 	if err := p.Write([]byte(cmd + "\n")); err != nil && !errors.Is(err, sshclient.ErrPTYClosed) {
 		base.Status = "error"
@@ -622,14 +394,6 @@ func (a *App) ResolveUnknownInput(hostID, text string) RouteDecision {
 		})
 		return RouteDecision{Kind: "agent", Binary: base, Missing: true}
 	}
-	// 命令存在（可能是用户自己的脚本）：按命令走，过策略引擎。
+	// 命令存在（可能是用户自己的脚本）：按命令走，过硬拒绝过滤。
 	return RouteDecision{Kind: "shell", Binary: base}
-}
-
-func (a *App) resolveShell(id string, approved bool) bool {
-	return a.shell.resolve(id, approved)
-}
-
-func (a *App) cancelShellApprovals() {
-	a.shell.cancelAll()
 }

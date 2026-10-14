@@ -1,5 +1,5 @@
 import { getTerm, surfaceWrite } from './termSession.js'
-import { ask, runShellInTerminal, writeTerminal, textToBase64, backendAPI } from '../store.js'
+import { ask, runShellInTerminal, writeTerminal, textToBase64, backendAPI, hasAgentTurn } from '../store.js'
 import { resolveInput } from '../inputRoute.js'
 import * as paint from '../termPaint.js'
 
@@ -24,11 +24,13 @@ async function submitLine(key, line) {
     writeTerminal(hostId, sessionId, textToBase64('\n'))
     return
   }
-  const route = await resolveInput(text, backendAPI(), hostId)
+  // 输入分流：agent 对话中（本会话已有 Agent 回复/工具调用）一律当回复交给 Agent，
+  // 不做命令识别/执行；要跑命令用 ! 前缀或原始终端。
+  const route = await resolveInput(text, backendAPI(), hostId, hasAgentTurn(hostId, sessionId))
   await dispatchLine(key, text, route)
 }
 
-// dispatchLine 真正把一行交出去：agent 走 ask，shell 走策略闸门 + PTY。
+// dispatchLine 真正把一行交出去：agent 走 ask，shell 走硬拒绝过滤 + PTY。
 async function dispatchLine(key, text, route) {
   const t = getTerm(key)
   if (!t) return
@@ -45,6 +47,6 @@ async function dispatchLine(key, text, route) {
     ask(route.text)
     return
   }
-  // shell：交回常驻终端通道（策略闸门 + 写进 PTY，PTY 自己回显执行）。
+  // shell：交回常驻终端通道（硬拒绝过滤 + 写进 PTY，PTY 自己回显执行）。
   await runShellInTerminal(hostId, sessionId, route.text)
 }

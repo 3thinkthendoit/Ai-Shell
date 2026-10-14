@@ -10,7 +10,7 @@ package main
 // 但这不等于「什么都不拦」：
 //   - 删除由前端弹窗二次确认（用户明确点过才知道自己删的是什么）；
 //   - 后端拒绝空路径与根目录（前端那一道拦不住 bug，后端这道是底线）；
-//   - 上传/下载有 32 MiB 上限，超了明确报错，而不是把内存打爆；
+//   - 上传/下载都不设大小上限（按需求去掉）：下载分块流式落盘、内存平稳；上传由前端分块读、后端一次性 base64 落盘；
 //   - 所有操作写审计，事后可查。
 
 import (
@@ -161,9 +161,6 @@ func (a *App) UploadRemoteFile(hostID, dir, name, base64Data string) FileOpResul
 	if err != nil {
 		return FileOpResult{Error: "上传内容不是合法 base64：" + err.Error()}
 	}
-	if int64(len(data)) > sshclient.MaxTransferBytes {
-		return FileOpResult{Error: fmt.Sprintf("文件超过上限（%d MiB）", sshclient.MaxTransferBytes>>20)}
-	}
 
 	res, err := a.ssh.WriteFileBinary(hostID, target, data)
 	if err != nil {
@@ -192,8 +189,8 @@ func (a *App) UploadRemoteFile(hostID, dir, name, base64Data string) FileOpResul
 // 大于一个块的文件会持续回报进度与速度，中途可取消。
 //
 // 流程与顺序是有讲究的：
-//  1. 先探大小（StatFileSize）——文件不存在、超过上限都在**弹对话框之前**
-//     失败。对话框弹了又被一条错误收场，比直接报错更让人困惑。
+//  1. 先探大小（StatFileSize）——「文件不存在」这类错误在**弹对话框之前**
+//     就报出来。对话框弹了又被一条错误收场，比直接报错更让人困惑。
 //  2. 再弹保存对话框 —— 用户取消就安静返回（Cancelled），什么都不显示。
 //  3. 最后分块传输（downloadTo），每块回报进度。
 func (a *App) DownloadRemoteFile(hostID, path string) FileOpResult {
@@ -208,16 +205,11 @@ func (a *App) DownloadRemoteFile(hostID, path string) FileOpResult {
 		return FileOpResult{Error: "请选择一个文件"}
 	}
 
-	total, err := a.ssh.StatFileSize(hostID, target)
-	if err != nil {
+	// 先探一次大小：不是为了限制，而是让「文件不存在」这类错误在弹保存
+	// 对话框之前就报出来（downloadTo 会重新探一次并驱动分块循环）。
+	if _, err := a.ssh.StatFileSize(hostID, target); err != nil {
 		a.auditFile("下载失败："+err.Error(), hostID, target)
 		return FileOpResult{Error: err.Error()}
-	}
-	if total > sshclient.MaxTransferBytes {
-		a.auditFile(fmt.Sprintf("下载被拒：文件 %d 字节超过上限", total), hostID, target)
-		return FileOpResult{Error: fmt.Sprintf(
-			"文件（%s）超过 %s 上限，未下载。请改用终端里的 scp/sftp 取这个大文件。",
-			humanBytes(total), humanBytes(sshclient.MaxTransferBytes))}
 	}
 
 	dest, err := a.pickSaveDest(target)
@@ -265,12 +257,6 @@ func (a *App) downloadTo(hostID, target, dest string, onProgress func(FileTransf
 	if err != nil {
 		a.auditFile("下载失败："+err.Error(), hostID, target)
 		return FileOpResult{Error: err.Error()}
-	}
-	if total > sshclient.MaxTransferBytes {
-		a.auditFile(fmt.Sprintf("下载被拒：文件 %d 字节超过上限", total), hostID, target)
-		return FileOpResult{Error: fmt.Sprintf(
-			"文件（%s）超过 %s 上限，未下载。请改用终端里的 scp/sftp 取这个大文件。",
-			humanBytes(total), humanBytes(sshclient.MaxTransferBytes))}
 	}
 
 	// 每次传输一个独立 context：CancelFileTransfer 找到它并触发取消。
@@ -370,20 +356,6 @@ func (a *App) CancelFileTransfer(id string) bool {
 	}
 	cancel()
 	return true
-}
-
-// humanBytes 把字节数变成人能读的大小，用在错误信息里。
-func humanBytes(n int64) string {
-	switch {
-	case n < 1024:
-		return fmt.Sprintf("%d B", n)
-	case n < 1024*1024:
-		return fmt.Sprintf("%.1f KiB", float64(n)/1024)
-	case n < 1024*1024*1024:
-		return fmt.Sprintf("%.1f MiB", float64(n)/(1024*1024))
-	default:
-		return fmt.Sprintf("%.2f GiB", float64(n)/(1024*1024*1024))
-	}
 }
 
 // ---- 辅助 ----

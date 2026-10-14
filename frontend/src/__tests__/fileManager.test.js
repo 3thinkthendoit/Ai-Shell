@@ -54,7 +54,6 @@ function makeApp(impl = {}) {
 
 function resetStore() {
   store.termCwd = {}
-  store.maxTransferBytes = 32 * 1024 * 1024
   store.fileManager = {
     open: false, key: '', hostId: '', sessionId: '', cwd: '', parent: '',
     entries: [], loading: false, error: '', busy: false, notice: '',
@@ -334,19 +333,24 @@ describe('文件管理 上传进度', () => {
     expect(store.fileManager.busy).toBe(false)
   })
 
-  it('超过上限的文件在开始前就被拒绝，不会出现进度', async () => {
-    const { app, calls } = makeApp()
+  it('多块文件拼出的 base64 必须整体可解码（块边界不能带 padding）', async () => {
+    // 回归：曾经每块各自 base64 再字符串拼接，非 3 倍数块尾的 '=' 让后端
+    // base64.DecodeString 在块边界报 illegal base64 —— >1 MiB 的文件必挂。
+    let received = null
+    const { app } = makeApp({
+      UploadRemoteFile: async (h, d, n, b64) => {
+        received = b64
+        return { ok: true, message: '' }
+      }
+    })
     window.go = { main: { App: app } }
     await openFileManager('h1', 's1')
-    store.maxTransferBytes = 1024
 
-    await fmUpload(fakeFile('huge.bin', 4096))
+    const size = 3 * 1024 * 1024 + 7 // 跨多块，且末块长度不是 3 的倍数
+    await fmUpload(fakeFile('big.bin', size))
 
-    expect(store.fileManager.error).toContain('超过上限')
-    // 关键：连读都不该读 —— 进度条一闪而过也算一种失败体验，
-    // 而且白读了 4KiB（真实场景里是几百 MB）。
-    expect(store.fileManager.progress).toBeNull()
-    expect(calls.filter(c => c.name === 'UploadRemoteFile').length).toBe(0)
+    expect(received, '应把整个文件的 base64 交给后端').toBeTruthy()
+    expect(atob(received).length, '解码出的原始字节数必须等于文件大小').toBe(size)
   })
 
   it('小文件也能走完进度（不能因为只有一块就卡在 0%）', async () => {

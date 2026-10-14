@@ -141,7 +141,7 @@
         />
         <button class="sm" :disabled="fm.busy" @click="pickFile">上传到当前目录</button>
         <span class="fm-spacer"></span>
-        <span class="modal-hint">上限 {{ limitText }} · 上传/下载支持二进制</span>
+        <span class="modal-hint">上传/下载支持二进制</span>
         <button class="sm primary" @click="close">关闭</button>
       </div>
     </div>
@@ -167,9 +167,6 @@ const fileEl = ref(null)
 watch(() => fm.cwd, v => { pathInput.value = v || '' }, { immediate: true })
 
 const canGoParent = computed(() => fm.parent && fm.parent !== fm.cwd)
-
-// 上限文案取自后端下发的值，不写死 —— 见 store.maxTransferBytes 的说明。
-const limitText = computed(() => fmtBytes(store.maxTransferBytes))
 
 // 进度的三个派生值。之所以要分成三个 computed 而不是在模板里直接算：
 // 它们都要处理"total 未知/为 0"的情况，散在模板里会重复三遍同样的判断，

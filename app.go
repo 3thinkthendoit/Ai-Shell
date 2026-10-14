@@ -32,7 +32,6 @@ type App struct {
 	ag      *agent.Agent
 	audit   *audit.Logger
 	openErr error
-	shell   shellGate   // 人工 shell 命令的审批闸门（与 Agent 工具审批分开）
 	lane    sessionLane // Ask 与 RunShell 互斥道
 
 	// 活跃传输（文件下载）的取消注册表。下载是分块循环（见 app_files.go
@@ -1301,20 +1300,16 @@ func (a *App) CompactSession(hostID, sessionID string) (agent.CompactResult, err
 	return a.ag.CompactSession(a.ctx, hostID, sessionID)
 }
 
-// Approve 回应一次审批请求（Agent 工具或人工 shell，先试 Agent）。
+// Approve 回应一次 Agent 工具审批请求。
 func (a *App) Approve(id string, approved bool) bool {
-	if a.ag != nil && a.ag.Resolve(id, approved) {
-		return true
-	}
-	return a.resolveShell(id, approved)
+	return a.ag != nil && a.ag.Resolve(id, approved)
 }
 
-// Stop 中断当前 agent 会话，取消挂起的人工 shell 审批，并杀掉本轮 shell 的 Exec。
+// Stop 中断当前 agent 会话，并杀掉本轮 shell 的 Exec。
 func (a *App) Stop() {
 	if a.ag != nil {
 		a.ag.Stop()
 	}
-	a.cancelShellApprovals()
 	// 只 Cancel 当前人工 shell 占用的那台主机，避免误杀其它主机会话。
 	if a.ssh != nil {
 		if id := a.lane.shellHostID(); id != "" {

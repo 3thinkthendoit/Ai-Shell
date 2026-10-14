@@ -5,7 +5,8 @@ import (
 	"strings"
 )
 
-// highRisk 命中则需人工确认（不是硬拒绝）。
+// highRisk 命中则需人工确认（不是硬拒绝）。仅作用于 LLM 路径（Evaluate）；
+// 人工 shell 走 EvaluateHuman，不看高危。
 //
 // 覆盖「会改系统状态」的常见操作：删/建/改文件与权限、装包、启停服务、
 // 杀进程、危险管道与重定向。极高危（mkfs、rm -rf /…）仍由 destructive 硬拒绝。
@@ -52,7 +53,7 @@ var highRisk = []struct {
 	{regexp.MustCompile(`(?i)(?:^|[|;&]\s*)(?:sudo\s+)?kubectl\s+(?:apply|delete|create|replace|patch|scale|rollout|exec)\b`), "Kubernetes 变更类操作"},
 }
 
-// IsHighRisk 判断命令是否属于「变更类高危」—— 需要人工确认，但仍可被批准执行。
+// IsHighRisk 判断命令是否属于「变更类高危」—— 需要人工确认，但仍可被批准执行（仅 LLM 路径 Evaluate；人工 shell 不审批）。
 func IsHighRisk(cmd string) bool {
 	return HighRiskReason(cmd) != ""
 }
@@ -77,9 +78,20 @@ func HighRiskReason(cmd string) string {
 	return ""
 }
 
-// EvaluateHuman 是 Agent 会话里「人直接敲的 shell」专用裁决：
+// EvaluateHuman 是「人在控制台直接敲的 shell」专用裁决：
 //
-//	硬拒绝 → 高危需确认 → 其余自动放行。
+//	硬拒绝 → 其余一律直接放行（不审批）。
+//
+// 为什么不再对高危命令要求确认：控制台是「人是所有者」的真终端，人对自己
+// 敲的命令负责，审批自己没有意义（与 SSH 直连一致）。安全边界改成按**命令
+// 来源**分层 —— 只有 AI 生成的命令才需人工确认（见 Evaluate），因为 AI 会
+// 误判、会被远端输出里的提示注入诱导。
+//
+// 因此这里只保留硬拒绝：挡掉不可逆的破坏命令（rm -rf /、mkfs …）与凭据
+// 读取（/etc/shadow、~/.ssh …）。定位是「防手滑」而非「防刻意」—— 它只在
+// 「本地行编辑 → 回车提交」这条路上生效；用户若用原始按键直通（Tab /
+// passthrough）把命令灌进 PTY 仍会绕过（那条路零策略，见 WriteTerminal）。
+// 这是有意的取舍，用来换取 Tab 补全 / vim / top 等原生终端体验。
 //
 // 不走「手动模式条条确认」，也不要求命中只读白名单 —— 白名单是给 LLM 工具用的命令库。
 // 未知第三方命令是否存在，由调用方在 Exec 前做 command -v 检查。
@@ -91,8 +103,5 @@ func EvaluateHuman(cmd string) Verdict {
 	if v := EvaluateProtected(c); v.Decision == Deny {
 		return v
 	}
-	if reason := HighRiskReason(c); reason != "" {
-		return Verdict{Confirm, "高危变更（" + reason + "）需人工确认", "high_risk"}
-	}
-	return Verdict{Allow, "非高危命令，自动执行", "auto_safe"}
+	return Verdict{Allow, "人工 shell 命令直接执行（仅硬拒绝不可逆/凭据操作）", "auto_safe"}
 }

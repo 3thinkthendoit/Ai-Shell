@@ -59,7 +59,7 @@ type Sealer interface {
 const (
 	KindAgentRun  = "agent_run" // 用户发起一轮 agent 会话
 	KindTool      = "tool"      // agent 的一次工具调用及其裁决/结果
-	KindDirect    = "direct"    // 人工 shell（经策略）：交互式会话里人敲的命令；亦含历史直连记录
+	KindDirect    = "direct"    // 人工 shell（仅硬拒绝）：交互式会话里人敲的命令；亦含历史直连记录
 	KindTerminal  = "terminal"  // 交互终端会话的开始/结束
 	KindHost      = "host"      // 主机配置变更
 	KindLLM       = "llm"       // LLM 配置变更

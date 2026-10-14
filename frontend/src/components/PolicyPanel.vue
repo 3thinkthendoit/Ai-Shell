@@ -203,14 +203,14 @@ async function save() {
           <input type="radio" value="manual" v-model="form.mode" />
           <div>
             <div class="mode-title">手动模式</div>
-            <div class="mode-desc">仅约束 LLM：Agent 提出的每一条命令都需你批准。人在 Agent 会话里敲的 shell 仍只对高危（删/建/改等）确认。</div>
+            <div class="mode-desc">仅约束 LLM：Agent 提出的每一条命令都需你批准。人敲的 shell 不走此闸门（以你的身份直接执行、仅硬拒绝不可逆命令）。</div>
           </div>
         </label>
         <label class="mode" :class="{ on: form.mode === 'whitelist' }">
           <input type="radio" value="whitelist" v-model="form.mode" />
           <div>
             <div class="mode-title">白名单模式</div>
-            <div class="mode-desc">LLM 命中只读命令库的自动执行，其余需批准。人敲的 shell 不走此闸门（仍按高危确认）；未知第三方会先查远端是否存在。</div>
+            <div class="mode-desc">LLM 命中只读命令库的自动执行，其余需批准。人敲的 shell 不走此闸门（以你的身份直接执行、仅硬拒绝不可逆命令）；未知第三方会先查远端是否存在。</div>
           </div>
         </label>
       </div>

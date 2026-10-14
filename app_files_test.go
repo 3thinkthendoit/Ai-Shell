@@ -15,7 +15,7 @@ import (
 //
 // 重点不在「顺利路径能跑通」，而在几条**错了会很危险**的边界：
 // 空路径/根目录必须拒绝删除、文件名里的路径穿越必须拒绝、
-// 超过上限必须明确报错而不是把内存打爆、二进制内容必须一字不差。
+// 二进制内容必须一字不差、任何失败都不能留下半成品文件。
 
 func TestListRemoteDir_EmptyPathFallsBackToHome(t *testing.T) {
 	a, hostID := newShellTestApp(t, vault.ModeManual, nil)
@@ -297,27 +297,6 @@ func TestUploadRemoteFile_RejectsPathTraversal(t *testing.T) {
 	}
 }
 
-// 超过上限时必须明确报错，而不是把它读进内存再说 ——
-// 那种失败方式会把页面和后端一起打爆。
-func TestUploadRemoteFile_RejectsOversize(t *testing.T) {
-	a, hostID := newShellTestApp(t, vault.ModeManual, nil)
-
-	// 把上限压到 8 字节，这样一条短内容就能验证「超过上限被拒」，
-	// 而不必真的构造 32 MiB 的字符串（那会让用例本身很慢）。
-	old := sshclient.MaxTransferBytes
-	sshclient.MaxTransferBytes = 8
-	t.Cleanup(func() { sshclient.MaxTransferBytes = old })
-
-	big := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("x", 64)))
-	res := a.UploadRemoteFile(hostID, "/srv", "big.txt", big)
-	if res.OK {
-		t.Fatal("超过上限的上传应被拒绝")
-	}
-	if !strings.Contains(res.Error, "上限") {
-		t.Fatalf("错误信息应说明是超过上限，实得 %q", res.Error)
-	}
-}
-
 // doDownload 走一遍真实下载（分块落盘路径 downloadTo），把进度事件收集起来。
 // dest 固定落在临时目录，测试结束时自动清理。
 func doDownload(t *testing.T, a *App, hostID, path string) (string, FileOpResult, []FileTransferProgress) {
@@ -384,54 +363,6 @@ func TestDownloadRemoteFile_EmptyFile(t *testing.T) {
 	data, _ := mustDownload(t, a, hostID, "/srv/empty.bin")
 	if len(data) != 0 {
 		t.Fatalf("空文件不应有内容, 实得 %d 字节", len(data))
-	}
-}
-
-// 超过上限的下载必须**明确拒绝**，而不是交回一段被静默截断的内容。
-//
-// 这条守的是本功能最危险的一种失败：用户下载一个大日志，只拿到前半截
-// 却看到「已下载」，然后拿这份残缺文件去做覆盖或迁移。那种损失是不可逆的，
-// 而且现场没有任何线索指向「文件其实是完整的，只是没传完」。
-func TestDownloadRemoteFile_RejectsOversize(t *testing.T) {
-	a, hostID := newShellTestApp(t, vault.ModeManual, nil)
-
-	// 把上限压到 8 字节。假远端预置的 /srv/app.conf 远长于它，
-	// 于是「超限」这条路径真的被走到 —— 探测（wc -c）先行，
-	// 超限在弹对话框、写任何本地字节之前就被拒绝。
-	old := sshclient.MaxTransferBytes
-	sshclient.MaxTransferBytes = 8
-	t.Cleanup(func() { sshclient.MaxTransferBytes = old })
-
-	dest, res, _ := doDownload(t, a, hostID, "/srv/app.conf")
-	if res.OK {
-		t.Fatalf("超限的下载必须被拒绝，却报告成功（%s）", dest)
-	}
-	if !strings.Contains(res.Error, "上限") {
-		t.Fatalf("拒绝理由应说明是超过上限，实得 %q", res.Error)
-	}
-	if _, err := os.Stat(dest); !os.IsNotExist(err) {
-		t.Fatalf("被拒绝的下载不应留下半成品文件（%s）", dest)
-	}
-}
-
-// 文件**恰好等于**上限时必须正常下载 —— 这是「按长度顶格即视为截断」
-// 那种实现会误报的边界，也是这里先用 wc -c 探明真实大小的原因。
-func TestDownloadRemoteFile_ExactLimitIsNotTruncated(t *testing.T) {
-	a, hostID := newShellTestApp(t, vault.ModeManual, nil)
-
-	raw := []byte("0123456789")
-	up := a.UploadRemoteFile(hostID, "/srv", "exact.bin", base64.StdEncoding.EncodeToString(raw))
-	if !up.OK {
-		t.Fatalf("准备用例的上传失败: %s", up.Error)
-	}
-
-	old := sshclient.MaxTransferBytes
-	sshclient.MaxTransferBytes = int64(len(raw))
-	t.Cleanup(func() { sshclient.MaxTransferBytes = old })
-
-	got, _ := mustDownload(t, a, hostID, "/srv/exact.bin")
-	if string(got) != string(raw) {
-		t.Fatalf("内容不符：期望 %q，实得 %q", raw, got)
 	}
 }
 

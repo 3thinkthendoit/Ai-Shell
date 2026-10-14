@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { classifyInput } from '../inputRoute.js'
+import { classifyInput, resolveInput } from '../inputRoute.js'
 
 describe('classifyInput', () => {
   it('空输入走 agent（由上层拦「请输入」）', () => {
@@ -46,5 +46,23 @@ describe('classifyInput', () => {
   it('真实命令仍走 shell', () => {
     expect(classifyInput('df -h').kind).toBe('shell')
     expect(classifyInput('ls /var/log').kind).toBe('shell')
+  })
+})
+
+// agent 模式：本会话已在和 Agent 对话时，输入一律当「回复」交给 Agent，
+// 不做命令识别/远端探测（api 传 undefined 也应命中，证明没去问后端）。
+describe('resolveInput · agent 模式', () => {
+  it('agent 对话中：像命令的回复也交给 Agent', async () => {
+    expect(await resolveInput('ls -la', undefined, 'h1', true)).toEqual({ kind: 'agent', text: 'ls -la' })
+    expect(await resolveInput('yes', undefined, 'h1', true)).toEqual({ kind: 'agent', text: 'yes' })
+  })
+  it('agent 对话中：显式 ! 前缀仍强制 shell', async () => {
+    expect(await resolveInput('!ls -la', undefined, 'h1', true)).toEqual({ kind: 'shell', text: 'ls -la' })
+  })
+  it('agent 对话中：? 前缀仍走 Agent 并剥前缀', async () => {
+    expect(await resolveInput('?ls -la', undefined, 'h1', true)).toEqual({ kind: 'agent', text: 'ls -la' })
+  })
+  it('非 agent 对话：命令仍走 shell', async () => {
+    expect(await resolveInput('ls -la', undefined, 'h1', false)).toEqual({ kind: 'shell', text: 'ls -la' })
   })
 })

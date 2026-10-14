@@ -20,7 +20,7 @@ func (l *sessionLane) tryEnterAgent() (ok bool, reason string) {
 	case "agent":
 		return false, "已有会话正在运行"
 	case "shell":
-		return false, "人工 shell 命令正在执行或等待批准，请先结束再问 Agent"
+		return false, "人工 shell 命令正在执行，请先结束再问 Agent"
 	}
 	l.mode = "agent"
 	return true, ""
@@ -41,7 +41,7 @@ func (l *sessionLane) tryEnterShell(hostID string) (ok bool, reason string) {
 	case "agent":
 		return false, "Agent 正在运行，请先结束本轮再敲命令"
 	case "shell":
-		return false, "已有 shell 命令在执行或等待批准"
+		return false, "已有 shell 命令在执行"
 	}
 	l.mode = "shell"
 	l.shellID = hostID

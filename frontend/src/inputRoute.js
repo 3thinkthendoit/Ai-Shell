@@ -1,6 +1,7 @@
-// 交互式会话的输入分流：同一输入框既收自然语言（→ Agent），也收 shell 命令（→ 策略后 Exec）。
+// 交互式会话的输入分流：同一输入框既收自然语言（→ Agent），也收 shell 命令（→ 硬拒绝后写 PTY）。
 //
 // 判定顺序：
+//   0. agent 对话中（本会话已有 Agent 回复/工具调用）→ 一律走 Agent（仅 ! 前缀例外）
 //   1. 以 ? / ？ 开头 → 强制走 Agent（去掉前缀）
 //   2. 以 ! 开头      → 强制走 shell（去掉前缀，中文命令也能跑）
 //   3. 首词是命令     → shell（**不管有没有中文**：`echo 你好` 意图明确）
@@ -136,13 +137,22 @@ export function unknownToQuestion(binary, text) {
  * @param {string} raw
  * @param {object} api 后端绑定（window.go.main.App），可空
  * @param {string} hostId 当前主机 id（探测需要），可空
+ * @param {boolean} [agentMode] 本会话是否已在 agent 对话中；为真时除 ! 外一律 Agent
  * @returns {Promise<{ kind: 'agent'|'shell', text: string, missing?: boolean, binary?: string }>}
  *   missing=true 表示该命令在远端不存在，text 已包装成给 LLM 的问题。
  */
-export async function resolveInput(raw, api, hostId) {
+export async function resolveInput(raw, api, hostId, agentMode = false) {
   const trimmed = String(raw ?? '').trim()
   const base = classifyInput(trimmed)
   if (!trimmed) return base
+
+  // agent 对话中：输入一律当「回复」交给 Agent，不做命令识别/远端探测。
+  // 为什么：回复 Agent 的话（哪怕首词恰好像个命令，如 `yes`/`open 3306`）绝不该被
+  // 当 shell 命令执行掉 —— 那会吞掉一次对话（`yes` 甚至会把屏幕刷满）。唯一例外是
+  // 显式 `!` 前缀：那是人明确表态「我就要跑这条命令」，尊重显式意图。
+  if (agentMode && !trimmed.startsWith('!')) {
+    return trimmed.startsWith('?') || trimmed.startsWith('？') ? base : { kind: 'agent', text: trimmed }
+  }
 
   // 显式表态（? / !）与纯语言特征（问号结尾、多行）已经定了，不必再问后端：
   // 少一次跨进程往返，用户敲回车到发出提问之间没有额外延迟。

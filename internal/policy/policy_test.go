@@ -183,19 +183,21 @@ func TestEvaluateHighRiskOverridesWhitelist(t *testing.T) {
 	}
 }
 
-func TestEvaluateHumanOnlyHighRiskConfirms(t *testing.T) {
+func TestEvaluateHumanOnlyDeniesProtected(t *testing.T) {
 	if v := EvaluateHuman("ls -la"); v.Decision != Allow {
 		t.Fatalf("人敲 ls 应自动放行，实际 %s(%s)", v.Decision, v.Rule)
 	}
 	if v := EvaluateHuman("echo hi"); v.Decision != Allow {
 		t.Fatalf("人敲 echo 应自动放行，实际 %s", v.Decision)
 	}
-	if v := EvaluateHuman("mkdir /tmp/x"); v.Decision != Confirm || v.Rule != "high_risk" {
-		t.Fatalf("mkdir 应 Confirm(high_risk)，实际 %s(%s)", v.Decision, v.Rule)
+	// 人敲命令不再审批：mkdir / rm -f 这类高危但非不可逆的命令直接放行。
+	if v := EvaluateHuman("mkdir /tmp/x"); v.Decision != Allow {
+		t.Fatalf("人敲 mkdir 应直接放行（不再审批），实际 %s(%s)", v.Decision, v.Rule)
 	}
-	if v := EvaluateHuman("rm -f /tmp/x"); v.Decision != Confirm {
-		t.Fatalf("rm 应 Confirm，实际 %s", v.Decision)
+	if v := EvaluateHuman("rm -f /tmp/x"); v.Decision != Allow {
+		t.Fatalf("人敲 rm -f 应直接放行（不再审批），实际 %s", v.Decision)
 	}
+	// 仅硬拒绝仍生效：凭据读取被 Deny。
 	if v := EvaluateHuman("cat /etc/shadow"); v.Decision != Deny {
 		t.Fatalf("凭据读取应 Deny，实际 %s", v.Decision)
 	}

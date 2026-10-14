@@ -569,6 +569,66 @@ describe('常驻终端表面 退出与关闭', () => {
     expect(callsOf('OpenTerminal')).toHaveLength(2)
   })
 
+  it('「重新打开」换新实例后，按键接线必须重新接上（vim 假死回归）', async () => {
+    withHost()
+    setup()
+    await attached()
+    expect(instances[0].dataHandlers.length).toBeGreaterThan(0)
+
+    rt.emit('term:exit', { hostId: 'h1', reason: '远端已断开连接' })
+    await nextTick()
+    await wrapper.find('.surface-status button').trigger('click')
+    await flushPromises()
+    await nextTick()
+
+    expect(instances).toHaveLength(2)
+    expect(instances[0].disposed).toBe(true)
+    // 回归点：新实例必须重新接上 onData。旧实现用组件里的模块级 Set 按
+    // surface key 去重，ensureTerm 重建实例不清它 —— 新实例收不到任何按键，
+    // 画面正常渲染、键盘全部石沉大海（进了 vim 后 i/:q 全失效的假死）。
+    expect(instances[1].dataHandlers.length).toBeGreaterThan(0)
+
+    // 按键真的能透传出去：模拟 vim 全屏接管后敲 i。
+    rt.emit('term:cmd', { hostId: 'h1', active: true })
+    await flushPromises()
+    instances[1].emitData('i')
+    await flushPromises()
+    const wt = callsOf('WriteTerminal')
+    expect(wt.map(c => String.fromCharCode(...base64ToBytes(c.args[2])))).toEqual(['i'])
+  })
+
+  it('全屏中断连且 term:exit 还在路上：按键写入失败必须报错，不得静默假死', async () => {
+    withHost()
+    setup({ WriteTerminal: async () => { throw new Error('交互终端没有打开') } })
+    await attached()
+    // 模拟 vim 冻结的最后一帧：本地状态仍 open，PTY 在后端已死。
+    instances[0].buffer.active.type = 'alternate'
+    await flushPromises()
+
+    const errs0 = store.entries.filter(e => e.kind === 'error').length
+    instances[0].emitData('i')
+    await flushPromises()
+    // 静默的话用户看到的是「一个像素都不变」的假死；必须把断连说出来。
+    expect(store.entries.filter(e => e.kind === 'error').length).toBe(errs0 + 1)
+  })
+
+  it('已知断开（closed）后按键写入失败仍静默，断连已画在冻结的帧上', async () => {
+    withHost()
+    setup({ WriteTerminal: async () => { throw new Error('交互终端没有打开') } })
+    await attached()
+    instances[0].buffer.active.type = 'alternate'
+    rt.emit('term:exit', { hostId: 'h1', reason: '远端已断开连接' })
+    await nextTick()
+    // 断开必须发生在事发地点：冻结的 vim 帧上要能看到，而不是只有上方横幅。
+    expect(instances[0].text()).toContain('终端已断开')
+
+    const errs0 = store.entries.filter(e => e.kind === 'error').length
+    instances[0].emitData('i')
+    await flushPromises()
+    // 用户已经看得见断开提示，后续残留按键的写入失败不再打扰。
+    expect(store.entries.filter(e => e.kind === 'error').length).toBe(errs0)
+  })
+
   it('自己点关闭会打后端并销毁本地实例', async () => {
     withHost()
     setup()
@@ -610,16 +670,16 @@ describe('常驻终端表面 退出与关闭', () => {
 // ---- 界面必须说清楚风险 ----
 
 describe('常驻终端表面 风险提示', () => {
-  it('显眼处写明终端内输入的分流与策略闸门', async () => {
+  it('显眼处写明终端内输入的分流与硬拒绝边界', async () => {
     withHost()
     setup()
     await attached()
 
     const banner = wrapper.find('.sess-banner')
     expect(banner.exists()).toBe(true)
-    // 输入已整体搬进终端：中文/? 交 LLM，shell 先过策略（高危需确认）。
+    // 输入已整体搬进终端：中文/? 交 LLM，shell 以你的身份直接执行、仅硬拒绝不可逆操作。
     expect(banner.text()).toContain('交给')
-    expect(banner.text()).toContain('先过策略')
+    expect(banner.text()).toContain('硬拒绝')
     // 连到哪台机器也要写在旁边：终端一旦开起来就再没有别的提示符可看
     expect(banner.text()).toContain('root@10.0.0.1')
   })
@@ -926,7 +986,7 @@ describe('终端内直接输入自然语言', () => {
     expect(run[0].args[2]).toBe('echo 你好')
   })
 
-  it('shell 命令回车 → 走常驻终端通道（策略闸门）', async () => {
+  it('shell 命令回车 → 走常驻终端通道（硬拒绝过滤）', async () => {
     setup()
     withHost()
     await attached()
@@ -1015,6 +1075,71 @@ describe('终端内直接输入自然语言', () => {
     inst.emitData('l')
     await flushPromises()
     expect(callsOf('WriteTerminal').length).toBe(1)
+  })
+
+  it('提交 shell 命令后乐观开窗：即便无接管信号，R 也直达 PTY（vim E325 卡死兜底）', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
+    // 提交一条 shell 命令（写进 PTY），后端没发 term:cmd/term:tui。
+    type(inst, 'ls')
+    inst.emitData('\r')
+    await flushPromises()
+    expect(callsOf('RunShellInTerminal').length).toBe(1)
+    // 命令刚提交完这一瞬：后续可打印字符应直达 PTY，不再被本地行编辑吞掉。
+    calls.length = 0
+    inst.emitData('R')
+    await flushPromises()
+    const wt = callsOf('WriteTerminal')
+    expect(wt.length).toBe(1)
+    expect(wt[0].args[2]).toBe(textToBase64('R'))
+  })
+
+  it('权威信号 term:cmd 结束回到提示符 → 关闭乐观窗口，回到本地行编辑', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
+    type(inst, 'ls')
+    inst.emitData('\r')
+    await flushPromises()
+    // 窗口开着时先确认透传生效。
+    calls.length = 0
+    inst.emitData('R')
+    await flushPromises()
+    expect(callsOf('WriteTerminal').length).toBe(1)
+    // 命令边界（OSC 133）报回提示符：cmdActive=false，权威信号交还后关窗。
+    rt.emit('term:cmd', { hostId: 'h1', active: false })
+    await flushPromises()
+    calls.length = 0
+    inst.emitData('l')
+    await flushPromises()
+    expect(callsOf('WriteTerminal').length).toBe(0)
+  })
+
+  it('权威信号 term:tui 让出（程序退出）→ 关闭乐观窗口', async () => {
+    setup()
+    withHost()
+    await attached()
+    const inst = instances[0]
+    clearSurface()
+    type(inst, 'ls')
+    inst.emitData('\r')
+    await flushPromises()
+    calls.length = 0
+    inst.emitData('R')
+    await flushPromises()
+    expect(callsOf('WriteTerminal').length).toBe(1)
+    // 备用屏让出（无论 active 真假都是权威接管/退出信号）：窗口收掉。
+    rt.emit('term:tui', { hostId: 'h1', active: false })
+    await flushPromises()
+    calls.length = 0
+    inst.emitData('l')
+    await flushPromises()
+    expect(callsOf('WriteTerminal').length).toBe(0)
   })
 
   it('控制键（Tab）打断本地行编辑：缓冲连同该键交给 PTY', async () => {

@@ -67,10 +67,6 @@ export function paintHost() {
   return targetKey()
 }
 
-function isHumanShellApproval(p) {
-  return !!(p && p.name === 'shell')
-}
-
 function currentModelBadge() {
   const id = store.selectedProfileId
   const p = store.llmProfiles.find(x => x.id === id) ||
@@ -125,6 +121,70 @@ export function afterTermQuiet(hostId, sessionId, fn) {
   const key = bucketKey(hostId, sessionId)
   quietWaiters.set(key, fn)
   armQuietTimer(key)
+}
+
+// ---- 提交 shell 命令后的乐观透传窗口（cmdPending）----
+//
+// 为什么需要：控制台把「在提示符下敲命令」这一常态改成了本地行编辑，只有
+// 拿到「前台程序接管了输入」的正向信号时才让键直达 PTY。这些信号是 OSC 133
+// 的 cmdActive 与备用屏 tuiActive —— 但两者都可能缺席：
+//   - shell integration 没装上（非 bash/zsh，或阿里云 ECS 上安全 agent 把
+//     bash 的 DEBUG trap 冲掉，133;C 再也不发）→ cmdActive 恒假；
+//   - 程序在**切备用屏之前**就等输入（vim 打开有 .swp 冲突的文件时，
+//     E325 交换文件提示 / "Press ENTER or type command to continue" 打在
+//     主屏上；less/read/菜单同理）→ tuiActive 也假。
+// 三个信号全假时，用户敲的选项字母被本地行编辑吞进缓冲、送不到程序，
+// 表现为「执行 vi 这类命令直接卡死」。
+//
+// 人刚提交一条 shell 命令，接下来屏幕上必然是这条命令的输出/交互，而不是
+// 一个能打字问 LLM 的新提示符 —— 所以这一刻乐观地开一个透传窗口：期间按键
+// 一律直达 PTY。窗口由权威信号及时关闭（收到 term:cmd / term:tui 说明真信号
+// 接管了，交还给它们）；没有 shell integration 时靠「输出静默
+// CMD_PENDING_IDLE_MS 秒」兜底关闭，自动回到本地行编辑。持续重绘的程序（top）
+// 每帧都重置静默计时，于是它运行期间窗口一直开着、退出后自动关。
+export const CMD_PENDING_IDLE_MS = 6000
+const cmdPendingTimers = new Map()
+
+function clearCmdPendingTimer(key) {
+  const timer = cmdPendingTimers.get(key)
+  if (timer) {
+    clearTimeout(timer)
+    cmdPendingTimers.delete(key)
+  }
+}
+
+function armCmdPendingTimer(key, hostId, sessionId) {
+  clearCmdPendingTimer(key)
+  const timer = setTimeout(() => {
+    cmdPendingTimers.delete(key)
+    const st = termState(hostId, sessionId)
+    if (st) st.cmdPending = false
+  }, CMD_PENDING_IDLE_MS)
+  cmdPendingTimers.set(key, timer)
+}
+
+// armCmdPending 在提交一条 shell 命令时开启透传窗口（由 store.runShellInTerminal 调）。
+export function armCmdPending(hostId, sessionId) {
+  const key = bucketKey(hostId, sessionId)
+  const st = termState(hostId, sessionId)
+  if (!st) return
+  st.cmdPending = true
+  armCmdPendingTimer(key, hostId, sessionId)
+}
+
+// resetCmdPending：窗口内每收到一次 PTY 输出就续期 —— 程序还在动，别急着关。
+function resetCmdPending(hostId, sessionId) {
+  const st = termState(hostId, sessionId)
+  if (!st || !st.cmdPending) return
+  armCmdPendingTimer(bucketKey(hostId, sessionId), hostId, sessionId)
+}
+
+// endCmdPending：拿到权威接管信号（term:cmd / term:tui）或终端退出时收掉窗口，
+// 交还给 cmdActive / tuiActive（或回到本地行编辑）。
+function endCmdPending(hostId, sessionId) {
+  clearCmdPendingTimer(bucketKey(hostId, sessionId))
+  const st = termState(hostId, sessionId)
+  if (st) st.cmdPending = false
 }
 
 export function bindTerminalEvents(runtime) {
@@ -257,7 +317,7 @@ export function bindTerminalEvents(runtime) {
   runtime.EventsOn('agent:error', e => {
     store.running = false
     stopThinking(paintHost())
-    if (!isHumanShellApproval(store.pending)) store.pending = null
+    store.pending = null
     freezeStreams()
     push({ kind: 'error', content: e.message })
     paint.paintError(surfaceWrite(paintHost()), e.message)
@@ -271,12 +331,14 @@ export function bindTerminalEvents(runtime) {
   runtime.EventsOn('agent:done', () => {
     store.running = false
     stopThinking(paintHost())
-    if (!isHumanShellApproval(store.pending)) store.pending = null
+    store.pending = null
     freezeStreams()
   })
 
   runtime.EventsOn('term:data', d => {
     const k = bucketKey(d && d.hostId, d && d.sessionId)
+    // 有输出 = 前台程序还在动：为乐观透传窗口续期（仅当窗口开着）。
+    resetCmdPending(d && d.hostId, d && d.sessionId)
     const sink = termSinks.get(k)
     if (!sink) return
     stopThinking(k)
@@ -291,11 +353,18 @@ export function bindTerminalEvents(runtime) {
   runtime.EventsOn('term:tui', d => {
     const st = termState(d && d.hostId, d && d.sessionId)
     if (st) st.tuiActive = !!(d && d.active)
+    // 备用屏接管/让出都是权威信号：接管时 isFullscreen 会兜住，让出时程序
+    // 已退出 —— 两种情况都该把乐观窗口收掉。
+    endCmdPending(d && d.hostId, d && d.sessionId)
   })
 
   runtime.EventsOn('term:cmd', d => {
     const st = termState(d && d.hostId, d && d.sessionId)
-    if (st) st.cmdActive = !!(d && d.active)
+    const active = !!(d && d.active)
+    if (st) st.cmdActive = active
+    // 命令边界（OSC 133）是权威信号：运行时 cmdActive 自己管透传，结束时
+    // 回到提示符 —— 两者都不再需要乐观窗口。
+    endCmdPending(d && d.hostId, d && d.sessionId)
   })
 
   runtime.EventsOn('term:cwd', d => {
@@ -338,6 +407,13 @@ export function bindTerminalEvents(runtime) {
     st.exitReason = (d && d.reason) || '终端已结束'
     st.cmdActive = false
     st.tuiActive = false
+    endCmdPending(d && d.hostId, d && d.sessionId)
+    // 断连必须**画在屏幕上**：全屏程序（vim/top）运行中断连时画面冻结在
+    // 最后一帧，输入态已归零、后续按键也不再透传 —— 用户盯着一动不动的
+    // 画面，既不知道连接断了，也不知道按键为什么全部失效（表现为假死）。
+    // 状态横幅在表面上方，盯着终端的人很容易漏看；在冻结的帧上补一行字，
+    // 让「发生了什么」在事发地点可见。
+    paint.paintSystem(surfaceWrite(bucketKey(d && d.hostId, d && d.sessionId)), '终端已断开：' + st.exitReason)
   })
 
   runtime.EventsOn('agent:snapshot', d => {

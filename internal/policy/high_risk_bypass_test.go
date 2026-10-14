@@ -18,11 +18,13 @@ func TestHighRiskBypassClosed(t *testing.T) {
 		"FOO=1 kill 1",
 	}
 	for _, c := range cases {
+		// agent 路径：高危 wrapper 仍需人工确认（AI 会误判、会被远端输出注入诱导）。
 		if v := Evaluate(c, ModeWhitelist, wl); v.Decision != Confirm || v.Rule != "high_risk" {
 			t.Errorf("LLM Evaluate(%q)=%s/%s want confirm/high_risk", c, v.Decision, v.Rule)
 		}
-		if v := EvaluateHuman(c); v.Decision != Confirm || v.Rule != "high_risk" {
-			t.Errorf("EvaluateHuman(%q)=%s/%s want confirm/high_risk", c, v.Decision, v.Rule)
+		// 人工路径：同一批 wrapper 都不是不可逆破坏/凭据命令，故直接放行（不再拦高危）。
+		if v := EvaluateHuman(c); v.Decision != Allow {
+			t.Errorf("EvaluateHuman(%q)=%s/%s want allow（人工路径不再拦高危）", c, v.Decision, v.Rule)
 		}
 	}
 	// 只读仍放行
