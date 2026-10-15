@@ -1,5 +1,6 @@
 import { reactive } from 'vue'
 import * as paint from './termPaint'
+import { t } from './i18n'
 import {
   bindTerminalEvents,
   registerTermSink, unregisterTermSink, registerLLMHint,
@@ -39,6 +40,13 @@ export function bucketKey(hostId, sessionId) {
   return `${hostId || ''}${SEP}${sessionId || DEFAULT_SESSION}`
 }
 
+// 终端字体默认值：与 xterm 实例创建时的历史默认完全一致 —— 升级后老用户
+// 观感不变，也作为字体偏好坏数据时的回退。
+export const DEFAULT_TERM_FONT = {
+  family: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+  size: 12.5
+}
+
 export const store = reactive({
   ready: false,
   error: '',
@@ -48,6 +56,8 @@ export const store = reactive({
   auditError: '',
   // 主题：'light' | 'dark'。持久化在 localStorage（纯前端偏好，不进加密库）。
   theme: 'light',
+  // 终端字体偏好（family/fontSize），与主题同款 localStorage 持久化。
+  termFont: { ...DEFAULT_TERM_FONT },
   posture: { keyProtection: '', configDir: '', hostCount: 0, degraded: false },
   hosts: [],
   llm: { baseUrl: '', model: '', hasApiKey: false },
@@ -61,6 +71,11 @@ export const store = reactive({
   // 不再依赖「先改全局激活指针、下一轮才读它」那条间接路径：既不会在切换的
   // 后端回程还没跑完时把请求发到上一套方案上，也省掉了「切了却没换」的观感。
   selectedProfileId: '',
+  // pendingSessionId 是「切主机后想直达的那条会话」：侧栏分组视图里点击
+  // 其它主机的任务时先记下意图再切主机（currentHostId 一改 ConsolePanel 的
+  // watch 会开始整套切换流程），流程里的 refreshSessions 完成后若这条会话
+  // 确实存在就落到它 —— 用完即清，普通切主机时它始终是空串。
+  pendingSessionId: '',
 
   // contextUsage 是最近一次请求的上下文用量（估算值，见 internal/agent/tokenbudget.go）。
   // window 为 0 表示后端认不出该模型的上下文窗口 —— 此时只显示 token 数，不显示占比。
@@ -302,19 +317,53 @@ const THEME_KEY = 'aishell.theme'
 // initTheme 在应用挂载前调用：恢复上次选择并把 data-theme 落到 <html> 上。
 // 注意必须在首帧渲染前执行，否则暗色用户会先看到一帧白屏。
 export function initTheme() {
-  let t = 'light'
+  // 局部变量/参数不能叫 t —— 它会遮蔽 i18n 的翻译函数 t()。
+  let v = 'light'
   try {
-    t = localStorage.getItem(THEME_KEY) === 'dark' ? 'dark' : 'light'
+    v = localStorage.getItem(THEME_KEY) === 'dark' ? 'dark' : 'light'
   } catch { /* localStorage 不可用时用默认值 */ }
-  store.theme = t
-  document.documentElement.dataset.theme = t
+  store.theme = v
+  document.documentElement.dataset.theme = v
 }
 
-export function setTheme(t) {
-  if (t !== 'light' && t !== 'dark') return
-  store.theme = t
-  document.documentElement.dataset.theme = t
-  try { localStorage.setItem(THEME_KEY, t) } catch { /* 忽略持久化失败 */ }
+export function setTheme(v) {
+  if (v !== 'light' && v !== 'dark') return
+  store.theme = v
+  document.documentElement.dataset.theme = v
+  try { localStorage.setItem(THEME_KEY, v) } catch { /* 忽略持久化失败 */ }
+}
+
+// ---- 终端字体 ----
+const TERMFONT_KEY = 'aishell.termfont'
+
+// initTermFont 在应用挂载前调用（main.js）：恢复上次的字体偏好。坏数据
+// （非法 JSON、越界字号、空字体栈）一律当没有，回退默认。
+export function initTermFont() {
+  try {
+    const raw = localStorage.getItem(TERMFONT_KEY)
+    if (!raw) return
+    const v = JSON.parse(raw)
+    const size = Number(v && v.size)
+    store.termFont = {
+      family: typeof v.family === 'string' && v.family.trim() ? v.family : DEFAULT_TERM_FONT.family,
+      size: Number.isFinite(size) && size >= 8 && size <= 28 ? size : DEFAULT_TERM_FONT.size
+    }
+  } catch { /* 坏数据当没有，用默认 */ }
+}
+
+// setTermFont 更新字体偏好（patch 可只带 family 或只带 size），夹紧字号到
+// 8~28、步进 0.5。只改 store：已开终端实例的热更新由 ConsolePanel 的
+// watcher 调 termSession.setTermFont 完成 —— store 不依赖任何渲染模块。
+export function setTermFont(patch = {}) {
+  const family = typeof patch.family === 'string' && patch.family.trim()
+    ? patch.family
+    : store.termFont.family
+  let size = Number(patch.size)
+  size = Number.isFinite(size)
+    ? Math.min(28, Math.max(8, Math.round(size * 2) / 2))
+    : store.termFont.size
+  store.termFont = { family, size }
+  try { localStorage.setItem(TERMFONT_KEY, JSON.stringify(store.termFont)) } catch { /* 忽略持久化失败 */ }
 }
 
 export async function bootstrap() {
@@ -333,7 +382,11 @@ export async function bootstrap() {
       store.selectedProfileId = (store.llmProfiles.find(p => p.active) || {}).id || ''
     }
     store.policy = info.policy || store.policy
-    if (!store.currentHostId && store.hosts.length) store.currentHostId = store.hosts[0].id
+    // 自动选中只在「只有一台主机」时发生：猜对率 100% 且省一次点击。
+    // 多台时不猜 —— 选错的主机会被立即建立 SSH 连接（远端登录、审计痕迹），
+    // 而用户启动后未必先用终端（可能只想看审计/改设置）。选中动作交给用户，
+    // 连接时机随之从「启动时」移到「用户选择时」。
+    if (!store.currentHostId && store.hosts.length === 1) store.currentHostId = store.hosts[0].id
     store.ready = true
   } catch (e) {
     store.error = String(e && e.message ? e.message : e)
@@ -390,7 +443,7 @@ export async function refreshSessions(hostId) {
   } catch (e) {
     // 列表拉不到不该把界面清空：保留上一次的结果，用户至少还能继续用。
     // 但要说出来 —— 否则他会以为自己的会话全没了。
-    push({ kind: 'error', content: `读取会话列表失败：${e && e.message ? e.message : e}` }, hostId)
+    push({ kind: 'error', content: t('msg.sessionsFail', { err: e && e.message ? e.message : e }) }, hostId)
     return
   }
   store.sessions = { ...store.sessions, [hostId]: list }
@@ -409,6 +462,27 @@ export async function refreshSessions(hostId) {
     store.currentSessionId = def ? def.id : ''
   }
   pruneTimelines(hostId, list)
+}
+
+// refreshAllSessionLists 把**未选中主机**的会话列表拉齐，只填充 store.sessions、
+// 不碰 currentSessionId / currentHostId —— 与 refreshSessions 的区别在于后者
+// 还承担「把选中会话修正到有效值」的选中语义。
+//
+// 用途是侧栏的「按主机分组」视图：还没有选中主机时（欢迎页），侧栏也要能把
+// 每台主机的任务列出来供直达。当前选中的主机被跳过 —— 它的列表由切换与
+// 操作流程里的 refreshSessions 维护，这里再拉一遍等于用旧数据覆盖新数据
+// （重命名/新建刚落盘就被冲掉）。单台失败只让它缺席（该组显示为空），不挡其它主机。
+export async function refreshAllSessionLists() {
+  await Promise.all(
+    store.hosts
+      .filter(h => h.id !== store.currentHostId)
+      .map(async h => {
+        try {
+          const list = (await api().ListSessions(h.id)) || []
+          store.sessions = { ...store.sessions, [h.id]: list }
+        } catch { /* 拉不到就不显示这台的任务，下次主机列表变化时会再试 */ }
+      })
+  )
 }
 
 // pruneTimelines 清掉某台主机下「会话已不存在」的时间线。
@@ -464,14 +538,14 @@ export function freezeStreams() {
 
 export async function ask(prompt) {
   if (!store.currentHostId) {
-    push({ kind: 'error', content: '请先在「主机管理」里添加一台主机。' })
+    push({ kind: 'error', content: t('msg.needHost') })
     return
   }
   // 防重入：这个不变量由 store 自己守住，不指望每个调用方都记得先查 running。
   // 否则第二次调用会被后端以「已有会话正在运行」拒绝，给用户弹一个莫名其妙的报错。
   // 不能静默 return：那会让用户以为「发出去没反应」，必须给出可见提示。
   if (store.running || store.busy) {
-    push({ kind: 'system', content: '上一轮任务仍在执行中，请等待完成或点「中断」。' })
+    push({ kind: 'system', content: t('msg.busyRound') })
     return
   }
   // 记下这一轮属于哪条时间线。后续所有事件都按它归档 ——
@@ -504,12 +578,17 @@ export async function ask(prompt) {
 // 粒度是**一条会话**而不是一台主机：用户完全可能想留住「nginx 排查」
 // 那段上下文，只把另一条试验性的对话清掉。
 export async function clearSession(hostId, sessionId) {
+  // 无主机守卫：组件按钮已隐藏该入口，这里再兜一道 —— 未来新调用方不必记得先判空。
+  if (!hostId) {
+    push({ kind: 'error', content: t('msg.pickHost') })
+    return
+  }
   try {
     const res = await api().ClearSession(hostId, sessionId)
     if (res && res.busy) {
       push({
         kind: 'error',
-        content: '有会话正在运行，无法清空上下文。等这一轮结束或点「中断」后再试。'
+        content: t('msg.clearRunning')
       }, hostId, sessionId)
       return
     }
@@ -521,15 +600,12 @@ export async function clearSession(hostId, sessionId) {
   store.contextUsage.messages = 0
     push({
       kind: 'system',
-      content: n > 0
-        ? `已清空这条会话的 ${n} 轮对话上下文，LLM 不再记得之前的对话。` +
-          '界面上的文字保留 —— 清的是模型的记忆，不是屏幕上的记录。'
-        : '这条会话本来就没有对话上下文。'
+      content: n > 0 ? t('msg.clearDone', { n }) : t('msg.clearEmpty')
     }, hostId, sessionId)
   } catch (e) {
     push({
       kind: 'error',
-      content: `清空上下文失败：${e && e.message ? e.message : e}`
+      content: t('msg.clearFail', { err: e && e.message ? e.message : e })
     }, hostId, sessionId)
   }
 }
@@ -544,17 +620,22 @@ export async function clearSession(hostId, sessionId) {
 //   - 真故障（没配 Key、模型调用失败）走 error，以 error 消息提示。
 // 把「没有可压缩的内容」渲染成红色报错是误导 —— 用户会以为功能坏了。
 export async function compactSession(hostId, sessionId) {
+  // 无主机守卫：同 clearSession，兜住绕过组件按钮的调用方。
+  if (!hostId) {
+    push({ kind: 'error', content: t('msg.pickHost') })
+    return
+  }
   if (store.compacting) return
   store.compacting = true
   try {
     const res = await api().CompactSession(hostId, sessionId)
     // 后端已经把话说全了（含被拒绝的原因），照搬即可 ——
     // 在前端重写一遍措辞，两处迟早会漂移。
-    push({ kind: 'system', content: (res && res.message) || '压缩完成。' }, hostId, sessionId)
+    push({ kind: 'system', content: (res && res.message) || t('msg.compactDone') }, hostId, sessionId)
   } catch (e) {
     push({
       kind: 'error',
-      content: `压缩上下文失败：${e && e.message ? e.message : e}。原历史未被改动。`
+      content: t('msg.compactFail', { err: e && e.message ? e.message : e })
     }, hostId, sessionId)
   } finally {
     store.compacting = false
@@ -581,18 +662,18 @@ export function selectSession(sessionId) {
 export async function createSession(name) {
   const hostId = store.currentHostId
   if (!hostId) {
-    push({ kind: 'error', content: '请先选择一台主机。' })
+    push({ kind: 'error', content: t('msg.pickHost') })
     return
   }
   try {
     const info = await api().CreateSession(hostId, name)
     await refreshSessions(hostId)
     store.currentSessionId = info.id
-    push({ kind: 'system', content: `已新建任务「${info.name}」。` }, hostId, info.id)
+    push({ kind: 'system', content: t('msg.taskCreated', { name: info.name }) }, hostId, info.id)
   } catch (e) {
     push({
       kind: 'error',
-      content: `新建任务失败：${e && e.message ? e.message : e}`
+      content: t('msg.taskCreateFail', { err: e && e.message ? e.message : e })
     }, hostId)
   }
 }
@@ -601,17 +682,17 @@ export async function createSession(name) {
 export async function renameSession(sessionId, name) {
   const hostId = store.currentHostId
   if (!hostId) {
-    push({ kind: 'error', content: '请先选择一台主机。' })
+    push({ kind: 'error', content: t('msg.pickHost') })
     return
   }
   try {
     await api().RenameSession(hostId, sessionId, name)
     await refreshSessions(hostId)
-    push({ kind: 'system', content: `任务已改名为「${name}」。` }, hostId, sessionId)
+    push({ kind: 'system', content: t('msg.taskRenamed', { name }) }, hostId, sessionId)
   } catch (e) {
     push({
       kind: 'error',
-      content: `改名失败：${e && e.message ? e.message : e}`
+      content: t('msg.renameFail', { err: e && e.message ? e.message : e })
     }, hostId, sessionId)
   }
 }
@@ -624,7 +705,7 @@ export async function renameSession(sessionId, name) {
 export async function deleteSession(sessionId) {
   const hostId = store.currentHostId
   if (!hostId) {
-    push({ kind: 'error', content: '请先选择一台主机。' })
+    push({ kind: 'error', content: t('msg.pickHost') })
     return
   }
   try {
@@ -634,11 +715,11 @@ export async function deleteSession(sessionId) {
     // 结果相同但意图看不出来。
     if (store.currentSessionId === sessionId) store.currentSessionId = ''
     await refreshSessions(hostId)
-    push({ kind: 'system', content: '已删除该会话。' }, hostId)
+    push({ kind: 'system', content: t('msg.sessionDeleted') }, hostId)
   } catch (e) {
     push({
       kind: 'error',
-      content: `删除会话失败：${e && e.message ? e.message : e}`
+      content: t('msg.deleteSessionFail', { err: e && e.message ? e.message : e })
     }, hostId)
   }
 }
@@ -651,7 +732,7 @@ export async function approve(ok) {  if (!store.pending) return
   try {
     applied = await api().Approve(id, ok)
   } catch (e) {
-    push({ kind: 'error', content: `审批提交失败：${e && e.message ? e.message : e}` })
+    push({ kind: 'error', content: t('msg.approveFail', { err: e && e.message ? e.message : e }) })
     return
   }
 
@@ -660,7 +741,7 @@ export async function approve(ok) {  if (!store.pending) return
   if (!applied) {
     push({
       kind: 'error',
-      content: '这次审批已失效（可能已超时或被中断），Agent 不会执行该命令。'
+      content: t('msg.approvalStale')
     })
     return
   }
@@ -675,7 +756,7 @@ export async function switchProfile(id) {
   try {
     await api().ActivateLLMProfile(id)
   } catch (e) {
-    const msg = `切换模型失败：${e && e.message ? e.message : e}`
+    const msg = t('msg.switchModelFail', { err: e && e.message ? e.message : e })
     push({ kind: 'error', content: msg })
     throw e // 让调用方知道失败，避免外层再推「已切换」的成功提示
   }
@@ -699,9 +780,9 @@ export async function stop() {
     // canceled」画成红字，等于把用户自己的操作报成错误。所以这句回执由
     // 前端补：灰字系统提示，进归档时间线；表面上的可见反馈是
     // 「Working 停止 + 输入提示符回来」（ConsolePanel 的 running watch）。
-    if (wasActive) push({ kind: 'system', content: '已中断本轮任务。' })
+    if (wasActive) push({ kind: 'system', content: t('msg.stopped') })
   } catch (e) {
-    push({ kind: 'error', content: `中断失败：${e && e.message ? e.message : e}` })
+    push({ kind: 'error', content: t('msg.stopFail', { err: e && e.message ? e.message : e }) })
   } finally {
     // 无论后端是否响应，本地都必须回到可交互状态，否则界面会永久卡在「运行中」。
     store.running = false
@@ -761,7 +842,7 @@ export async function runShellInTerminal(hostId, sessionId, command) {
   } catch (e) {
     const msg = String(e && e.message ? e.message : e)
     paint.paintError(surfaceWrite(key), msg)
-    push({ kind: 'error', content: '命令执行失败：' + msg })
+    push({ kind: 'error', content: t('msg.cmdFail', { msg }) })
     return { status: 'error', error: msg }
   } finally {
     store.busy = false
@@ -1033,10 +1114,10 @@ export async function fmUpload(file) {
     const res = await api().UploadRemoteFile(fm.hostId, fm.cwd, file.name, pure)
     if (res && res.ok) {
       fm.progress = { phase: 'done', loaded: file.size, total: file.size, name: file.name }
-      fm.notice = res.message || `已上传 ${file.name}`
+      fm.notice = res.message || t('msg.uploaded', { name: file.name })
       await loadDir(fm.cwd)
     } else {
-      fm.error = (res && res.error) || '上传失败'
+      fm.error = (res && res.error) || t('msg.uploadFail')
     }
   } catch (e) {
     fm.error = String(e && e.message ? e.message : e)
@@ -1069,9 +1150,9 @@ export async function fmDownload(entryPath, name) {
       return
     }
     if (res && res.ok) {
-      fm.notice = res.message ? `已保存到 ${res.message}` : `已下载 ${name || ''}`
+      fm.notice = res.message ? t('msg.savedTo', { path: res.message }) : t('msg.downloaded', { name: name || '' })
     } else {
-      fm.error = (res && res.error) || '下载失败'
+      fm.error = (res && res.error) || t('msg.downloadFail')
     }
   } catch (e) {
     fm.error = String(e && e.message ? e.message : e)
@@ -1147,7 +1228,7 @@ function fileToBase64Paced(file, onProgress) {
 
       // onloadend 同时覆盖成功与失败：少写一个分支就少一处忘记推进的地方。
       // 真失败时 fr.result 为空、fr.error 非空。
-      fr.onerror = () => reject(fr.error || new Error('读取本地文件失败'))
+      fr.onerror = () => reject(fr.error || new Error(t('msg.readFileFail')))
       fr.onload = () => {
         const buf = fr.result
         if (!buf) {
@@ -1197,7 +1278,7 @@ export async function writeTerminal(hostId, sessionId, dataB64) {
     const st = store.terms[bucketKey(hostId, sessionId)]
     const knownGone = !!st && (st.status === 'closed' || st.status === 'idle' || st.status === 'error')
     if (!knownGone || !/没有打开|已关闭/.test(msg)) {
-      push({ kind: 'error', content: '终端输入失败：' + msg })
+      push({ kind: 'error', content: t('msg.termInputFail', { msg }) })
     }
   }
 }

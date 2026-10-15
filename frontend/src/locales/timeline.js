@@ -1,0 +1,50 @@
+// locales/timeline.js —— 会话时间线渲染（termPaint.js）画进 xterm 的文案。
+//
+// 这些字符串带 ANSI 样式拼接进终端流；英文翻译刻意保持短行风格，避免在窄
+// 终端里折行错位。宽度计算（displayCols）发生在 t() 结果上，天然正确。
+export const timeline = {
+  zh: {
+    'tl.clip.trimmed': '…（输出过长已截断，完整内容见归档）',
+    'tl.decision.allow': '自动放行',
+    'tl.decision.confirm': '需确认',
+    'tl.decision.deny': '硬拒绝',
+    'tl.tool.fallback': '工具',
+    'tl.tool.tty': '需要交互式终端，已交接到这片终端表面执行（画面不进模型上下文）',
+    'tl.tool.done': '完成',
+    'tl.tool.fail': '失败（码 {code}）',
+    'tl.tool.redacted': ' · 已脱敏 {n} 处',
+    'tl.approval': '需要你的批准：',
+    'tl.error': '错误',
+    'tl.injection': '远端输出中检测到疑似提示注入：{findings}（已标记为不可信）',
+    'tl.snapshot.final': '终端结束画面已进归档与模型上下文。',
+    'tl.snapshot.live': '终端屏幕快照已进归档与模型上下文。',
+    'tl.shell.denied': '命令被策略拒绝：{reason}',
+    'tl.shell.error': '命令执行失败：{err}',
+    'tl.shell.missing': '远端未找到该命令。',
+    'tl.shell.notRun': '命令未执行（{st}）。',
+    'tl.llmHint': '提示：这段输出可交给 LLM 分析。',
+    'tl.welcomeHint': '可以直接用自然语言提需求（中文或 ? 开头交给 LLM）'
+  },
+  en: {
+    'tl.clip.trimmed': '… (output truncated — full text in the archive)',
+    'tl.decision.allow': 'auto-approved',
+    'tl.decision.confirm': 'needs approval',
+    'tl.decision.deny': 'hard-denied',
+    'tl.tool.fallback': 'Tool',
+    'tl.tool.tty': 'interactive terminal required — handed over to this surface (screen stays out of the model context)',
+    'tl.tool.done': 'done',
+    'tl.tool.fail': 'failed (code {code})',
+    'tl.tool.redacted': ' · {n} redacted',
+    'tl.approval': 'Your approval is required: ',
+    'tl.error': 'Error',
+    'tl.injection': 'Possible prompt injection detected in remote output: {findings} (marked untrusted)',
+    'tl.snapshot.final': 'Final terminal screen archived and sent to the model context.',
+    'tl.snapshot.live': 'Terminal screen snapshot archived and sent to the model context.',
+    'tl.shell.denied': 'Command denied by policy: {reason}',
+    'tl.shell.error': 'Command failed: {err}',
+    'tl.shell.missing': 'Command not found on the remote host.',
+    'tl.shell.notRun': 'Command not executed ({st}).',
+    'tl.llmHint': 'Tip: hand this output to the LLM for analysis.',
+    'tl.welcomeHint': 'Type requests in plain language (start with ? to ask the LLM)'
+  }
+}

@@ -330,13 +330,25 @@ describe('常驻终端表面 建立会话', () => {
     expect(callsOf('OpenTerminal').map(c => c.args[0])).toEqual(['h1', 'h2', 'h1'])
   })
 
-  it('没选主机时不去开终端，给出提示', async () => {
+  it('没选主机时不去开终端，显示功能介绍欢迎页', async () => {
     setup()
     await attached()
 
     expect(callsOf('OpenTerminal')).toHaveLength(0)
     expect(instances).toHaveLength(0)
-    expect(wrapper.text()).toContain('请先选择一台主机')
+    // 空态已升级为欢迎页。测试环境没有主机 → 「新建任务」禁用并提示去加主机。
+    expect(wrapper.text()).toContain('欢迎使用 Ai-Shell')
+    // 模型已配置（llmReady=true），缺的是主机 → title 指向「主机管理」。
+    store.llmProfiles = [{ id: 'p1', name: 'deepseek', active: true }]
+    await nextTick()
+    // 三个快捷入口按钮在位（模型 → 主机 → 新建任务）。
+    const acts = wrapper.findAll('.welcome-btn')
+    expect(acts.map(b => b.text())).toEqual(['LLM 设置', '主机管理', '＋ 新建任务'])
+    expect(acts[2].attributes('disabled')).toBeDefined()
+    expect(acts[2].attributes('title')).toContain('主机')
+    // 风险说明的钉子（从原横幅用例迁来）：三条路径与硬拒绝边界必须在欢迎页写明。
+    expect(wrapper.text()).toContain('自然语言交给 LLM')
+    expect(wrapper.text()).toContain('硬拒绝')
   })
 })
 
@@ -670,18 +682,18 @@ describe('常驻终端表面 退出与关闭', () => {
 // ---- 界面必须说清楚风险 ----
 
 describe('常驻终端表面 风险提示', () => {
-  it('显眼处写明终端内输入的分流与硬拒绝边界', async () => {
+  it('连上后横幅只留关闭终端入口；风险说明由欢迎页承担（见欢迎页用例）', async () => {
     withHost()
     setup()
     await attached()
 
     const banner = wrapper.find('.sess-banner')
     expect(banner.exists()).toBe(true)
-    // 输入已整体搬进终端：中文/? 交 LLM，shell 以你的身份直接执行、仅硬拒绝不可逆操作。
-    expect(banner.text()).toContain('交给')
-    expect(banner.text()).toContain('硬拒绝')
-    // 连到哪台机器也要写在旁边：终端一旦开起来就再没有别的提示符可看
-    expect(banner.text()).toContain('root@10.0.0.1')
+    // 能力/风险说明已移至未选主机时的欢迎页，这里不再常驻重复。
+    expect(banner.text()).not.toContain('交给')
+    expect(banner.text()).not.toContain('硬拒绝')
+    // 已连上主机的界面不应出现欢迎页。
+    expect(wrapper.find('.welcome').exists()).toBe(false)
   })
 })
 

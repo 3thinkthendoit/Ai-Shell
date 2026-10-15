@@ -1,8 +1,9 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
-  store, push, selectSession, renameSession, deleteSession
+  store, push, selectSession, renameSession, deleteSession, refreshAllSessionLists
 } from '../store'
+import { t } from '../i18n'
 
 // 侧边栏的会话区（参考 WorkBuddy 的任务列表交互）：
 // 列表常驻侧边栏，条目上的「…」按钮悬停才出现，点开才有「重命名 / 删除」。
@@ -10,6 +11,45 @@ import {
 const emit = defineEmits(['open'])
 
 const sessions = computed(() => store.currentSessions || [])
+
+// ---- 按主机分组的任务视图（未选主机时的欢迎态） ----
+//
+// 没选主机时不再只是干巴巴一句提示，而是把每台主机的任务分组列出来：
+// 点组头进入该主机，点组内任务直达那条会话。重命名/删除只对当前主机
+// 有意义（store 的会话操作都以 currentHostId 为准），分组视图里不提供。
+const groups = computed(() =>
+  store.hosts.map(h => ({
+    host: h,
+    list: store.sessions[h.id] || []
+  }))
+)
+
+// 分组里的任务名用短名：组头已经标明主机，默认任务不必再拼一遍
+// 「主机名 (user@addr)」，否则窄侧栏里全是重复信息。
+function shortLabel(s) {
+  const base = s.name || (s.isDefault ? t('ss.defaultTask') : t('console.unnamed'))
+  return s.turns > 0 ? base + t('ss.turns', { n: s.turns }) : base
+}
+
+function enterHost(hostId) {
+  store.currentHostId = hostId
+  emit('open')
+}
+
+async function enterSession(hostId, s) {
+  store.pendingSessionId = s.id
+  store.currentHostId = hostId
+  emit('open')
+}
+
+// 分组视图的数据源是全部主机的会话列表。已选主机时当前主机的列表由
+// 切换流程维护，其它主机也要拉一次才能显示；主机集合变化（增删）时重拉。
+// 只读填充、不碰选中状态（见 refreshAllSessionLists）。
+watch(
+  () => store.hosts.map(h => h.id).join('\n'),
+  () => { refreshAllSessionLists() },
+  { immediate: true }
+)
 
 // 默认任务没有自己的名字：用「主机名 (user@addr)」顶替，
 // 不同节点的默认任务在列表里一眼可分（否则每台机器都叫「默认任务」）。
@@ -21,11 +61,11 @@ function label(s) {
     base = s.name
   } else if (s.isDefault) {
     const h = hostOf(store.currentHostId)
-    base = h ? `${h.name} (${h.user}@${h.addr})` : '默认任务'
+    base = h ? `${h.name} (${h.user}@${h.addr})` : t('ss.defaultTask')
   } else {
-    base = '未命名任务'
+    base = t('console.unnamed')
   }
-  return s.turns > 0 ? `${base}（${s.turns} 轮）` : base
+  return s.turns > 0 ? base + t('ss.turns', { n: s.turns }) : base
 }
 
 function open(s) {
@@ -93,15 +133,16 @@ const collapsed = ref(false)
 // 阈值： <1min 刚刚 · <1h N分钟前 · <24h N小时前 · <30d N天前 · 更旧显示日期。
 function timeAgo(iso) {
   if (!iso) return ''
-  const t = new Date(iso).getTime()
-  if (Number.isNaN(t)) return ''
-  const diff = Date.now() - t
-  if (diff < 60_000) return '刚刚'
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}分钟前`
-  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}小时前`
-  if (diff < 30 * 86_400_000) return `${Math.floor(diff / 86_400_000)}天前`
-  const d = new Date(t)
-  return `${d.getMonth() + 1}月${d.getDate()}日`
+  // 局部变量不能叫 t —— 它会遮蔽 i18n 的翻译函数 t()。
+  const ts = new Date(iso).getTime()
+  if (Number.isNaN(ts)) return ''
+  const diff = Date.now() - ts
+  if (diff < 60_000) return t('ss.time.justNow')
+  if (diff < 3_600_000) return t('ss.time.min', { n: Math.floor(diff / 60_000) })
+  if (diff < 86_400_000) return t('ss.time.hour', { n: Math.floor(diff / 3_600_000) })
+  if (diff < 30 * 86_400_000) return t('ss.time.day', { n: Math.floor(diff / 86_400_000) })
+  const d = new Date(ts)
+  return t('ss.time.date', { m: d.getMonth() + 1, d: d.getDate() })
 }
 
 onMounted(() => document.addEventListener('mousedown', onDocMousedown))
@@ -115,7 +156,7 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocMousedown))
       :aria-expanded="!collapsed"
       @click="collapsed = !collapsed"
     >
-      <span>任务 ({{ sessions.length }})</span>
+      <span>{{ t('ss.head', { n: sessions.length }) }}</span>
       <svg class="ssb-caret" :class="{ open: !collapsed }" width="9" height="6" viewBox="0 0 10 6" aria-hidden="true">
         <path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.5"
               stroke-linecap="round" stroke-linejoin="round" />
@@ -123,8 +164,28 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocMousedown))
     </button>
 
     <template v-if="!collapsed">
-      <div v-if="!store.currentHostId" class="ssb-empty">选择主机后在这里管理任务。</div>
-      <div v-else-if="!sessions.length" class="ssb-empty">暂无任务。</div>
+      <!-- 未选主机：按主机分组列出全部任务，点组头/任务可直接进入。 -->
+      <template v-if="!store.currentHostId">
+        <div v-if="!groups.length" class="ssb-empty">{{ t('ss.empty.none') }}</div>
+        <div v-for="g in groups" :key="g.host.id" class="ssb-group">
+          <button class="ssb-group-head" :title="t('ss.enterHost')" @click="enterHost(g.host.id)">
+            <span class="ssb-group-name">{{ g.host.name }}</span>
+            <span class="ssb-group-meta mono">{{ g.host.user }}@{{ g.host.addr }}</span>
+            <span class="ssb-group-count">{{ g.list.length }}</span>
+          </button>
+          <div
+            v-for="s in g.list"
+            :key="s.id"
+            class="ssb-item ssb-item-nested"
+            @click="enterSession(g.host.id, s)"
+          >
+            <span class="ssb-name" :title="shortLabel(s)">{{ shortLabel(s) }}</span>
+            <span class="ssb-time" :title="s.updatedAt">{{ timeAgo(s.updatedAt) }}</span>
+          </div>
+        </div>
+      </template>
+      <template v-else>
+      <div v-if="!sessions.length" class="ssb-empty">{{ t('ss.empty.none') }}</div>
 
       <div
         v-for="s in sessions"
@@ -140,34 +201,35 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocMousedown))
           v-if="!s.isDefault"
           class="ssb-more"
           :aria-expanded="menuFor === s.id"
-          title="更多操作"
+          :title="t('ss.more')"
           @click.stop="toggleMenu(s)"
         >⋯</button>
 
         <div v-if="menuFor === s.id" class="ssb-menu" @click.stop>
-          <button @click="startRename(s)">重命名</button>
+          <button @click="startRename(s)">{{ t('ss.rename') }}</button>
           <button
             class="ssb-menu-danger"
             @click="askDelete(s)"
-          >删除</button>
+          >{{ t('ss.delete') }}</button>
         </div>
       </div>
+      </template>
 
       <!-- 重命名弹窗（应用内，与新建/删除同形式） -->
       <div v-if="renaming" class="overlay" @click.self="renaming = null">
         <div class="modal">
-          <h3>重命名任务</h3>
+          <h3>{{ t('ss.renameTitle') }}</h3>
           <input
             ref="renameEl"
             v-model="renameVal"
-            placeholder="任务名称"
+            :placeholder="t('ss.namePh')"
             @keydown.enter.prevent="commitRename"
             @keydown.esc.prevent="renaming = null"
           />
-          <div class="modal-hint">Enter 确定 · Esc 取消</div>
+          <div class="modal-hint">{{ t('ss.enterEsc') }}</div>
           <div class="modal-actions">
-            <button class="sm" @click="renaming = null">取消</button>
-            <button class="sm primary" @click="commitRename">确定</button>
+            <button class="sm" @click="renaming = null">{{ t('ss.cancel') }}</button>
+            <button class="sm primary" @click="commitRename">{{ t('ss.confirm') }}</button>
           </div>
         </div>
       </div>
@@ -175,14 +237,13 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocMousedown))
 
     <div v-if="deleting" class="overlay" @click.self="deleting = null">
       <div class="modal">
-        <h3>删除任务</h3>
+        <h3>{{ t('ss.deleteTitle') }}</h3>
         <p>
-          确认删除「<b>{{ label(deleting) }}</b>」？
-          该任务的上下文会被永久丢弃，此操作不可撤销。
+          {{ t('ss.delete.p1') }}<b>{{ label(deleting) }}</b>{{ t('ss.delete.p2') }}
         </p>
         <div class="modal-actions">
-          <button class="sm" @click="deleting = null">取消</button>
-          <button class="sm danger" @click="confirmDelete">确认删除</button>
+          <button class="sm" @click="deleting = null">{{ t('ss.cancel') }}</button>
+          <button class="sm danger" @click="confirmDelete">{{ t('ss.deleteBtn') }}</button>
         </div>
       </div>
     </div>
@@ -221,6 +282,54 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocMousedown))
   padding: 6px 10px;
   line-height: 1.6;
 }
+
+/* 分组视图（未选主机）：主机名当组头，组内任务缩进一级。 */
+.ssb-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 6px;
+}
+.ssb-group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: none;
+  background: transparent;
+  text-align: left;
+  padding: 5px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  min-height: 0;
+  color: var(--text-2);
+}
+.ssb-group-head:hover { background: var(--hover-overlay); color: var(--text); }
+.ssb-group-name {
+  font-size: 12px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ssb-group-meta {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+.ssb-group-count {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  color: var(--text-3);
+  background: var(--surface-2);
+  border-radius: 8px;
+  padding: 0 6px;
+  line-height: 16px;
+}
+.ssb-item-nested { margin-left: 12px; }
 
 .ssb-item {
   position: relative;

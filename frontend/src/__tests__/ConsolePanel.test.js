@@ -10,7 +10,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import { nextTick } from 'vue'
 import ConsolePanel from '../components/ConsolePanel.vue'
-import { store, push, textToBase64, bindEvents, writeTerminal, isPtyDirty, ask } from '../store.js'
+import { store, push, textToBase64, bindEvents, writeTerminal, isPtyDirty, ask, clearSession, compactSession } from '../store.js'
 import { instances, resetInstances } from './stubs/xterm.js'
 
 // ---- Wails 运行时与后端替身 ----
@@ -100,6 +100,9 @@ let rt
 let wrapper
 
 function setup(impl) {
+  // 默认带一台已选中主机：绝大多数用例测的是「已连接」形态（工具条/composer
+  // 只在选中主机后渲染）。测无主机空态的用例须显式清空（见空状态 describe）。
+  withHost()
   const made = makeApp(impl)
   calls = made.calls
   window.go = { main: { App: made.app } }
@@ -107,6 +110,13 @@ function setup(impl) {
   bindEvents()
   wrapper = mount(ConsolePanel, { attachTo: document.body })
   return wrapper
+}
+
+// 无主机场景：清掉 setup 默认放进去的主机，让欢迎页（而非工具条）可见。
+function withoutHost() {
+  store.hosts = []
+  store.currentHostId = ''
+  store.currentSessionId = ''
 }
 
 function withHost() {
@@ -157,9 +167,19 @@ afterEach(() => {
 })
 
 describe('ConsolePanel 空状态与主机选择', () => {
-  it('没有主机时提示先去主机管理添加', () => {
+  it('没有主机时显示欢迎页并引导去主机管理添加，工具条与 composer 隐藏', async () => {
     setup()
-    expect(wrapper.text()).toContain('暂无主机')
+    withoutHost()
+    await nextTick()
+    expect(wrapper.find('.welcome').exists()).toBe(true)
+    // 欢迎页带三个快捷入口（模型 → 主机 → 新建任务）。本用例无模型无主机：
+    // 新建任务禁用，缺失原因写在 title 上（text() 取不到 title，须查属性）。
+    const wbtns = wrapper.findAll('.welcome-btn')
+    expect(wbtns.length).toBe(3)
+    expect(wbtns[2].attributes('disabled')).toBeDefined()
+    expect(wbtns[2].attributes('title')).toContain('LLM')
+    expect(wrapper.find('.bar').exists()).toBe(false)
+    expect(wrapper.find('.composer-bar').exists()).toBe(false)
   })
 
   it('已有主机时列出「名称 — user@addr」', () => {
@@ -169,14 +189,23 @@ describe('ConsolePanel 空状态与主机选择', () => {
     expect(wrapper.text()).toContain('root@10.0.0.1')
   })
 
-  it('分段按钮是「终端 / 对话归档」，能力横幅标明直接运行不审批与 LLM', () => {
+  it('未选主机时欢迎页可见；选中后分段按钮是「终端 / 对话归档」', async () => {
     setup()
+    withoutHost()
+    await nextTick()
+    // 能力/风险说明已移至欢迎页（未选主机 → 欢迎页可见，横幅不存在）。
+    expect(wrapper.find('.welcome').exists()).toBe(true)
+    expect(wrapper.find('.sess-banner').exists()).toBe(false)
+
+    // 用户选中主机：工具条出现，分段按钮就位，欢迎页退场。
+    store.hosts = [{ id: 'h1', name: 'web', user: 'root', addr: '10.0.0.1' }]
+    store.currentHostId = 'h1'
+    await flushPromises()
+    await nextTick()
     const segs = wrapper.findAll('.seg button')
     expect(segs[0].text()).toBe('终端')
     expect(segs[1].text()).toBe('对话归档')
-    // 控制台命令不再审批：横幅应诚实说明「以你的身份直接运行、仅硬拒绝不可逆操作」。
-    expect(wrapper.find('.sess-banner').text()).toMatch(/硬拒绝/)
-    expect(wrapper.find('.sess-banner').text()).toMatch(/LLM/)
+    expect(wrapper.find('.welcome').exists()).toBe(false)
   })
 })
 
@@ -1118,10 +1147,10 @@ describe('ConsolePanel 清空会话上下文', () => {
   })
 
   it('没选主机时不打后端，给出提示', async () => {
-    store.hosts = []
-    store.currentHostId = ''
+    // composer 在未选主机时整体隐藏，按钮路径不可达；守卫本身仍值得钉住。
     setup({ ClearSession: async () => ({ cleared: 1, busy: false }) })
-    await ctxBtn('清空上下文').trigger('click')
+    withoutHost()
+    clearSession()
     await flushPromises()
 
     expect(calls.filter(c => c.name === 'ClearSession')).toHaveLength(0)
@@ -1229,10 +1258,10 @@ describe('ConsolePanel 压缩会话上下文', () => {
   })
 
   it('没选主机时不打后端，给出提示', async () => {
-    store.hosts = []
-    store.currentHostId = ''
+    // 同「清空上下文」：UI 路径已随 composer 隐藏，直接钉 store 层守卫。
     setup({ CompactSession: async () => ({ compacted: true }) })
-    await ctxBtn('压缩上下文').trigger('click')
+    withoutHost()
+    compactSession()
     await flushPromises()
 
     expect(calls.filter(c => c.name === 'CompactSession')).toHaveLength(0)
@@ -1288,7 +1317,6 @@ describe('ConsolePanel 上下文存放说明', () => {
     const text = wrapper.find('.console').text()
     expect(text, '会话已经落盘了，不能再声称重启即清空').not.toContain('重启应用即清空')
     expect(text).not.toContain('只存在内存')
-    expect(wrapper.find('.sess-banner').text()).toMatch(/硬拒绝|不经审批/)
   })
 })
 

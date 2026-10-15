@@ -37,6 +37,7 @@ function resetStore() {
   store.bySession = {}
   store.sessions = {}
   store.currentSessionId = ''
+  store.pendingSessionId = ''
   store.activeHostId = ''
   store.activeSessionId = ''
   store.pending = null
@@ -215,13 +216,63 @@ describe('SessionsSidebar 会话列表', () => {
 
   // 新建入口在控制台顶栏（ConsolePanel.test.js 覆盖），
   // 侧边栏只负责列表与重命名/删除。
-  it('没选主机时给出提示', () => {
+  it('没选主机也没有主机时，提示暂无任务', () => {
     store.hosts = []
     store.currentHostId = ''
     store.currentSessionId = ''
     store.sessions = {}
     mountSidebar({})
 
-    expect(wrapper.text()).toContain('选择主机')
+    expect(wrapper.text()).toContain('暂无任务')
+  })
+
+  // ---- 分组视图（未选主机时的欢迎态） ----
+
+  describe('按主机分组的任务', () => {
+    const HOSTS = [
+      { id: 'h1', name: 'web', user: 'root', addr: '10.0.0.1' },
+      { id: 'h2', name: 'db', user: 'ubuntu', addr: '10.0.0.2' }
+    ]
+
+    function mountGroups() {
+      store.hosts = HOSTS.map(h => ({ ...h }))
+      store.currentHostId = ''
+      store.sessions = {
+        h1: copy(),
+        h2: [{ id: 'g9', name: '备份迁移', turns: 2, archivedTurns: 0, isDefault: false }]
+      }
+      return mountSidebar({})
+    }
+
+    it('按主机分组列出全部任务，组头带地址与数量', () => {
+      mountGroups()
+      const heads = wrapper.findAll('.ssb-group-head')
+      expect(heads).toHaveLength(2)
+      expect(heads[0].text()).toContain('web')
+      expect(heads[0].text()).toContain('root@10.0.0.1')
+      expect(heads[0].text()).toContain('3')
+      expect(heads[1].text()).toContain('db')
+      expect(heads[1].text()).toContain('1')
+      // 组内任务用短名：默认任务不再拼「主机名 (user@addr)」（组头已有）。
+      const nested = wrapper.findAll('.ssb-item-nested')
+      expect(nested).toHaveLength(4)
+      expect(nested[0].text()).toContain('默认任务')
+      expect(nested[3].text()).toContain('备份迁移')
+    })
+
+    it('点组头进入该主机', async () => {
+      mountGroups()
+      await wrapper.findAll('.ssb-group-head')[1].trigger('click')
+      expect(store.currentHostId).toBe('h2')
+      expect(store.pendingSessionId).toBe('')
+    })
+
+    it('点组内任务直达那条会话：先记意图再切主机', async () => {
+      mountGroups()
+      const target = wrapper.findAll('.ssb-item-nested')[3]
+      await target.trigger('click')
+      expect(store.currentHostId).toBe('h2')
+      expect(store.pendingSessionId).toBe('g9')
+    })
   })
 })

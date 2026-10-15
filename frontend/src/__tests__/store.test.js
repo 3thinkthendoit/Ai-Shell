@@ -778,6 +778,22 @@ describe('bootstrap 初始化', () => {
     await bootstrap()
     expect(store.currentHostId).toBe('h2')
   })
+
+  it('多台主机时启动不自动选中 —— 连接必须由用户挑主机触发（防误连）', async () => {
+    const { app } = makeApp({
+      Bootstrap: async () => ({
+        error: '',
+        posture: {},
+        hosts: [{ id: 'h1', name: 'a' }, { id: 'h2', name: 'b' }],
+        llm: {}, policy: {}
+      })
+    })
+    install({ runtime: rt, app })
+    await bootstrap()
+    // 不猜：选错的主机会被立即建立 SSH 连接，而用户启动后未必先用终端。
+    expect(store.currentHostId).toBe('')
+    expect(store.ready).toBe(true)
+  })
 })
 
 describe('refreshHosts 刷新主机', () => {

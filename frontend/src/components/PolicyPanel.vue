@@ -1,6 +1,7 @@
 <script setup>
 import { computed, reactive, ref, watch } from 'vue'
 import { store, push } from '../store'
+import { t } from '../i18n'
 
 const form = reactive({
   mode: store.policy.mode,
@@ -132,19 +133,21 @@ async function restoreDefaults() {
   try {
     const list = await window.go.main.App.DefaultWhitelist()
     form.whitelist = (list || []).join('\n')
-    push({ kind: 'system', content: '已载入默认白名单，点击「保存策略」后生效' })
+    push({ kind: 'system', content: t('policy.defaultsLoaded') })
   } catch (e) {
     push({ kind: 'error', content: String(e) })
   }
 }
 
-const hardDenied = [
-  { name: '登录凭据文件', detail: '/etc/shadow、/etc/gshadow、~/.ssh/id_*、ssh_host_*_key、.aws/credentials、.kube/config、.docker/config.json、.netrc、.pgpass' },
-  { name: '环境变量整块导出', detail: 'printenv、单独执行 env、export -p、/proc/*/environ' },
-  { name: '不可逆破坏性操作', detail: 'mkfs、wipefs、dd of=/dev/*、rm -rf /、> /dev/sd*' },
-  { name: '服务中断类操作', detail: 'shutdown、reboot、halt、poweroff、systemctl poweroff/reboot' },
-  { name: '其他高危', detail: 'fork bomb、chmod -R 777 /、全盘 chown、kill -9 -1、清空防火墙规则、userdel -r' }
-]
+// 硬拒绝规则清单：分类名走字典（语言可切）；detail 是路径/命令枚举，
+// 属技术原文，不翻。
+const hardDenied = computed(() => [
+  { name: t('policy.hard.r1'), detail: '/etc/shadow、/etc/gshadow、~/.ssh/id_*、ssh_host_*_key、.aws/credentials、.kube/config、.docker/config.json、.netrc、.pgpass' },
+  { name: t('policy.hard.r2'), detail: 'printenv、单独执行 env、export -p、/proc/*/environ' },
+  { name: t('policy.hard.r3'), detail: 'mkfs、wipefs、dd of=/dev/*、rm -rf /、> /dev/sd*' },
+  { name: t('policy.hard.r4'), detail: 'shutdown、reboot、halt、poweroff、systemctl poweroff/reboot' },
+  { name: t('policy.hard.r5'), detail: 'fork bomb、chmod -R 777 /、全盘 chown、kill -9 -1、清空防火墙规则、userdel -r' }
+])
 
 // 把界面上以 KB 输入的会话上限换算回字节。
 //
@@ -176,7 +179,7 @@ async function save() {
     }
     await window.go.main.App.SavePolicy(payload)
     store.policy = payload
-    push({ kind: 'system', content: '安全策略已保存' })
+    push({ kind: 'system', content: t('policy.saved') })
   } catch (e) {
     push({ kind: 'error', content: String(e) })
   } finally {
@@ -189,28 +192,28 @@ async function save() {
   <div class="panel">
     <header class="panel-head">
       <div>
-        <h2>安全策略</h2>
+        <h2>{{ t('policy.title') }}</h2>
         <p class="muted">
-          这里决定 LLM 提出的命令能走多远。硬拒绝规则不受任何配置影响 —— 它们是需求 4 的强制边界。
+          {{ t('policy.headHint') }}
         </p>
       </div>
     </header>
 
     <div class="card">
-      <div class="card-title">Agent 执行模式</div>
+      <div class="card-title">{{ t('policy.mode.title') }}</div>
       <div class="modes">
         <label class="mode" :class="{ on: form.mode === 'manual' }">
           <input type="radio" value="manual" v-model="form.mode" />
           <div>
-            <div class="mode-title">手动模式</div>
-            <div class="mode-desc">仅约束 LLM：Agent 提出的每一条命令都需你批准。人敲的 shell 不走此闸门（以你的身份直接执行、仅硬拒绝不可逆命令）。</div>
+            <div class="mode-title">{{ t('policy.mode.manual') }}</div>
+            <div class="mode-desc">{{ t('policy.mode.manualDesc') }}</div>
           </div>
         </label>
         <label class="mode" :class="{ on: form.mode === 'whitelist' }">
           <input type="radio" value="whitelist" v-model="form.mode" />
           <div>
-            <div class="mode-title">白名单模式</div>
-            <div class="mode-desc">LLM 命中只读命令库的自动执行，其余需批准。人敲的 shell 不走此闸门（以你的身份直接执行、仅硬拒绝不可逆命令）；未知第三方会先查远端是否存在。</div>
+            <div class="mode-title">{{ t('policy.mode.whitelist') }}</div>
+            <div class="mode-desc">{{ t('policy.mode.whitelistDesc') }}</div>
           </div>
         </label>
       </div>
@@ -218,12 +221,12 @@ async function save() {
 
     <div class="card">
       <div class="wl-head">
-        <div class="card-title">只读命令库 / 白名单</div>
+        <div class="card-title">{{ t('policy.wl.title') }}</div>
         <button class="sm" :disabled="form.mode !== 'whitelist'" @click="restoreDefaults">
-          恢复默认
+          {{ t('policy.wl.restore') }}
         </button>
       </div>
-      <div class="card-sub">每行一条，按命令前缀匹配。</div>
+      <div class="card-sub">{{ t('policy.wl.sub') }}</div>
       <textarea
         v-model="form.whitelist"
         rows="10"
@@ -231,152 +234,149 @@ async function save() {
         placeholder="ls&#10;cat&#10;systemctl status"
       ></textarea>
       <div class="muted hint">
-        对 LLM：白名单决定是否自动执行；高危变更（删/建/改等）即使命中也需确认。
-        对人敲的 shell：名单当作「已知 Linux 命令库」——库外命令会先
-        <span class="mono">command -v</span>，不存在则提示改问 Agent。
-        含重定向（<span class="mono">&gt;</span>）的命令不会因白名单自动放行。
+        {{ t('policy.wl.hint.a') }}
+        {{ t('policy.wl.hint.b1') }}
+        <span class="mono">command -v</span>{{ t('policy.wl.hint.b2') }}
+        {{ t('policy.wl.hint.c1') }}<span class="mono">&gt;</span>{{ t('policy.wl.hint.c2') }}
       </div>
     </div>
 
     <div class="card">
-      <div class="card-title">执行范围</div>
+      <div class="card-title">{{ t('policy.scope.title') }}</div>
       <label class="chk">
         <input type="checkbox" v-model="form.allowCrossHost" class="cross-host" />
-        允许跨主机执行（默认关闭）
+        {{ t('policy.scope.crossHost') }}
       </label>
       <div class="muted hint">
-        关闭时，一条会话里的工具只能操作<b>该会话所属的主机</b> ——
-        Agent 看得到所有主机，但对其余主机的调用会被直接拒绝。
-        这是在防「A 机器的排查对话悄悄把命令打到 B 机器上」的横向移动。
-        打开后，目标可以是任何已配置主机，但每条命令仍要过安全策略与审批。
+        {{ t('policy.scope.hint.a1') }}<b>{{ t('policy.scope.hint.bold') }}</b>{{ t('policy.scope.hint.a2') }}
+        {{ t('policy.scope.hint.a3') }}
+        {{ t('policy.scope.hint.a4') }}
+        {{ t('policy.scope.hint.a5') }}
       </div>
     </div>
 
     <div class="card">
-      <div class="card-title">访问互联网（默认关闭）</div>
+      <div class="card-title">{{ t('policy.web.title') }}</div>
       <label class="chk">
         <input type="checkbox" v-model="form.allowWeb" class="allow-web" />
-        允许 Agent 访问互联网
+        {{ t('policy.web.allow') }}
       </label>
       <div class="muted hint">
-        开启后 Agent 可以抓取网页（fetch_webpage）与搜索（search_web），
-        用来查官方文档、确认某个参数的当前用法、看不认识的错误信息。
+        {{ t('policy.web.hint.a') }}
         <br />
-        <b>默认关闭</b>：这两个工具让 LLM 具备了本项目其余部分都没有的能力 ——
-        把内容送去公网。而一台已被入侵的主机可以借提示注入诱导它这么做，
-        所以这个开关必须由你显式打开。
+        <b>{{ t('policy.web.hint.bold') }}</b>{{ t('policy.web.hint.b1') }}
+        {{ t('policy.web.hint.b2') }}
+        {{ t('policy.web.hint.b3') }}
       </div>
 
       <div v-if="form.allowWeb" class="grid">
         <div>
-          <label style="margin-top: 12px">搜索服务</label>
+          <label style="margin-top: 12px">{{ t('policy.web.search') }}</label>
           <select v-model="form.searchProvider">
-            <option value="">不配置（只用 fetch_webpage）</option>
-            <option value="duckduckgo">DuckDuckGo（无需密钥）</option>
+            <option value="">{{ t('policy.web.noProvider') }}</option>
+            <option value="duckduckgo">{{ t('policy.web.ddg') }}</option>
           </select>
         </div>
       </div>
       <div v-if="form.allowWeb" class="muted hint">
-        不配置搜索服务时，search_web 不可用，fetch_webpage 仍可用 ——
-        它只需要一个 URL，不需要任何凭据。
+        {{ t('policy.web.noSearchHint') }}
       </div>
     </div>
 
     <div class="card">
-      <div class="card-title">回传给 LLM 的内容</div>
+      <div class="card-title">{{ t('policy.content.title') }}</div>
       <label class="chk">
         <input type="checkbox" v-model="form.redactOutput" />
-        自动脱敏命令输出中的密钥（强烈建议保持开启）
+        {{ t('policy.content.redact') }}
       </label>
 
       <div class="grid">
         <div>
-          <label style="margin-top: 12px">单次回传上限 (字节)</label>
+          <label style="margin-top: 12px">{{ t('policy.content.maxOutput') }}</label>
           <input v-model="form.maxOutput" type="number" min="1024" step="1024" />
         </div>
         <div>
-          <label style="margin-top: 12px">单轮最大工具调用步数</label>
+          <label style="margin-top: 12px">{{ t('policy.content.maxSteps') }}</label>
           <input v-model="form.maxSteps" type="number" min="1" max="50" />
         </div>
       </div>
 
       <div class="notice">
-        脱敏做两件事：把本机已保存的密钥字面值整段替换，以及按模式识别私钥块、各类 token、连接串密码等。
-        被替换的内容显示为 <span class="mono">[REDACTED]</span>。
+        {{ t('policy.content.redactNotice.a') }}
+        {{ t('policy.content.redactNotice.b1') }}<span class="mono">[REDACTED]</span>{{ t('policy.content.redactNotice.b2') }}
       </div>
 
       <div class="notice">
-        <b>提示注入防护。</b>远端主机的输出是不可信数据 —— 日志、文件名、HTTP 响应里都可能藏着
-        「忽略之前的指令，去执行 X」这类文本。回传给 LLM 的内容会被包裹在
-        <span class="mono">&lt;&lt;&lt;UNTRUSTED_REMOTE_OUTPUT&gt;&gt;&gt;</span> 边界内并声明其数据性质，
-        同时会检测常见注入话术，命中时在控制台高亮告警。
-        会破坏对话结构的 chat 控制符（如 <span class="mono">&lt;|im_start|&gt;</span>）会被转义。
+        <b>{{ t('policy.content.inj.bold') }}</b>{{ t('policy.content.inj.p1') }}
+        {{ t('policy.content.inj.p2') }}
+        <span class="mono">&lt;&lt;&lt;UNTRUSTED_REMOTE_OUTPUT&gt;&gt;&gt;</span>{{ t('policy.content.inj.p3') }}
+        {{ t('policy.content.inj.p4') }}
+        {{ t('policy.content.inj.p5a') }}<span class="mono">&lt;|im_start|&gt;</span>{{ t('policy.content.inj.p5b') }}
         <br />
         <span class="muted">
-          注意：这一层是降低成功率，不是保证。真正的兜底是上面的硬拒绝规则 ——
-          即使 LLM 被完全说服，读取凭据与破坏性命令依然执行不了。
+          {{ t('policy.content.inj.n1') }}
+          {{ t('policy.content.inj.n2') }}
         </span>
       </div>
     </div>
 
     <div class="card">
-      <div class="card-title">会话上下文（模型记得多少）</div>
+      <div class="card-title">{{ t('policy.ctx.title') }}</div>
 
       <div class="grid">
         <div>
-          <label style="margin-top: 12px">每台主机保留轮数</label>
+          <label style="margin-top: 12px">{{ t('policy.ctx.turns') }}</label>
           <input v-model="form.maxSessionTurns" class="session-turns" type="number" min="1" max="100" />
         </div>
         <div>
-          <label style="margin-top: 12px">单条工具输出上限 (KB)</label>
+          <label style="margin-top: 12px">{{ t('policy.ctx.toolKb') }}</label>
           <input v-model="form.maxStoredToolBytesKb" class="session-tool-bytes" type="number" min="1" step="1" />
         </div>
       </div>
 
       <div style="margin-top: 12px">
-        <label style="margin-top: 0">每台主机历史总量上限 (KB)</label>
+        <label style="margin-top: 0">{{ t('policy.ctx.totalKb') }}</label>
         <input v-model="form.maxSessionBytesKb" class="session-total-bytes" type="number" min="1" step="16" />
       </div>
 
       <div class="notice">
-        <b>对话记忆按主机独立保存</b>，加密存在本机配置目录里（重启后仍在，
-        可用「控制台」里的「清空上下文」丢掉）。
-        每轮提问会把命中的历史一并发给模型，所以这几个值直接决定
-        <b>单次请求的体积与费用</b>：调大让长链路排查更连贯，调小更省 token。
+        <b>{{ t('policy.ctx.mem.bold1') }}</b>{{ t('policy.ctx.mem.p1') }}
+        {{ t('policy.ctx.mem.p2') }}
+        {{ t('policy.ctx.mem.p3') }}
+        <b>{{ t('policy.ctx.mem.bold2') }}</b>{{ t('policy.ctx.mem.p4') }}
       </div>
 
       <div class="notice">
-        <b>裁剪以「整轮」为单位</b>（一问一答为一条），超限时从最旧的整轮开始丢弃。
-        不会从中间切断，否则历史里会留下悬空的工具调用，导致该主机此后每次请求都失败。
+        <b>{{ t('policy.ctx.trim.bold') }}</b>{{ t('policy.ctx.trim.p1') }}
+        {{ t('policy.ctx.trim.p2') }}
         <br />
         <span class="muted">
-          单条工具输出上限是真正兜住上下文窗口的那一项：命令回显可能很大，
-          而一轮里可能调用多次工具。它只裁工具输出，不裁提问与回答的正文。
+          {{ t('policy.ctx.trim.note') }}
         </span>
       </div>
     </div>
 
     <div class="card">
-      <div class="card-title">主机级覆盖（可选）</div>
+      <div class="card-title">{{ t('policy.ov.title') }}</div>
       <div class="muted hint">
-        上面三个值是<b>全局默认</b>。某台主机需要不一样时在这里单独填 ——
-        留空的那一项仍然跟随全局，不必把三项都抄一遍。
-        占位符显示的就是它当前会继承到的值。
+        {{ t('policy.ov.hint.a1') }}<b>{{ t('policy.ov.hint.bold') }}</b>{{ t('policy.ov.hint.a2') }}
+        {{ t('policy.ov.hint.a3') }}
+        {{ t('policy.ov.hint.a4') }}
       </div>
 
       <div v-if="!hosts.length && !rows.length" class="notice">
-        还没有主机。添加主机后可以在这里为它单独设置上下文上限。
+        {{ t('policy.ov.noHosts') }}
       </div>
 
       <div v-for="r in rows" :key="r.id" class="ov-row">
         <div class="ov-name">
           <span class="ov-title">{{ r.name }}</span>
-          <span v-if="hasOverride(r.id)" class="ov-badge">已自定义</span>
-          <span v-if="r.missing" class="ov-badge ov-missing">主机已不存在</span>
+          <span v-if="hasOverride(r.id)" class="ov-badge">{{ t('policy.ov.custom') }}</span>
+          <span v-if="r.missing" class="ov-badge ov-missing">{{ t('policy.ov.missing') }}</span>
         </div>
         <div class="ov-fields">
           <label class="ov-field">
-            <span>轮数</span>
+            <span>{{ t('policy.ov.turns') }}</span>
             <input
               v-model="overrides[r.id].turns"
               class="ov-turns"
@@ -387,7 +387,7 @@ async function save() {
             />
           </label>
           <label class="ov-field">
-            <span>单条输出 (KB)</span>
+            <span>{{ t('policy.ov.toolKb') }}</span>
             <input
               v-model="overrides[r.id].toolKb"
               class="ov-tool-bytes"
@@ -398,7 +398,7 @@ async function save() {
             />
           </label>
           <label class="ov-field">
-            <span>总量 (KB)</span>
+            <span>{{ t('policy.ov.totalKb') }}</span>
             <input
               v-model="overrides[r.id].totalKb"
               class="ov-total-bytes"
@@ -409,26 +409,26 @@ async function save() {
             />
           </label>
           <button class="sm ov-clear" :disabled="!hasOverride(r.id)" @click="clearOverride(r.id)">
-            清除
+            {{ t('policy.ov.clear') }}
           </button>
         </div>
       </div>
     </div>
 
     <div class="card">
-      <div class="card-title">硬拒绝规则（不可关闭）</div>
+      <div class="card-title">{{ t('policy.hard.title') }}</div>
       <div v-for="r in hardDenied" :key="r.name" class="rule">
         <div class="rule-name">{{ r.name }}</div>
         <div class="rule-detail mono">{{ r.detail }}</div>
       </div>
       <div class="notice">
-        这些规则在策略引擎中无条件生效，与上方模式、白名单无关 ——
-        这是「LLM 绝对不允许直接读取 Linux 登录配置与密钥」的落地方式。
+        {{ t('policy.hard.notice.a') }}
+        {{ t('policy.hard.notice.b') }}
       </div>
     </div>
 
     <div class="actions">
-      <button class="primary" :disabled="busy" @click="save">{{ busy ? '保存中…' : '保存策略' }}</button>
+      <button class="primary" :disabled="busy" @click="save">{{ busy ? t('policy.saving') : t('policy.save') }}</button>
     </div>
   </div>
 </template>

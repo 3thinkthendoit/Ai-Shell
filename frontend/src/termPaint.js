@@ -8,6 +8,8 @@
 // 每个函数都收一个 `write(str)` 落点（就是某台主机 xterm 实例的 write），
 // 自己负责补 \r\n —— 终端不像 DOM 会自动换行。
 
+import { t } from './i18n'
+
 const RESET = '\x1b[0m'
 const DIM = '\x1b[2m'
 const BOLD = '\x1b[1m'
@@ -42,7 +44,7 @@ function clip(text) {
     out = out.slice(0, OUT_COLS)
     trimmed = true
   }
-  if (trimmed) out += '\r\n' + DIM + '…（输出过长已截断，完整内容见归档）' + RESET
+  if (trimmed) out += '\r\n' + DIM + t('tl.clip.trimmed') + RESET
   return out
 }
 
@@ -177,7 +179,9 @@ export function paintAssistantEnd(write) {
   nl(write, '')
 }
 
-const DECISION = { allow: '自动放行', confirm: '需确认', deny: '硬拒绝' }
+// 裁决显示文案（键 → i18n key）。decision 值本身（allow/confirm/deny）是
+// 与后端协议匹配的标识符，不翻；只有展示层走字典。
+const DECISION_LABELS = { allow: 'tl.decision.allow', confirm: 'tl.decision.confirm', deny: 'tl.decision.deny' }
 
 // 工具调用：**实时**画一行 —— agent 每调一次画一次，让人当场看到它在调什么工具，
 // 不必等收尾、也不必翻「对话归档」。卡片风格（▸ + 工具名 + 命令），
@@ -185,11 +189,12 @@ const DECISION = { allow: '自动放行', confirm: '需确认', deny: '硬拒绝
 export function paintToolCall(write, view) {
   if (!write || !view) return
   nl(write, '')
-  const dec = view.decision && view.decision !== 'allow'
-    ? ' · ' + YELLOW + (DECISION[view.decision] || view.decision) + RESET
+  const decKey = DECISION_LABELS[view.decision]
+  const dec = view.decision && view.decision !== 'allow' && decKey
+    ? ' · ' + YELLOW + t(decKey) + RESET
     : ''
   const host = view.hostName ? DIM + ' · @' + view.hostName + RESET : ''
-  nl(write, MAGENTA + '▸ ' + RESET + BOLD + String(view.name || '工具') + RESET + dec + host)
+  nl(write, MAGENTA + '▸ ' + RESET + BOLD + String(view.name || t('tl.tool.fallback')) + RESET + dec + host)
   if (view.command) nl(write, DIM + '  ' + String(view.command) + RESET)
 }
 
@@ -198,13 +203,13 @@ export function paintToolCall(write, view) {
 export function paintToolResultLine(write, res) {
   if (!write || !res) return
   if (res.tty) {
-    nl(write, CYAN + '  ⤷ 需要交互式终端，已交接到这片终端表面执行（画面不进模型上下文）' + RESET)
+    nl(write, CYAN + '  ⤷ ' + t('tl.tool.tty') + RESET)
     return
   }
   const code = res.exitCode
   const ok = code === 0 || code == null || code === ''
-  const status = ok ? GREEN + '完成' : RED + '失败（码 ' + code + '）'
-  const red = res.redacted ? YELLOW + ' · 已脱敏 ' + res.redacted + ' 处' : ''
+  const status = ok ? GREEN + t('tl.tool.done') : RED + t('tl.tool.fail', { code })
+  const red = res.redacted ? YELLOW + t('tl.tool.redacted', { n: res.redacted }) : ''
   nl(write, '  ⤷ ' + status + RESET + red + RESET)
 }
 
@@ -212,27 +217,27 @@ export function paintToolResultLine(write, res) {
 export function paintApproval(write, view) {
   if (!write || !view) return
   nl(write, '')
-  nl(write, YELLOW + BOLD + '⚠ 需要你的批准：' + RESET + YELLOW + String(view.command || view.name || '') + RESET)
+  nl(write, YELLOW + BOLD + '⚠ ' + t('tl.approval') + RESET + YELLOW + String(view.command || view.name || '') + RESET)
   if (view.reason) nl(write, DIM + '  ' + view.reason + RESET)
 }
 
 export function paintError(write, msg) {
   if (!write) return
   nl(write, '')
-  nl(write, RED + BOLD + '错误 › ' + RESET + RED + String(msg == null ? '' : msg) + RESET)
+  nl(write, RED + BOLD + t('tl.error') + ' › ' + RESET + RED + String(msg == null ? '' : msg) + RESET)
 }
 
 export function paintInjection(write, e) {
   if (!write || !e) return
   nl(write, '')
-  nl(write, RED + '⚠ 远端输出中检测到疑似提示注入：' + ((e.findings || []).join('、')) + '（已标记为不可信）' + RESET)
+  nl(write, RED + '⚠ ' + t('tl.injection', { findings: (e.findings || []).join('、') }) + RESET)
 }
 
 // 快照注记：**不重画那一帧**（它本来就在 scrollback 里），只留一行说明
 // 「结束画面已进归档与模型上下文」，让人和审计对得上。
 export function paintSnapshotNote(write, final) {
   if (!write) return
-  nl(write, DIM + '  ▸ ' + (final ? '终端结束画面' : '终端屏幕快照') + '已进归档与模型上下文。' + RESET)
+  nl(write, DIM + '  ▸ ' + t(final ? 'tl.snapshot.final' : 'tl.snapshot.live') + RESET)
 }
 
 // 人工 shell 被硬拒绝或执行失败：在表面上说明原因（放行时无需多话，
@@ -242,10 +247,10 @@ export function paintShellVerdict(write, res) {
   const st = res.status
   if (st === 'done') return
   const msg = {
-    denied: '命令被策略拒绝：' + (res.reason || res.error || ''),
-    error: '命令执行失败：' + (res.error || ''),
-    missing: (res.reason || '远端未找到该命令。')
-  }[st] || ('命令未执行（' + st + '）。')
+    denied: t('tl.shell.denied', { reason: res.reason || res.error || '' }),
+    error: t('tl.shell.error', { err: res.error || '' }),
+    missing: res.reason || t('tl.shell.missing')
+  }[st] || t('tl.shell.notRun', { st })
   nl(write, RED + '  ⤷ ' + msg + RESET)
 }
 
@@ -268,7 +273,7 @@ export function paintShellVerdict(write, res) {
 // store.test.js 的「执行命令绝不进 agent」护栏用例）。
 export function paintLLMHint(write, startCol = 0) {
   if (!write) return 0
-  const text = '  提示：这段输出可交给 LLM 分析。'
+  const text = '  ' + t('tl.llmHint')
   write(DIM + text + RESET + '\x1b[' + (startCol + 1) + 'G')
   return displayCols(text)
 }
@@ -315,7 +320,7 @@ export function paintInputPrompt(write) {
 // 而真实提示符（如 root@host:~$ ）有十几个字符宽，算出来会偏到左边盖住提示符。
 export function paintWelcomeHint(write, startCol = 0) {
   if (!write) return 0
-  const text = '可以直接用自然语言提需求（中文或 ? 开头交给 LLM）'
+  const text = t('tl.welcomeHint')
   // 写完提示光标停在末尾，用绝对列定位移回起点（ANSI 列号从 1 起，故 +1）。
   write(DIM + text + RESET + '\x1b[' + (startCol + 1) + 'G')
   return displayCols(text)

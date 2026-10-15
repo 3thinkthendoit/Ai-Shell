@@ -1,6 +1,7 @@
 <script setup>
 import { reactive, ref, computed } from 'vue'
 import { store, push } from '../store'
+import { t } from '../i18n'
 import UiSelect from './UiSelect.vue'
 
 // ---- 方案（多套 LLM 配置，可切换） ----
@@ -12,11 +13,11 @@ const profiles = computed(() => store.llmProfiles || [])
 const editingId = ref(profiles.value.find(p => p.active)?.id || '')
 
 const profileOptions = computed(() =>
-  profiles.value.map(p => ({ value: p.id, label: `${p.name}${p.active ? '（使用中）' : ''}` }))
+  profiles.value.map(p => ({ value: p.id, label: `${p.name}${p.active ? t('settings.active') : ''}` }))
 )
 
 const form = reactive({
-  name: profiles.value.find(p => p.id === editingId.value)?.name || '默认',
+  name: profiles.value.find(p => p.id === editingId.value)?.name || t('settings.defaultName'),
   baseUrl: store.llm.baseUrl,
   model: store.llm.model,
   apiKey: '',
@@ -77,9 +78,9 @@ async function activate() {
   try {
     await window.go.main.App.ActivateLLMProfile(id)
     await refreshLLM()
-    push({ kind: 'system', content: `已切换到服务商「${form.name}」，下一轮对话生效。` })
+    push({ kind: 'system', content: t('settings.switched', { name: form.name }) })
   } catch (e) {
-    push({ kind: 'error', content: `切换服务商失败：${e && e.message ? e.message : e}` })
+    push({ kind: 'error', content: t('settings.switchFail', { err: e && e.message ? e.message : e }) })
   } finally {
     busy.value = false
   }
@@ -93,21 +94,22 @@ async function removeProfile() {
   try {
     await window.go.main.App.DeleteLLMProfile(id)
     await refreshLLM()
-    push({ kind: 'system', content: '已删除该服务商。' })
+    push({ kind: 'system', content: t('settings.removed') })
   } catch (e) {
-    push({ kind: 'error', content: `删除服务商失败：${e && e.message ? e.message : e}` })
+    push({ kind: 'error', content: t('settings.removeFail', { err: e && e.message ? e.message : e }) })
   } finally {
     busy.value = false
   }
 }
 
-const presets = [
+// 预设按钮的显示名走字典（品牌名不翻，但「本地」这类描述词要跟语言走）。
+const presets = computed(() => [
   { label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
   { label: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
-  { label: '通义千问', baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus' },
-  { label: '本地 Ollama', baseUrl: 'http://localhost:11434/v1', model: 'qwen2.5:14b' },
-  { label: '本地 vLLM', baseUrl: 'http://localhost:8000/v1', model: 'Qwen2.5-14B-Instruct' }
-]
+  { label: t('settings.presets.qwen'), baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus' },
+  { label: t('settings.presets.ollama'), baseUrl: 'http://localhost:11434/v1', model: 'qwen2.5:14b' },
+  { label: t('settings.presets.vllm'), baseUrl: 'http://localhost:8000/v1', model: 'Qwen2.5-14B-Instruct' }
+])
 
 function applyPreset(p) {
   form.baseUrl = p.baseUrl
@@ -128,7 +130,7 @@ async function save() {
   try {
     const saved = await window.go.main.App.SaveLLMProfile({
       id: editingId.value,
-      name: form.name || '默认',
+      name: form.name || t('settings.defaultName'),
       baseUrl: form.baseUrl,
       model: form.model,
       apiKey: form.apiKey,
@@ -138,7 +140,7 @@ async function save() {
     // refreshLLM 内部会 loadEditing()：表单对齐到保存后的值
     // （含后端规范化过的 Base URL），并清掉 Key 输入框与测试结果。
     await refreshLLM()
-    push({ kind: 'system', content: `服务商「${saved.name}」已保存` })
+    push({ kind: 'system', content: t('settings.saved', { name: saved.name }) })
   } catch (e) {
     push({ kind: 'error', content: String(e) })
   } finally {
@@ -155,7 +157,7 @@ async function test() {
   // 新建模式下表单全空时不发请求：后端 TestLLM 会回落到激活方案的配置，
   // 用户会拿到一个「连接成功」—— 但验证的根本不是他没填完的这套。
   if (!editingId.value && !form.baseUrl.trim() && !form.model.trim()) {
-    testRes.value = { ok: false, message: '请先填写 Base URL 与模型名。' }
+    testRes.value = { ok: false, message: t('settings.fillFirst') }
     return
   }
   testing.value = true
@@ -191,48 +193,46 @@ const isLocal = () => /localhost|127\.0\.0\.1|0\.0\.0\.0/.test(form.baseUrl)
   <div class="panel">
     <div class="panel-inner">
       <header class="panel-head">
-        <h2>LLM 设置</h2>
+        <h2>{{ t('settings.title') }}</h2>
         <p class="muted">
-          任何兼容 OpenAI <span class="mono">/v1/chat/completions</span> 与 function calling 的服务都能接入。
-          指向本地模型时，数据完全不出你的机器。可以保存多个服务商，随时切换。
+          {{ t('settings.headHint.a') }}<span class="mono">/v1/chat/completions</span>{{ t('settings.headHint.b') }}
+          {{ t('settings.headHint.c') }}
         </p>
       </header>
 
       <div class="card">
-        <div class="card-title">配置服务商</div>
-        <div class="card-sub">「编辑哪一套」与「用哪一套」分开管：改完点保存，再点「设为当前」切换。</div>
+        <div class="card-title">{{ t('settings.card.title') }}</div>
+        <div class="card-sub">{{ t('settings.card.sub') }}</div>
         <div class="profile-bar">
           <UiSelect
             class="profile-select"
             v-model="editingId"
             :options="profileOptions"
             :disabled="!profiles.length"
-            placeholder="暂无服务商"
+            :placeholder="t('settings.noProfiles')"
             @change="loadEditing"
           />
-          <button class="sm" @click="newProfile">新建</button>
+          <button class="sm" @click="newProfile">{{ t('settings.new') }}</button>
           <button class="sm" v-if="editingId && !editingProfile()?.active" :disabled="busy" @click="activate">
-            设为当前
+            {{ t('settings.activate') }}
           </button>
           <button class="sm danger" v-if="profiles.length > 1 && editingId" :disabled="busy" @click="removeProfile">
-            删除
+            {{ t('settings.delete') }}
           </button>
         </div>
         <div class="profile-hint muted" v-if="editingId">
-          {{ editingProfile()?.active
-            ? '这个服务商正在被所有对话使用。'
-            : '编辑后点「保存」，再用「设为当前」切换过去。' }}
+          {{ editingProfile()?.active ? t('settings.hint.active') : t('settings.hint.inactive') }}
         </div>
       </div>
 
       <div class="card">
-        <div class="card-title">服务商信息</div>
+        <div class="card-title">{{ t('settings.info.title') }}</div>
         <div class="field">
-          <label>服务商名称</label>
-          <input v-model="form.name" class="profile-name" placeholder="例如：DeepSeek / 本地 Qwen" />
+          <label>{{ t('settings.info.name') }}</label>
+          <input v-model="form.name" class="profile-name" :placeholder="t('settings.info.namePh')" />
         </div>
         <div class="field">
-          <label>快速预设</label>
+          <label>{{ t('settings.info.presets') }}</label>
           <div class="presets">
             <button v-for="p in presets" :key="p.label" class="sm" @click="applyPreset(p)">
               {{ p.label }}
@@ -242,41 +242,37 @@ const isLocal = () => /localhost|127\.0\.0\.1|0\.0\.0\.0/.test(form.baseUrl)
       </div>
 
       <div class="card">
-        <div class="card-title">连接参数</div>
+        <div class="card-title">{{ t('settings.conn.title') }}</div>
         <div class="field">
           <label>Base URL</label>
           <input v-model="form.baseUrl" class="base-url" placeholder="https://api.openai.com/v1" />
         </div>
         <div class="field">
-          <label>模型名</label>
+          <label>{{ t('settings.conn.model') }}</label>
           <input v-model="form.model" class="model-name" placeholder="gpt-4o-mini" />
         </div>
         <div class="field">
           <label>
             API Key
-            <span v-if="editingId && editingProfile()?.hasApiKey" class="muted">（已保存，留空表示不修改）</span>
-            <span v-else-if="!editingId && store.llm.hasApiKey" class="muted">（当前服务商已保存，新服务商需另行填写）</span>
+            <span v-if="editingId && editingProfile()?.hasApiKey" class="muted">{{ t('settings.key.saved') }}</span>
+            <span v-else-if="!editingId && store.llm.hasApiKey" class="muted">{{ t('settings.key.activeSaved') }}</span>
           </label>
           <input v-model="form.apiKey" class="api-key" type="password" placeholder="sk-..." />
         </div>
 
         <label class="chk" v-if="editingId && editingProfile()?.hasApiKey">
           <input type="checkbox" v-model="form.clearKey" />
-          清除已保存的 API Key
+          {{ t('settings.key.clear') }}
         </label>
 
         <div class="notice">
-          API Key 与主机密码同样走 AES-256-GCM 加密，主密钥在操作系统钥匙串里。
-          它只会出现在发往 LLM 服务的 HTTP 头里，绝不会被写进对话内容。
+          {{ t('settings.notice') }}
         </div>
 
         <!-- 自动修正提示。用户把完整端点粘进 Base URL 是很常见的手滑，
              不说一声的话他只会看到「测试通过」，却不知道自己填错了。 -->
         <div v-if="corrected" class="fix-hint">
-          Base URL 已自动修正为 <span class="mono">{{ corrected }}</span> ——
-          原来的值把端点（<span class="mono">/chat/completions</span>）也填了进去，
-          那会拼成重复路径并返回 404。程序会自己追加这一段，填到
-          <span class="mono">/v1</span> 为止即可。
+          {{ t('settings.fix.k1') }}<span class="mono">{{ corrected }}</span>{{ t('settings.fix.k2') }}<span class="mono">/chat/completions</span>{{ t('settings.fix.k3') }}<span class="mono">/v1</span>{{ t('settings.fix.k4') }}
         </div>
 
         <div v-if="testRes" class="test-result" :class="testRes.ok ? 'ok' : 'bad'">
@@ -288,22 +284,22 @@ const isLocal = () => /localhost|127\.0\.0\.1|0\.0\.0\.0/.test(form.baseUrl)
             </span>
           </div>
           <div v-if="testRes.ok && testRes.reply" class="tr-line">
-            模型回复：<span class="mono">{{ testRes.reply }}</span>
+            {{ t('settings.test.reply') }}<span class="mono">{{ testRes.reply }}</span>
           </div>
           <!-- 失败时把实际请求的地址摆出来：404 这类问题光看错误码无从下手 -->
           <div v-if="!testRes.ok && testRes.url" class="tr-line">
-            实际请求：<span class="mono">{{ testRes.url }}</span>
+            {{ t('settings.test.actual') }}<span class="mono">{{ testRes.url }}</span>
           </div>
         </div>
 
         <div class="actions">
-          <span class="test-note">测试会真的发一次最小请求（max_tokens=8），不产生实质费用。</span>
-          <button :disabled="testing" @click="test">{{ testing ? '测试中…' : '测试连接' }}</button>
-          <button class="primary" :disabled="busy" @click="save">{{ busy ? '保存中…' : '保存' }}</button>
+          <span class="test-note">{{ t('settings.test.note') }}</span>
+          <button :disabled="testing" @click="test">{{ testing ? t('settings.test.testing') : t('settings.test.run') }}</button>
+          <button class="primary" :disabled="busy" @click="save">{{ busy ? t('settings.saving') : t('settings.save') }}</button>
         </div>
 
         <div v-if="isLocal()" class="local-hint">
-          当前指向本地地址 —— 对话内容不会离开这台机器。
+          {{ t('settings.localHint') }}
         </div>
       </div>
     </div>

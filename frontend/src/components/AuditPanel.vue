@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import { push } from '../store'
+import { t, i18n } from '../i18n'
 
 const entries = ref([])
 const size = ref(0)
@@ -11,34 +12,43 @@ const verifying = ref(false)
 const verifyResult = ref(null)
 const filter = ref('all')
 
-const kinds = [
-  { key: 'all', label: '全部' },
-  { key: 'tool', label: '工具调用' },
-  { key: 'direct', label: '人工命令' },
-  { key: 'terminal', label: '交互终端' },
-  { key: 'agent_run', label: '会话' },
-  { key: 'host', label: '主机变更' },
-  { key: 'policy', label: '策略变更' },
-  { key: 'llm', label: 'LLM 配置' },
-  { key: 'retention', label: '日志轮转' },
-  { key: 'system', label: '系统' }
-]
+// 筛选按钮（computed：语言切换时标签跟着换）。key 值与后端审计 kind 一致，不翻。
+const kinds = computed(() => [
+  { key: 'all', label: t('audit.kinds.all') },
+  { key: 'tool', label: t('audit.kinds.tool') },
+  { key: 'direct', label: t('audit.kinds.direct') },
+  { key: 'terminal', label: t('audit.kinds.terminal') },
+  { key: 'agent_run', label: t('audit.kinds.agentRun') },
+  { key: 'host', label: t('audit.kinds.host') },
+  { key: 'policy', label: t('audit.kinds.policy') },
+  { key: 'llm', label: t('audit.kinds.llm') },
+  { key: 'retention', label: t('audit.kinds.retention') },
+  { key: 'system', label: t('audit.kinds.system') }
+])
 
-const kindLabel = k =>
-  ({
-    agent_run: '会话',
-    tool: '工具调用',
-    direct: '人工命令',
-    terminal: '交互终端',
-    host: '主机变更',
-    llm: 'LLM 配置',
-    policy: '策略变更',
-    retention: '日志轮转',
-    system: '系统'
-  }[k] || k)
+const KIND_KEYS = {
+  agent_run: 'audit.kinds.agentRun',
+  tool: 'audit.kinds.tool',
+  direct: 'audit.kinds.direct',
+  terminal: 'audit.kinds.terminal',
+  host: 'audit.kinds.host',
+  llm: 'audit.kinds.llm',
+  policy: 'audit.kinds.policy',
+  retention: 'audit.kinds.retention',
+  system: 'audit.kinds.system'
+}
+const kindLabel = k => (KIND_KEYS[k] ? t(KIND_KEYS[k]) : k)
 
+// 裁决徽章：allow/confirm/deny 与 timeline 域同一套语义，复用其键；human 是
+// 审计页独有的（人工直接敲的命令）。值本身（allow/confirm/deny/human）是
+// 后端字段，不翻。
 const decisionLabel = d =>
-  ({ allow: '自动放行', confirm: '需确认', deny: '硬拒绝', human: '人工操作' }[d] || d)
+  ({
+    allow: t('tl.decision.allow'),
+    confirm: t('tl.decision.confirm'),
+    deny: t('tl.decision.deny'),
+    human: t('audit.decision.human')
+  }[d] || d)
 
 const decisionClass = d =>
   ({ allow: 'ok', confirm: 'warn', deny: 'danger', human: 'neutral' }[d] || 'neutral')
@@ -82,7 +92,7 @@ async function exportPlain() {
   try {
     const dest = await window.go.main.App.ExportAudit()
     if (dest) {
-      push({ kind: 'system', content: `审计日志已导出到 ${dest}` })
+      push({ kind: 'system', content: t('audit.exported', { dest }) })
       await load()
     }
   } catch (e) {
@@ -94,7 +104,7 @@ function fmtTime(s) {
   if (!s) return ''
   const d = new Date(s)
   if (isNaN(d.getTime())) return s
-  return d.toLocaleString('zh-CN', { hour12: false })
+  return d.toLocaleString(i18n.locale === 'en' ? 'en-US' : 'zh-CN', { hour12: false })
 }
 
 function fmtSize(n) {
@@ -112,42 +122,40 @@ onMounted(load)
     <div class="panel-inner">
       <header class="panel-head">
         <div>
-          <h2>审计日志</h2>
+          <h2>{{ t('audit.title') }}</h2>
           <p class="muted">
-            每一次对远端主机的操作、每一次人工批准或拒绝、每一次配置变更都在这里留下记录。
-            日志逐条用主密钥加密落盘，并以哈希链串联 —— 任何删改都会被检出。
-            达到体积上限后自动轮转归档，最旧的段按保留策略丢弃，丢弃动作本身也会记入链中。
+            {{ t('audit.headHint') }}
           </p>
         </div>
         <div class="head-actions">
-          <button :disabled="loading" @click="load">{{ loading ? '刷新中…' : '刷新' }}</button>
+          <button :disabled="loading" @click="load">{{ loading ? t('audit.refreshing') : t('audit.refresh') }}</button>
           <button :disabled="verifying" @click="verify">
-            {{ verifying ? '校验中…' : '校验完整性' }}
+            {{ verifying ? t('audit.verifying') : t('audit.verify') }}
           </button>
-          <button @click="exportPlain">导出明文</button>
+          <button @click="exportPlain">{{ t('audit.export') }}</button>
         </div>
       </header>
 
       <div v-if="err" class="card error-card">{{ err }}</div>
 
       <div v-if="verifyResult" class="card verify" :class="verifyResult.ok ? 'ok' : 'bad'">
-        <b>{{ verifyResult.ok ? '哈希链完整' : '校验未通过' }}</b>
+        <b>{{ verifyResult.ok ? t('audit.verify.ok') : t('audit.verify.bad') }}</b>
         <span>{{ verifyResult.message }}</span>
         <div v-if="verifyResult.truncated" class="verify-note">
-          注意：校验起点是第 {{ verifyResult.startSeq }} 条，更早的记录已不在。
-          若下方能看到「日志轮转」记录，说明是本程序的保留策略丢弃；
-          但看不到也不能据此认定被篡改 —— 那条声明本身也可能已被后续轮转丢弃。
+          {{ t('audit.verify.note.a', { seq: verifyResult.startSeq }) }}
+          {{ t('audit.verify.note.b') }}
+          {{ t('audit.verify.note.c') }}
         </div>
       </div>
 
       <!-- 概览行 + 筛选器合成一条工具栏：左边是规模，右边是筛选。 -->
       <div class="toolbar">
         <div class="meta">
-          <span class="muted">共 {{ entries.length }} 条 · {{ fmtSize(size) }}</span>
+          <span class="muted">{{ t('audit.meta.total', { n: entries.length }) }} · {{ fmtSize(size) }}</span>
           <span v-if="segments > 1" class="muted">
-            · 已轮转为 {{ segments }} 个段
+            {{ t('audit.meta.segments', { n: segments }) }}
           </span>
-          <span v-else class="muted">· 单段</span>
+          <span v-else class="muted">{{ t('audit.meta.single') }}</span>
         </div>
         <div class="filters">
           <button
@@ -162,7 +170,7 @@ onMounted(load)
         </div>
       </div>
 
-      <div v-if="!shown.length && !err" class="card muted empty">暂无记录。</div>
+      <div v-if="!shown.length && !err" class="card muted empty">{{ t('audit.empty') }}</div>
 
       <div v-else class="list">
         <div v-for="e in shown.slice().reverse()" :key="e.seq" class="row">
@@ -172,12 +180,12 @@ onMounted(load)
             <span v-if="e.decision" class="badge" :class="decisionClass(e.decision)">
               {{ decisionLabel(e.decision) }}
             </span>
-            <span v-if="e.approved === false" class="badge danger">已拒绝</span>
-            <span v-if="e.approved === true" class="badge ok">已批准</span>
+            <span v-if="e.approved === false" class="badge danger">{{ t('audit.rejected') }}</span>
+            <span v-if="e.approved === true" class="badge ok">{{ t('audit.approved') }}</span>
             <span v-if="e.injection && e.injection.length" class="badge danger">
-              注入 {{ e.injection.length }}
+              {{ t('audit.injection', { n: e.injection.length }) }}
             </span>
-            <span v-if="e.redacted" class="badge warn">脱敏 {{ e.redacted }}</span>
+            <span v-if="e.redacted" class="badge warn">{{ t('audit.redacted', { n: e.redacted }) }}</span>
             <span class="time muted">{{ fmtTime(e.time) }}</span>
           </div>
 
@@ -189,10 +197,10 @@ onMounted(load)
 
           <div class="row-foot">
             <span v-if="e.exitCode !== undefined && e.exitCode !== null" class="muted">
-              退出码 {{ e.exitCode }}
+              {{ t('console.exitCode', { n: e.exitCode }) }}
             </span>
             <span v-if="e.durationMs" class="muted">{{ e.durationMs }}ms</span>
-            <span v-if="e.rule" class="muted mono">规则 {{ e.rule }}</span>
+            <span v-if="e.rule" class="muted mono">{{ t('audit.rule', { r: e.rule }) }}</span>
             <span v-if="e.note" class="note">{{ e.note }}</span>
           </div>
         </div>

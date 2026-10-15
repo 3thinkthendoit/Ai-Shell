@@ -8,7 +8,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import { TERM_THEMES, currentTermTheme } from '../termTheme.js'
 import * as paint from '../termPaint.js'
-import { bucketKey, termState, openTerminal, resizeTerminal, writeTerminal, textToBase64 } from '../store.js'
+import { store, bucketKey, termState, openTerminal, resizeTerminal, writeTerminal, textToBase64 } from '../store.js'
 import { registerTermSink, unregisterTermSink, registerLLMHint } from './termEvents.js'
 
 // 欢迎引导比真提示符晚多久出现。远端 shell 从握手到打印提示符约 500ms
@@ -51,6 +51,19 @@ export function setSurfaceEl(key, el) {
 export function setTheme(theme) {
   const t = TERM_THEMES[theme] || TERM_THEMES.light
   for (const { term } of terms.values()) term.options.theme = t
+}
+
+// 终端字体热更新：改完 options 必须重新 fit —— 字号一变，同样容器尺寸下
+// 能容纳的行列数就变了；doFit 触发的 term.onResize 会经 reportResize 把新
+// 尺寸报给远端 PTY（window-change），vim/top 才不会按旧尺寸排版。
+export function setTermFont(font) {
+  for (const t of terms.values()) {
+    try {
+      if (font.family) t.term.options.fontFamily = font.family
+      if (font.size) t.term.options.fontSize = font.size
+    } catch { /* 替身或已销毁的实例，跳过 */ }
+  }
+  for (const key of terms.keys()) doFit(key)
 }
 
 // doFit 只在容器**确实有尺寸**时才测量。隐藏时（切到归档、或不是当前任务）
@@ -150,8 +163,8 @@ export async function ensureTerm(hostId, sessionId, currentTheme = 'light') {
     cursorStyle: 'bar',
     cursorWidth: 2,
     scrollback: 5000,
-    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-    fontSize: 12.5,
+    fontFamily: store.termFont.family,
+    fontSize: store.termFont.size,
     theme: currentTermTheme(currentTheme)
   })
   const fit = new FitAddon()

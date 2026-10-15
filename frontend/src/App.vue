@@ -1,31 +1,29 @@
 <script setup>
-import { onMounted, ref } from 'vue'
-import { store, bootstrap, bindEvents, dismissAuditError, initTheme, setTheme } from './store'
+import { computed, onMounted, ref } from 'vue'
+import { store, bootstrap, bindEvents, dismissAuditError, initTheme } from './store'
+import { t } from './i18n'
 import ConsolePanel from './components/ConsolePanel.vue'
 import HostsPanel from './components/HostsPanel.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
 import PolicyPanel from './components/PolicyPanel.vue'
 import AuditPanel from './components/AuditPanel.vue'
 import SessionsSidebar from './components/SessionsSidebar.vue'
+import SettingsMenu from './components/SettingsMenu.vue'
 import logoSrc from './assets/logo.svg'
 
 const tab = ref('console')
 
-const tabs = [
-  { key: 'console', label: '控制台' },
-  { key: 'hosts', label: '主机管理' },
-  { key: 'settings', label: 'LLM 设置' },
-  { key: 'policy', label: '安全策略' },
-  { key: 'audit', label: '审计日志' }
-]
+// 高频导航只留两页；LLM 设置/安全策略/审计日志收进底部齿轮（SettingsMenu）。
+// tabs 用 computed：语言切换时 t() 重新求值，导航文案跟着换。
+const tabs = computed(() => [
+  { key: 'console', label: t('app.nav.console') },
+  { key: 'hosts', label: t('app.nav.hosts') }
+])
 
 // 导航图标：内联 SVG（线性风格，stroke 跟随文字颜色），不引第三方图标库。
 const icons = {
   console: 'M4 5h16v11H4z M8 20h8 M12 16v4',            // 终端窗口
-  hosts: 'M6 4h12v7H6z M6 13h12v7H6z M9 7.5h.01 M9 16.5h.01', // 服务器两台叠放
-  settings: 'M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7z M12 3v2.5 M12 18.5V21 M4.2 7.5l2.2 1.3 M17.6 15.2l2.2 1.3 M4.2 16.5l2.2-1.3 M17.6 8.8l2.2-1.3', // 齿轮
-  policy: 'M12 3l7 3v5.5c0 4.3-3 7.6-7 9-4-1.4-7-4.7-7-9V6z M9.5 12l1.8 1.8 3.4-3.6', // 盾牌+对勾
-  audit: 'M6 3h9l4 4v14H6z M14 3v5h5 M9.5 12h5 M9.5 16h5' // 文档+行
+  hosts: 'M6 4h12v7H6z M6 13h12v7H6z M9 7.5h.01 M9 16.5h.01' // 服务器两台叠放
 }
 
 onMounted(async () => {
@@ -42,7 +40,7 @@ onMounted(async () => {
         <img class="brand-mark" :src="logoSrc" alt="Ai-Shell" />
         <div>
           <div class="brand-title">Ai-Shell</div>
-          <div class="brand-sub">Linux 智能运维台</div>
+          <div class="brand-sub">{{ t('app.brand.sub') }}</div>
         </div>
       </div>
 
@@ -66,19 +64,14 @@ onMounted(async () => {
       <SessionsSidebar v-if="store.ready" class="ssb-wrap" @open="tab = 'console'" />
 
       <div class="posture" v-if="store.ready">
-        <button
-          class="theme-btn"
-          :title="store.theme === 'dark' ? '切换到浅色主题' : '切换到暗黑主题'"
-          @click="setTheme(store.theme === 'dark' ? 'light' : 'dark')"
-        >
-          {{ store.theme === 'dark' ? '☀ 浅色' : '🌙 暗黑' }}
-        </button>
+        <!-- 偏好与设置类页面的统一入口（主题/语言/终端字体 + 页面跳转）。 -->
+        <SettingsMenu :active-page="tab" @page="tab = $event" />
       </div>
     </aside>
 
     <main class="main">
       <div v-if="store.error" class="fatal">
-        <h2>初始化失败</h2>
+        <h2>{{ t('app.fatal') }}</h2>
         <pre>{{ store.error }}</pre>
       </div>
 
@@ -87,21 +80,21 @@ onMounted(async () => {
              而「审计轨迹已不完整」是需要用户明确知晓并确认的事。 -->
         <div v-if="store.auditError" class="audit-warn" role="alert">
           <div>
-            <strong>审计日志异常</strong>
+            <strong>{{ t('app.auditWarn.title') }}</strong>
             <span class="audit-warn-msg">{{ store.auditError }}</span>
-            <span class="audit-warn-hint">审计记录可能已缺失，且该缺失是永久的 —— 校验时仍会被发现。</span>
+            <span class="audit-warn-hint">{{ t('app.auditWarn.hint') }}</span>
           </div>
-          <button class="audit-warn-close" @click="dismissAuditError()">知道了</button>
+          <button class="audit-warn-close" @click="dismissAuditError()">{{ t('app.auditWarn.close') }}</button>
         </div>
 
-        <ConsolePanel v-show="tab === 'console'" />
+        <ConsolePanel v-show="tab === 'console'" @page="tab = $event" />
         <HostsPanel v-if="tab === 'hosts'" />
         <SettingsPanel v-if="tab === 'settings'" />
         <PolicyPanel v-if="tab === 'policy'" />
         <AuditPanel v-if="tab === 'audit'" />
       </template>
 
-      <div v-else class="loading">正在初始化…</div>
+      <div v-else class="loading">{{ t('app.loading') }}</div>
     </main>
   </div>
 </template>
@@ -145,13 +138,6 @@ onMounted(async () => {
   font-size: 11px;
   color: var(--text-3);
   margin-top: 2px;
-}
-
-.theme-btn {
-  margin-top: 10px;
-  width: 100%;
-  font-size: 11.5px;
-  min-height: 28px;
 }
 
 nav {

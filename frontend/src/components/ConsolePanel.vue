@@ -8,11 +8,16 @@ import {
   bucketKey
 } from '../store'
 import { providerBadge, providerTermBadge } from '../providerLogos'
+
+// 未选主机的欢迎页按钮会向上切页签（App.vue 接住后改 tab），script 里也要
+// 主动调（新建任务引导去主机管理），所以提成常量而不是模板里用 $emit。
+const emit = defineEmits(['page'])
 import {
-  openedKeys, ensureTerm, disposeTerm, doFit, focusTerm, setTheme,
+  openedKeys, ensureTerm, disposeTerm, doFit, focusTerm, setTheme, setTermFont,
   setSurfaceEl, getTerm, paintWelcomeHintIfNeeded
 } from '../terminal/termSession'
 import { onTermData, paintInputPromptIfNeeded } from '../terminal/termInput'
+import { t } from '../i18n'
 import UiSelect from './UiSelect.vue'
 import FileManagerModal from './FileManagerModal.vue'
 
@@ -80,16 +85,19 @@ const st = computed(() => (currentKey.value ? store.terms[currentKey.value] : nu
 const statusLine = computed(() => {
   const s = st.value
   if (!s) return ''
-  if (s.status === 'opening') return '正在打开终端…'
-  if (s.status === 'closed') return s.exitReason || '终端已结束'
-  if (s.status === 'error') return '打开失败：' + s.error
+  if (s.status === 'opening') return t('console.status.opening')
+  if (s.status === 'closed') return s.exitReason || t('console.termExited')
+  if (s.status === 'error') return t('console.status.openFail', { err: s.error })
   return ''
 })
 const canRetry = computed(() => !!st.value && (st.value.status === 'closed' || st.value.status === 'error'))
 const canClose = computed(() => !!st.value && (st.value.status === 'open' || st.value.status === 'opening'))
 
 // 终端配色跟随亮/暗主题：切换时转交 termSession.setTheme（它同步所有已打开实例）。
-watch(() => store.theme, t => setTheme(t))
+// 注意参数名用 v：导入的 t() 是翻译函数，不能被遮蔽。
+watch(() => store.theme, v => setTheme(v))
+// 终端字体同理：字号/字体族变化时热更新所有已开实例并重测行列（见 setTermFont）。
+watch(() => store.termFont, f => setTermFont(f))
 
 // disposeSurface：销毁本地 xterm 实例（termSession.disposeTerm 负责），并
 // 顺带清掉 copy-on-select 防抖。
@@ -112,10 +120,11 @@ async function ensureSurface(hostId, sessionId) {
 // 按键全部石沉大海的假死（进入 vim 后无法操作的一个直接原因）。
 // 标记随登记项生灭：复用活实例时不重复挂（否则按键派发两次），重建后自动重接。
 function attachHandlers(key) {
-  const t = getTerm(key)
-  if (!t || t.wired) return
-  t.wired = true
-  const term = t.term
+  // 局部变量不能叫 t —— 它会遮蔽 i18n 的翻译函数 t()（同款问题在 termSubmit.js 炸过）。
+  const state = getTerm(key)
+  if (!state || state.wired) return
+  state.wired = true
+  const term = state.term
 
   // 用户按键 → 本地行编辑（见 termInput.onTermData）。
   term.onData(d => onTermData(key, d))
@@ -237,10 +246,13 @@ watch(statusLine, async () => {
 
 // ---- 归档视图派生 ----
 
-const decisionLabel = d => ({ allow: '自动放行', confirm: '需确认', deny: '硬拒绝' }[d] || d)
+// 决策徽章复用 timeline 域的 tl.decision.*（终端画面与归档视图同一套语义）。
+const decisionLabel = d => ({ allow: t('tl.decision.allow'), confirm: t('tl.decision.confirm'), deny: t('tl.decision.deny') }[d] || d)
 const decisionClass = d => ({ allow: 'ok', confirm: 'warn', deny: 'danger' }[d] || '')
 const statusLabel = s => ({
-  pending: '待批准', running: '执行中', done: '已完成', denied: '已拒绝', error: '出错'
+  pending: t('console.toolStatus.pending'), running: t('console.toolStatus.running'),
+  done: t('console.toolStatus.done'), denied: t('console.toolStatus.denied'),
+  error: t('console.toolStatus.error')
 }[s] || s)
 
 const streamingNow = computed(() => store.entries.some(e => e.streaming))
@@ -253,19 +265,21 @@ const streamingNow = computed(() => store.entries.some(e => e.streaming))
 const ctxUsage = computed(() => {
   const { tokens, window: win, messages } = store.contextUsage
   if (!tokens) return { text: '', level: '', title: '' }
-  const text = '约 ' + fmtTokens(tokens) + ' tokens'
+  const text = t('console.ctx.about', { n: fmtTokens(tokens) })
   if (!win) {
-    return { text, level: 'unknown', title: '未能识别该模型的上下文窗口，仅显示估算 token 数' }
+    return { text, level: 'unknown', title: t('console.ctx.unknown') }
   }
   const pct = Math.round(tokens * 100 / win)
   const level = pct >= 95 ? 'danger' : pct >= 80 ? 'warn' : pct >= 60 ? 'mid' : 'ok'
   return {
-    text: `${text} · ${pct}%`,
+    text: t('console.ctx.usage', { text, pct }),
     level,
-    title: `本次请求约 ${tokens.toLocaleString()} tokens，` +
-      `占模型窗口（${win.toLocaleString()}）的 ${pct}%\n` +
-      `${messages} 条消息。接近上限时服务端会直接报错 —— ` +
-      '可减少单次命令的输出量，或点「压缩上下文 / 清空上下文」。'
+    title: t('console.ctx.title', {
+      tokens: tokens.toLocaleString(),
+      win: win.toLocaleString(),
+      pct,
+      messages
+    })
   }
 })
 
@@ -318,7 +332,7 @@ const approvalCountdown = computed(() => {
     const r = s % 60
     return `${m}:${String(r).padStart(2, '0')}`
   }
-  return `${s} 秒`
+  return t('console.ctx.seconds', { s })
 })
 
 // 计时器只在有 pending 且带 deadline 时跑：没审批时白转一秒一次是浪费。
@@ -362,9 +376,9 @@ let hostSwitching = false
 // 落实「只留当前任务」：切换任务时上一任务的现场就此丢弃（回来是全新 shell）。
 async function detachSurface(key) {
   if (!key) return
-  const t = getTerm(key)
-  if (!t) return
-  await closeTerminal(t.hostId, t.sessionId)
+  const state = getTerm(key)
+  if (!state) return
+  await closeTerminal(state.hostId, state.sessionId)
   disposeSurface(key)
 }
 
@@ -387,6 +401,13 @@ watch(() => store.currentHostId, async id => {
   try {
     store.currentSessionId = ''
     await refreshSessions(id)
+    // 侧栏分组视图「点其它主机的某条任务直达」：意图记在 pendingSessionId，
+    // 列表里确实存在才落选中（用完即清；普通切主机时它是空串，走默认兜底）。
+    const want = store.pendingSessionId
+    store.pendingSessionId = ''
+    if (want && (store.sessions[id] || []).some(s => s.id === want)) {
+      store.currentSessionId = want
+    }
     if (id) await attachSurface(id, store.currentSessionId)
     scrollLog()
   } finally {
@@ -418,7 +439,7 @@ const currentSessionName = computed(() => {
     const h = store.hosts.find(x => x.id === store.currentHostId)
     if (h) return `${h.name} (${h.user}@${h.addr})`
   }
-  return '未命名任务'
+  return t('console.unnamed')
 })
 const hostOptions = computed(() =>
   store.hosts.map(h => ({ value: h.id, label: `${h.name} — ${h.user}@${h.addr}` }))
@@ -430,6 +451,21 @@ watch(currentSessionName, name => syncWindowTitle(name), { immediate: true })
 const activeProfileId = computed(() =>
   store.selectedProfileId || (store.llmProfiles.find(p => p.active) || {}).id || ''
 )
+
+// 欢迎页「新建任务」的前置条件：模型已配置。主机未配置/未选择时按钮仍可点，
+// 但引导去主机管理 —— 那里同时承担「添加」与「选择」。
+const llmReady = computed(() => !!activeProfileId.value)
+
+// 欢迎页新建任务：唯一主机直接选中（bootstrap 的单机自动选是同一规则），
+// 连接随选中立即建立；多台主机去主机管理挑。
+function welcomeNewTask() {
+  if (!llmReady.value) return
+  if (store.hosts.length === 1) {
+    store.currentHostId = store.hosts[0].id
+    return
+  }
+  emit('page', 'hosts')
+}
 const modelOptions = computed(() =>
   store.llmProfiles.map(p => ({
     value: p.id,
@@ -449,13 +485,13 @@ async function onSwitchModel(id) {
   }
   push({
     kind: 'system',
-    content: `已切换模型到「${p ? p.name : id}」，本会话上下文保留，下一轮对话生效。`
+    content: t('console.modelSwitched', { name: p ? p.name : id })
   })
 }
 
 async function onClearSession() {
   if (!store.currentHostId) {
-    push({ kind: 'error', content: '请先选择一台主机。' })
+    push({ kind: 'error', content: t('msg.pickHost') })
     return
   }
   await clearSession(store.currentHostId, store.currentSessionId)
@@ -463,7 +499,7 @@ async function onClearSession() {
 
 async function onCompactSession() {
   if (!store.currentHostId) {
-    push({ kind: 'error', content: '请先选择一台主机。' })
+    push({ kind: 'error', content: t('msg.pickHost') })
     return
   }
   await compactSession(store.currentHostId, store.currentSessionId)
@@ -477,7 +513,7 @@ const newEl = ref(null)
 
 function startNewSession() {
   if (!store.currentHostId) {
-    push({ kind: 'error', content: '请先选择一台主机。' })
+    push({ kind: 'error', content: t('msg.pickHost') })
     return
   }
   newName.value = ''
@@ -576,9 +612,10 @@ const copyTimers = new Map()   // key -> timer
 //       接着输入字符落在新行、退格却按旧列号定位，表现为擦错位置、字符乱跳。
 // 复制是高频动作，静默完成最稳妥；真要提示应走 UI 层（toast），不碰终端。
 async function copySelection(key) {
-  const t = getTerm(key)
-  if (!t) return false
-  const sel = t.term.getSelection ? t.term.getSelection() : ''
+  // 局部变量不能叫 t —— 遮蔽翻译函数（见 attachHandlers 内注释）。
+  const state = getTerm(key)
+  if (!state) return false
+  const sel = state.term.getSelection ? state.term.getSelection() : ''
   if (!sel) return false
   return writeClipboard(sel)
 }
@@ -607,7 +644,7 @@ function cancelCopyOnSelect(key) {
 // 各自停在不同目录（每任务一条独立 shell），用主机作键会打开到别人的目录。
 function openFiles() {
   if (!store.currentHostId) {
-    push({ kind: 'error', content: '请先选择一台主机。' })
+    push({ kind: 'error', content: t('msg.pickHost') })
     return
   }
   openFileManager(store.currentHostId, store.currentSessionId)
@@ -660,73 +697,116 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="console">
-    <header class="bar">
+    <!-- 未选主机时只显示欢迎页：工具条与切换按钮都无意义，整体隐藏。 -->
+    <header v-if="store.currentHostId" class="bar">
       <div class="row grow">
-        <label class="inline-label">目标主机</label>
+        <label class="inline-label">{{ t('console.bar.host') }}</label>
         <UiSelect
           v-model="store.currentHostId"
           class="host-select"
           :options="hostOptions"
-          placeholder="（暂无主机，请先到「主机管理」添加）"
+          :placeholder="t('console.bar.noHosts')"
         />
         <button
           class="sm tonal new-session-btn"
           :disabled="!store.currentHostId"
-          title="为当前主机新建一条任务"
+          :title="t('console.new.title')"
           @click="startNewSession"
-        >＋ 新建任务</button>
+        >{{ t('console.new.label') }}</button>
         <!-- 文件管理：默认打开当前终端所在的远端目录（目录由那条 shell
              通过 OSC 7 上报，见 store 的 term:cwd 处理）。 -->
         <button
           class="sm new-session-btn"
           :disabled="!store.currentHostId"
-          title="浏览当前终端所在目录，支持上传/下载/删除"
+          :title="t('console.files.title')"
           @click="openFiles"
-        >文件</button>
+        >{{ t('console.files.label') }}</button>
       </div>
 
       <div class="seg">
-        <button :class="{ on: !showArchive }" @click="showArchive = false">终端</button>
-        <button :class="{ on: showArchive }" @click="showArchive = true">对话归档</button>
+        <button :class="{ on: !showArchive }" @click="showArchive = false">{{ t('console.view.term') }}</button>
+        <button :class="{ on: showArchive }" @click="showArchive = true">{{ t('console.view.archive') }}</button>
       </div>
 
       <!-- 新建任务弹窗（应用内，WKWebView 上原生 prompt 不弹） -->
       <div v-if="showNewModal" class="overlay" @click.self="showNewModal = false">
         <div class="modal">
-          <h3>新建任务</h3>
+          <h3>{{ t('console.new.heading') }}</h3>
           <input
             ref="newEl"
             v-model="newName"
-            placeholder="任务名称，如「nginx 排查」"
+            :placeholder="t('console.new.placeholder')"
             @keydown="onNewKeydown"
           />
-          <div class="modal-hint">Enter 确定 · Esc 取消 · 留空则不创建</div>
+          <div class="modal-hint">{{ t('console.new.hint') }}</div>
           <div class="modal-actions">
-            <button class="sm" @click="showNewModal = false">取消</button>
-            <button class="sm primary" @click="commitNewSession">创建</button>
+            <button class="sm" @click="showNewModal = false">{{ t('console.new.cancel') }}</button>
+            <button class="sm primary" @click="commitNewSession">{{ t('console.new.create') }}</button>
           </div>
         </div>
       </div>
     </header>
 
-    <!-- 能力/风险横幅：说清两条输入路径的不同风险等级 -->
-    <div class="sess-banner">
-      <span>
-        控制台<span v-if="currentHost"> · <b>{{ currentHost.user }}@{{ currentHost.addr }}</b></span>
-        ｜ 在这里可直接敲 <b>Linux 命令</b>执行（以你的身份直接运行、不经审批；仅 <span class="mono">rm -rf /</span> 这类不可逆操作被硬拒绝），
-        也能用<b>自然语言</b>（中文 / <span class="mono">?</span> 开头）把需求交给 <b>LLM</b>。
-        top/vim 这类程序原生全屏接管，退出后最后一帧定格进模型上下文与审计。
-      </span>
-      <button v-if="canClose" class="sm" @click="onClose">关闭终端</button>
+    <!-- 关闭终端入口：能力/风险说明已移至欢迎页（未选主机时），不再常驻重复。 -->
+    <div v-if="canClose" class="sess-banner">
+      <button class="sm" @click="onClose">{{ t('console.term.close') }}</button>
     </div>
 
     <!-- 活表面：整幅 xterm，附着当前主机的常驻 shell PTY -->
     <div class="surface" ref="rootEl" v-show="!showArchive">
-      <div v-if="!store.currentHostId" class="surface-empty">请先选择一台主机。</div>
+      <!-- 未选主机的默认界面：功能介绍 + 引导。有主机提示上方选择；无主机给跳转按钮。 -->
+      <div v-if="!store.currentHostId" class="surface-empty welcome">
+        <h2 class="welcome-title">{{ t('console.welcome.title') }}</h2>
+        <p class="welcome-sub">{{ t('console.welcome.sub') }}</p>
+        <div class="welcome-feats">
+          <div class="welcome-feat">
+            <b>{{ t('console.welcome.f1t') }}</b>
+            <span>{{ t('console.welcome.f1d') }}</span>
+          </div>
+          <div class="welcome-feat">
+            <b>{{ t('console.welcome.f2t') }}</b>
+            <span>{{ t('console.welcome.f2d') }}</span>
+          </div>
+          <div class="welcome-feat">
+            <b>{{ t('console.welcome.f3t') }}</b>
+            <span>{{ t('console.welcome.f3d') }}</span>
+          </div>
+        </div>
+        <!-- 快捷入口：配置三步（模型 → 主机 → 新建任务）按使用顺序横排。
+             新建任务缺前置时禁用并用 title 说明缺什么，可点时单机直选、多机引导去主机管理。 -->
+        <div class="welcome-actions">
+          <button class="welcome-btn" @click="emit('page', 'settings')">
+            <svg width="17" height="17" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7z M12 3v2.5 M12 18.5V21 M4.2 7.5l2.2 1.3 M17.6 15.2l2.2 1.3 M4.2 16.5l2.2-1.3 M17.6 8.8l2.2-1.3"
+                    fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <span>{{ t('menu.page.settings') }}</span>
+          </button>
+          <button class="welcome-btn" @click="emit('page', 'hosts')">
+            <svg width="17" height="17" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 4h16v6H4z M4 14h16v6H4z M7 7h.01 M7 17h.01"
+                    fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <span>{{ t('app.nav.hosts') }}</span>
+          </button>
+          <button
+            class="welcome-btn primary"
+            :disabled="!llmReady || !store.hosts.length"
+            :title="!llmReady ? t('console.welcome.needLlm') : t('console.welcome.needHost')"
+            @click="welcomeNewTask"
+          >
+            <svg width="17" height="17" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 5v14 M5 12h14" fill="none" stroke="currentColor" stroke-width="1.7"
+                    stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <span>{{ t('console.new.label') }}</span>
+          </button>
+        </div>
+      </div>
       <template v-else>
         <div v-if="statusLine" class="surface-status" :class="{ bad: st && st.status === 'error' }">
           <span>{{ statusLine }}</span>
-          <button v-if="canRetry" class="sm" @click="onRetry">重新打开</button>
+          <button v-if="canRetry" class="sm" @click="onRetry">{{ t('console.term.reopen') }}</button>
         </div>
         <div class="surface-body">
           <div
@@ -747,7 +827,7 @@ onBeforeUnmount(() => {
         <div v-if="it.kind === 'toolGroup'" class="tool-group">
           <div class="tool-group-head" role="button" tabindex="0" @click="toggleGroup(it.id)">
             <span class="tg-arrow">{{ openGroups[it.id] ? '▾' : '▸' }}</span>
-            <span class="tg-label">{{ it.calls.length }} 次工具调用</span>
+            <span class="tg-label">{{ t('console.toolGroup', { n: it.calls.length }) }}</span>
           </div>
           <div v-show="openGroups[it.id]" class="tool-group-body">
             <div v-for="c in it.calls" :key="c.key" class="tool-call">
@@ -766,9 +846,9 @@ onBeforeUnmount(() => {
               </div>
               <div v-if="c.result" class="result">
                 <div class="result-head">
-                  <span class="muted">退出码 {{ c.result.exitCode }}</span>
-                  <span v-if="c.result.redacted" class="badge warn">已脱敏 {{ c.result.redacted }} 处</span>
-                  <span class="muted tiny">原始输出 · 发给 LLM 前已脱敏并标记为不可信</span>
+                  <span class="muted">{{ t('console.exitCode', { n: c.result.exitCode }) }}</span>
+                  <span v-if="c.result.redacted" class="badge warn">{{ t('console.redacted', { n: c.result.redacted }) }}</span>
+                  <span class="muted tiny">{{ t('console.rawOutput') }}</span>
                 </div>
                 <pre>{{ c.result.content }}</pre>
               </div>
@@ -779,14 +859,14 @@ onBeforeUnmount(() => {
         <!-- 屏幕快照：模型读的那份净化文本，人看同一份，审计才对得上 -->
         <div v-else-if="it.kind === 'snapshot'" class="result">
           <div class="result-head">
-            <span v-if="it.final" class="badge warn">终端结束画面 · 进模型上下文</span>
-            <span v-else class="badge warn">终端屏幕快照 · 进模型上下文</span>
-            <span v-if="it.redacted" class="badge warn">已脱敏 {{ it.redacted }} 处</span>
-            <span class="muted tiny">{{ it.final ? '全屏 TUI 退出/终端结束时定格的最后一屏（净化文本）' : '常驻终端静止后的可见屏幕（净化文本）' }}</span>
+            <span v-if="it.final" class="badge warn">{{ t('console.snapshot.final') }}</span>
+            <span v-else class="badge warn">{{ t('console.snapshot.live') }}</span>
+            <span v-if="it.redacted" class="badge warn">{{ t('console.redacted', { n: it.redacted }) }}</span>
+            <span class="muted tiny">{{ it.final ? t('console.snapshot.finalHint') : t('console.snapshot.liveHint') }}</span>
           </div>
           <pre>{{ it.text }}</pre>
           <div v-if="it.injection && it.injection.length" class="tool-reason">
-            检测到疑似提示注入：{{ it.injection.join('、') }}（内容已标记为不可信）
+            {{ t('console.injection.found', { findings: it.injection.join('、') }) }}
           </div>
         </div>
 
@@ -808,33 +888,32 @@ onBeforeUnmount(() => {
             <span class="model-chevron">&gt;</span>
           </div>
           <div class="msg-body">
-            <div v-if="archiveBadge(it) && archiveBadge(it).name" class="msg-model" title="这条回答实际使用的模型">
+            <div v-if="archiveBadge(it) && archiveBadge(it).name" class="msg-model" :title="t('console.model.used')">
               {{ archiveBadge(it).name }}<span v-if="it.model && archiveBadge(it).name !== it.model" class="msg-model-id"> · {{ it.model }}</span>
             </div>
-            <div v-else-if="it.model" class="msg-model" title="这条回答实际使用的模型">{{ it.model }}</div>
+            <div v-else-if="it.model" class="msg-model" :title="t('console.model.used')">{{ it.model }}</div>
             <div v-if="it.reasoning" class="reasoning">
               <div class="reasoning-head" @click="it.reasoningOpen = !it.reasoningOpen">
-                {{ it.streaming && !it.content ? '思考中…' : '思考过程' }}
+                {{ it.streaming && !it.content ? t('console.reasoning.thinking') : t('console.reasoning.label') }}
                 <span class="reasoning-arrow">{{ it.reasoningOpen ? '▾' : '▸' }}</span>
               </div>
               <div v-show="it.reasoningOpen" class="reasoning-body">{{ it.reasoning }}</div>
             </div>
-            {{ it.content }}<span v-if="it.streaming" class="caret"></span><span v-if="!it.content && !it.reasoning && !it.streaming" class="muted tiny">（模型返回了空回复）</span>
+            {{ it.content }}<span v-if="it.streaming" class="caret"></span><span v-if="!it.content && !it.reasoning && !it.streaming" class="muted tiny">{{ t('console.emptyReply') }}</span>
           </div>
         </div>
 
         <div v-else-if="it.kind === 'injection'" class="injection">
-          <div class="injection-title">远端输出中检测到疑似提示注入</div>
-          <div class="injection-body">命中话术：{{ it.findings.join('、') }}</div>
+          <div class="injection-title">{{ t('console.injection.title') }}</div>
+          <div class="injection-body">{{ t('console.injection.hits', { findings: it.findings.join('、') }) }}</div>
           <pre v-if="it.command" class="injection-cmd">{{ it.command }}</pre>
           <div class="injection-hint">
-            该内容来自 <span class="mono">{{ it.hostName }}</span> 的执行结果，已被标记为不可信数据，
-            不会作为指令执行。建议排查该主机上这段文本的来源。
+            {{ t('console.injection.p1') }}<span class="mono">{{ it.hostName }}</span>{{ t('console.injection.p2') }}{{ t('console.injection.p3') }}
           </div>
         </div>
 
         <div v-else-if="it.kind === 'error'" class="msg error">
-          <div class="msg-role">错误</div>
+          <div class="msg-role">{{ t('console.role.error') }}</div>
           <div class="msg-body">{{ it.content }}</div>
         </div>
 
@@ -844,19 +923,19 @@ onBeforeUnmount(() => {
       </div>
 
       <div v-if="!store.entries.length" class="archive-empty">
-        这条会话还没有归档记录。切到「终端」直接输入提问 / 敲命令。
+        {{ t('console.archiveEmpty') }}
       </div>
     </div>
 
-    <!-- 底部 composer：审批浮层 + 工具条 -->
-    <div class="composer-bar">
+    <!-- 底部 composer：审批浮层 + 工具条（未选主机时与工具条一起隐藏）。 -->
+    <div v-if="store.currentHostId" class="composer-bar">
       <!-- 审批条：必须是**浮层**（绝对定位、不占布局）。
            一旦它占布局，出现/消失就会改变 .surface 的高度 → 触发终端 resize →
            远端 shell 收到 SIGWINCH 重绘提示符 → 看起来像「agent 干活干到一半
            突然回到了命令行」。实测：审批出现与消失各触发一次重绘。 -->
       <div v-if="store.pending" class="approval">
         <div class="approval-head">
-          <span class="badge warn">需要你的批准</span>
+          <span class="badge warn">{{ t('console.approval.title') }}</span>
           <span class="mono">{{ store.pending.name }}</span>
           <span class="muted" v-if="store.pending.hostName">@{{ store.pending.hostName }}</span>
           <!-- 倒计时：告诉用户「不回答的代价」是什么。没有它，用户以为可以
@@ -865,19 +944,19 @@ onBeforeUnmount(() => {
             v-if="approvalCountdown"
             class="muted approval-countdown"
             :class="{ urgent: approvalRemainSec !== null && approvalRemainSec <= 30 }"
-          >{{ approvalCountdown }} 后失效</span>
-          <button class="sm right" @click="showCmdDetail = true">详细</button>
+          >{{ t('console.approval.expiry', { time: approvalCountdown }) }}</span>
+          <button class="sm right" @click="showCmdDetail = true">{{ t('console.approval.detail') }}</button>
         </div>
         <pre class="approval-cmd">{{ store.pending.command || store.pending.args }}</pre>
         <div class="approval-reason">{{ store.pending.reason }}</div>
         <div class="row" style="margin-top: 10px">
-          <button class="ok" @click="approve(true)">批准执行</button>
+          <button class="ok" @click="approve(true)">{{ t('console.approval.approve') }}</button>
           <!-- 拒绝与跳过在后端是同一个动作（不执行），差别只在**语义**：
                「拒绝」读起来像在否决 Agent 的判断，用户不确定拒绝了要不要
                给个理由；「跳过」是中性词，不想回答这条就直接跳过。
                两个按钮并存是为了让「不想回答」有一个心理成本最低的出口。 -->
-          <button class="danger" @click="approve(false)">拒绝</button>
-          <button class="sm" @click="approve(false)">跳过</button>
+          <button class="danger" @click="approve(false)">{{ t('console.approval.deny') }}</button>
+          <button class="sm" @click="approve(false)">{{ t('console.approval.skip') }}</button>
         </div>
       </div>
       <div class="composer-tools">
@@ -910,32 +989,32 @@ onBeforeUnmount(() => {
           :model-value="activeProfileId"
           :options="modelOptions"
           :disabled="store.running || !store.llmProfiles.length"
-          placeholder="（暂无服务商，请到「设置」添加）"
+          :placeholder="t('console.noProviders')"
           @change="onSwitchModel"
         />
         <button
           class="sm"
           :disabled="store.compacting"
-          :title="store.compacting ? '' : '让 LLM 把全部历史重写成一段摘要（花一次 API 调用）。日常使用无需手动压缩：旧的对话轮次已自动移出上下文。'"
+          :title="store.compacting ? '' : t('console.compact.title')"
           @click="onCompactSession"
         >
-          {{ store.compacting ? '压缩中…' : '压缩上下文' }}
+          {{ store.compacting ? t('console.compact.busy') : t('console.compact.label') }}
         </button>
-        <button class="sm" @click="onClearSession">清空上下文</button>
+        <button class="sm" @click="onClearSession">{{ t('console.clearCtx') }}</button>
         <span class="composer-sep"></span>
-        <button class="sm" @click="clearLog" :disabled="store.running || store.busy">清空记录</button>
-        <button v-if="store.running || store.busy" class="sm danger" @click="stop">中断</button>
+        <button class="sm" @click="clearLog" :disabled="store.running || store.busy">{{ t('console.clearLog') }}</button>
+        <button v-if="store.running || store.busy" class="sm danger" @click="stop">{{ t('console.interrupt') }}</button>
       </div>
     </div>
 
     <!-- 命令详细弹窗：审批卡内只做预览，超长命令在这里看全文 -->
     <div v-if="showCmdDetail" class="overlay" @click.self="showCmdDetail = false">
       <div class="modal cmd-modal">
-        <h3>待执行命令详细</h3>
+        <h3>{{ t('console.cmdDetail.title') }}</h3>
         <pre class="cmd-detail">{{ pendingCmd }}</pre>
         <div class="modal-actions">
-          <button class="sm" @click="copyPendingCmd">{{ cmdCopied ? '已复制' : '复制' }}</button>
-          <button class="sm primary" @click="showCmdDetail = false">关闭</button>
+          <button class="sm" @click="copyPendingCmd">{{ cmdCopied ? t('console.cmdDetail.copied') : t('console.cmdDetail.copy') }}</button>
+          <button class="sm primary" @click="showCmdDetail = false">{{ t('console.cmdDetail.close') }}</button>
         </div>
       </div>
     </div>
@@ -1028,13 +1107,9 @@ onBeforeUnmount(() => {
   flex-shrink: 0;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 12px;
   padding: 8px 16px;
-  background: var(--warn-bg);
-  color: var(--warn);
-  font-size: 12.5px;
-  line-height: 1.55;
   border-bottom: 1px solid var(--border);
 }
 .sess-banner .sm { flex-shrink: 0; }
@@ -1048,6 +1123,83 @@ onBeforeUnmount(() => {
   background: var(--bg);
 }
 .surface-empty { padding: 24px 16px; color: var(--text-3); font-size: 13px; }
+
+/* 欢迎页：未选主机时的默认界面。居中卡片，介绍三条输入路径并引导选主机。 */
+.welcome {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  text-align: center;
+  padding: 32px 24px;
+}
+.welcome-title {
+  margin: 0 0 6px;
+  font-size: 17px;
+  color: var(--text-1);
+}
+.welcome-sub {
+  margin: 0 0 18px;
+  color: var(--text-3);
+  font-size: 12.5px;
+}
+.welcome-feats {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 460px;
+  text-align: left;
+}
+.welcome-feat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+.welcome-feat b {
+  font-size: 13px;
+  color: var(--text-1);
+}
+.welcome-feat span {
+  font-size: 12px;
+  color: var(--text-3);
+  line-height: 1.55;
+}
+/* 快捷入口：三个竖排「图标 + 文字」按钮横排成一行，按配置顺序排列。 */
+.welcome-actions {
+  margin-top: 20px;
+  display: flex;
+  gap: 12px;
+}
+.welcome-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  min-width: 118px;
+  padding: 13px 18px 11px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text-1);
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+.welcome-btn svg { opacity: 0.8; }
+.welcome-btn:hover:not(:disabled) { border-color: var(--accent); }
+.welcome-btn.primary {
+  background: var(--accent-bg);
+  color: var(--accent);
+  border-color: transparent;
+  font-weight: 600;
+}
+.welcome-btn.primary:hover:not(:disabled) { border-color: var(--accent); }
+.welcome-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .surface-status {
   display: flex;
   align-items: center;

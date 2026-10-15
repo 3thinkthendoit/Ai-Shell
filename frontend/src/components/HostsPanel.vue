@@ -1,6 +1,7 @@
 <script setup>
 import { reactive, ref } from 'vue'
 import { store, refreshHosts, push } from '../store'
+import { t } from '../i18n'
 import UiSelect from './UiSelect.vue'
 
 const editing = ref(false)
@@ -42,7 +43,7 @@ function startEdit(h) {
 
 async function save() {
   if (!form.name.trim() || !form.addr.trim() || !form.user.trim()) {
-    push({ kind: 'error', content: '名称、地址、用户名均为必填。' })
+    push({ kind: 'error', content: t('hosts.required') })
     return
   }
   busy.value = true
@@ -50,7 +51,7 @@ async function save() {
     await window.go.main.App.SaveHost({ ...form })
     await refreshHosts()
     editing.value = false
-    push({ kind: 'system', content: `已保存主机「${form.name}」` })
+    push({ kind: 'system', content: t('hosts.saved', { name: form.name }) })
   } catch (e) {
     push({ kind: 'error', content: String(e) })
   } finally {
@@ -59,13 +60,13 @@ async function save() {
 }
 
 async function remove(h) {
-  if (!confirm(`确认删除主机「${h.name}」及其本地保存的密钥材料？此操作不可撤销。`)) return
+  if (!confirm(t('hosts.confirmDelete', { name: h.name }))) return
   try {
     await window.go.main.App.DeleteHost(h.id)
     await refreshHosts()
-    push({ kind: 'system', content: `已删除主机「${h.name}」` })
+    push({ kind: 'system', content: t('hosts.deleted', { name: h.name }) })
   } catch (e) {
-    push({ kind: 'error', content: `删除失败：${e}` })
+    push({ kind: 'error', content: t('hosts.deleteFail', { err: e }) })
   }
 }
 
@@ -83,124 +84,126 @@ async function test(h) {
 }
 
 async function forgetKey(h) {
-  if (!confirm(`清除「${h.name}」的主机指纹？下次连接将重新信任首次出现的密钥。`)) return
+  if (!confirm(t('hosts.confirmForget', { name: h.name }))) return
   try {
     await window.go.main.App.ForgetHostKey(h.id)
-    push({ kind: 'system', content: `已清除「${h.name}」的主机指纹` })
+    push({ kind: 'system', content: t('hosts.forgot', { name: h.name }) })
   } catch (e) {
-    push({ kind: 'error', content: `清除指纹失败：${e}` })
+    push({ kind: 'error', content: t('hosts.forgetFail', { err: e }) })
   }
 }
 
-const authLabel = m => ({ password: '密码', private_key: '私钥', agent: 'ssh-agent' }[m] || m)
+// 登录方式显示名。值（password/private_key/agent）是协议标识符，不翻；
+// ssh-agent 是产品名，保留原文。
+const authLabel = m => ({ password: t('hosts.auth.password'), private_key: t('hosts.auth.privateKey'), agent: 'ssh-agent' }[m] || m)
 </script>
 
 <template>
   <div class="panel">
     <header class="panel-head">
       <div>
-        <h2>主机管理</h2>
+        <h2>{{ t('hosts.title') }}</h2>
         <p class="muted">
-          密钥材料用 AES-256-GCM 加密后落盘，主密钥托管在操作系统钥匙串。
-          这些内容<b>不会</b>进入 LLM 的上下文。
+          {{ t('hosts.headHint.a') }}
+          {{ t('hosts.headHint.b1') }}<b>{{ t('hosts.headHint.no') }}</b>{{ t('hosts.headHint.b2') }}
         </p>
       </div>
-      <button class="primary" @click="startNew">新增主机</button>
+      <button class="primary" @click="startNew">{{ t('hosts.add') }}</button>
     </header>
 
     <div class="list">
-      <div v-if="!store.hosts.length" class="card muted">还没有主机，点击右上角「新增主机」开始。</div>
+      <div v-if="!store.hosts.length" class="card muted">{{ t('hosts.empty') }}</div>
 
       <div v-for="h in store.hosts" :key="h.id" class="card host">
         <div class="host-main">
           <div class="host-name">
             {{ h.name }}
             <span class="tag">{{ authLabel(h.authMethod) }}</span>
-            <span v-if="!h.hasSecret && h.authMethod !== 'agent'" class="tag danger">缺少凭据</span>
+            <span v-if="!h.hasSecret && h.authMethod !== 'agent'" class="tag danger">{{ t('hosts.noSecret') }}</span>
           </div>
           <div class="host-addr mono">{{ h.user }}@{{ h.addr }}</div>
           <div v-if="h.note" class="muted note">{{ h.note }}</div>
           <div v-if="testResult[h.id]" class="test" :class="testResult[h.id].ok ? 'ok' : 'bad'">
-            {{ testResult[h.id].ok ? '连接成功' : '连接失败' }}：{{ testResult[h.id].message }}
+            {{ testResult[h.id].ok ? t('hosts.test.ok') : t('hosts.test.fail') }}{{ testResult[h.id].message }}
             <span v-if="testResult[h.id].durationMs" class="muted">({{ testResult[h.id].durationMs }}ms)</span>
           </div>
         </div>
         <div class="host-actions">
           <button class="sm" :disabled="testing === h.id" @click="test(h)">
-            {{ testing === h.id ? '测试中…' : '测试连接' }}
+            {{ testing === h.id ? t('hosts.test.testing') : t('hosts.test.run') }}
           </button>
-          <button class="sm" @click="startEdit(h)">编辑</button>
-          <button class="sm" @click="forgetKey(h)">清除指纹</button>
-          <button class="sm danger" @click="remove(h)">删除</button>
+          <button class="sm" @click="startEdit(h)">{{ t('hosts.edit') }}</button>
+          <button class="sm" @click="forgetKey(h)">{{ t('hosts.forgetKey') }}</button>
+          <button class="sm danger" @click="remove(h)">{{ t('hosts.delete') }}</button>
         </div>
       </div>
     </div>
 
     <div v-if="editing" class="overlay" @click.self="editing = false">
       <div class="modal">
-        <h3>{{ form.id ? '编辑主机' : '新增主机' }}</h3>
+        <h3>{{ form.id ? t('hosts.editTitle') : t('hosts.addTitle') }}</h3>
 
         <div class="grid">
           <div>
-            <label>名称</label>
-            <input v-model="form.name" placeholder="生产 Web 服务器" />
+            <label>{{ t('hosts.f.name') }}</label>
+            <input v-model="form.name" :placeholder="t('hosts.f.namePh')" />
           </div>
           <div>
-            <label>登录方式</label>
+            <label>{{ t('hosts.f.auth') }}</label>
             <UiSelect
               v-model="form.authMethod"
               :options="[
-                { value: 'password', label: '密码' },
-                { value: 'private_key', label: '私钥' },
+                { value: 'password', label: t('hosts.auth.password') },
+                { value: 'private_key', label: t('hosts.auth.privateKey') },
                 { value: 'agent', label: 'ssh-agent' },
               ]"
             />
           </div>
           <div>
-            <label>地址 (host:port)</label>
+            <label>{{ t('hosts.f.addr') }}</label>
             <input v-model="form.addr" placeholder="10.0.0.12:22" />
           </div>
           <div>
-            <label>用户名</label>
+            <label>{{ t('hosts.f.user') }}</label>
             <input v-model="form.user" placeholder="root" />
           </div>
         </div>
 
         <template v-if="form.authMethod === 'password'">
-          <label>密码</label>
-          <input v-model="form.password" type="password" :placeholder="form.id ? '留空表示不修改' : '登录密码'" />
+          <label>{{ t('hosts.f.password') }}</label>
+          <input v-model="form.password" type="password" :placeholder="form.id ? t('hosts.keepEmpty') : t('hosts.f.passwordPh')" />
         </template>
 
         <template v-else-if="form.authMethod === 'private_key'">
-          <label>私钥内容 (PEM / OpenSSH)</label>
+          <label>{{ t('hosts.f.key') }}</label>
           <textarea
             v-model="form.privateKey"
             rows="6"
-            :placeholder="form.id ? '留空表示不修改' : '-----BEGIN OPENSSH PRIVATE KEY-----'"
+            :placeholder="form.id ? t('hosts.keepEmpty') : '-----BEGIN OPENSSH PRIVATE KEY-----'"
           ></textarea>
-          <label style="margin-top: 10px">私钥口令 (可选)</label>
-          <input v-model="form.passphrase" type="password" placeholder="没有就留空" />
-          <label style="margin-top: 10px">备用密码 (可选)</label>
-          <input v-model="form.password" type="password" placeholder="部分主机同时允许密码登录" />
+          <label style="margin-top: 10px">{{ t('hosts.f.passphrase') }}</label>
+          <input v-model="form.passphrase" type="password" :placeholder="t('hosts.f.passphrasePh')" />
+          <label style="margin-top: 10px">{{ t('hosts.f.backupPwd') }}</label>
+          <input v-model="form.password" type="password" :placeholder="t('hosts.f.backupPwdPh')" />
         </template>
 
         <div v-else class="hint">
-          使用本机 ssh-agent 中已加载的密钥，无需在此保存任何密钥材料。
-          <span class="muted">（Windows 下需已启动 OpenSSH 认证代理并设置 SSH_AUTH_SOCK）</span>
+          {{ t('hosts.agentHint') }}
+          <span class="muted">{{ t('hosts.agentHint.win') }}</span>
         </div>
 
-        <label style="margin-top: 12px">备注</label>
-        <input v-model="form.note" placeholder="可选" />
+        <label style="margin-top: 12px">{{ t('hosts.f.note') }}</label>
+        <input v-model="form.note" :placeholder="t('hosts.f.optional')" />
 
         <label class="chk" v-if="form.id">
           <input type="checkbox" v-model="form.clearSecret" />
-          清除该主机已保存的密钥材料
+          {{ t('hosts.clearSecret') }}
         </label>
 
         <div class="modal-actions">
-          <button @click="editing = false">取消</button>
+          <button @click="editing = false">{{ t('hosts.cancel') }}</button>
           <button class="primary" :disabled="busy" @click="save">
-            {{ busy ? '保存中…' : '保存' }}
+            {{ busy ? t('hosts.saving') : t('hosts.save') }}
           </button>
         </div>
       </div>

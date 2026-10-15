@@ -1,0 +1,52 @@
+// locales/sessions.js —— 侧栏会话/任务列表（SessionsSidebar.vue）的文案。
+// 相对时间的阈值文案也在这一域（timeAgo）。
+export const sessions = {
+  zh: {
+    'ss.defaultTask': '默认任务',
+    'ss.turns': '（{n} 轮）',
+    'ss.head': '任务 ({n})',
+    'ss.time.justNow': '刚刚',
+    'ss.time.min': '{n}分钟前',
+    'ss.time.hour': '{n}小时前',
+    'ss.time.day': '{n}天前',
+    'ss.time.date': '{m}月{d}日',
+    'ss.empty.none': '暂无任务。',
+    'ss.enterHost': '点击进入这台主机',
+    'ss.more': '更多操作',
+    'ss.rename': '重命名',
+    'ss.delete': '删除',
+    'ss.renameTitle': '重命名任务',
+    'ss.namePh': '任务名称',
+    'ss.enterEsc': 'Enter 确定 · Esc 取消',
+    'ss.cancel': '取消',
+    'ss.confirm': '确定',
+    'ss.deleteTitle': '删除任务',
+    'ss.delete.p1': '确认删除「',
+    'ss.delete.p2': '」？该任务的上下文会被永久丢弃，此操作不可撤销。',
+    'ss.deleteBtn': '确认删除'
+  },
+  en: {
+    'ss.defaultTask': 'Default task',
+    'ss.turns': ' ({n} turns)',
+    'ss.head': 'Tasks ({n})',
+    'ss.time.justNow': 'just now',
+    'ss.time.min': '{n}m ago',
+    'ss.time.hour': '{n}h ago',
+    'ss.time.day': '{n}d ago',
+    'ss.time.date': '{m}/{d}',
+    'ss.empty.none': 'No tasks yet.',
+    'ss.enterHost': 'Open this host',
+    'ss.more': 'More actions',
+    'ss.rename': 'Rename',
+    'ss.delete': 'Delete',
+    'ss.renameTitle': 'Rename task',
+    'ss.namePh': 'Task name',
+    'ss.enterEsc': 'Enter to confirm · Esc to cancel',
+    'ss.cancel': 'Cancel',
+    'ss.confirm': 'OK',
+    'ss.deleteTitle': 'Delete task',
+    'ss.delete.p1': 'Delete "',
+    'ss.delete.p2': '"? The task\'s context will be permanently discarded; this cannot be undone.',
+    'ss.deleteBtn': 'Delete'
+  }
+}

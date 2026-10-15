@@ -18,7 +18,7 @@
   <div v-if="fm.open" class="overlay" @click.self="close">
     <div class="modal fm-modal">
       <div class="fm-head">
-        <h3>文件管理</h3>
+        <h3>{{ t('fm.title') }}</h3>
         <span class="muted mono fm-host">{{ hostLabel }}</span>
       </div>
 
@@ -27,17 +27,17 @@
         <button
           class="sm"
           :disabled="!canGoParent || fm.busy"
-          title="上一级目录"
+          :title="t('fm.parent')"
           @click="goParent"
         >↑</button>
         <input
           v-model="pathInput"
           class="fm-path mono"
           spellcheck="false"
-          placeholder="远端目录，如 /etc/nginx"
+          :placeholder="t('fm.pathPh')"
           @keydown.enter.prevent="goPath"
         />
-        <button class="sm" :disabled="fm.loading || fm.busy" @click="refresh">刷新</button>
+        <button class="sm" :disabled="fm.loading || fm.busy" @click="refresh">{{ t('fm.refresh') }}</button>
       </div>
 
       <div v-if="fm.error" class="fm-error">{{ fm.error }}</div>
@@ -45,8 +45,8 @@
 
       <!-- 列表 -->
       <div class="fm-list">
-        <div v-if="fm.loading" class="fm-empty">读取中…</div>
-        <div v-else-if="!fm.entries.length" class="fm-empty">这个目录是空的</div>
+        <div v-if="fm.loading" class="fm-empty">{{ t('fm.loading') }}</div>
+        <div v-else-if="!fm.entries.length" class="fm-empty">{{ t('fm.empty') }}</div>
         <template v-else>
           <div
             v-for="e in sortedEntries"
@@ -56,12 +56,12 @@
           >
             <button
               class="fm-name"
-              :title="e.isDir ? '进入目录' : e.path"
+              :title="e.isDir ? t('fm.enterDir') : e.path"
               @click="onRowClick(e)"
             >
               <span class="fm-icon">{{ e.isDir ? '📁' : '📄' }}</span>
               <span class="fm-filename">{{ e.name }}</span>
-              <span v-if="e.isLink" class="fm-link">链接</span>
+              <span v-if="e.isLink" class="fm-link">{{ t('fm.link') }}</span>
             </button>
             <span class="fm-meta mono">{{ e.isDir ? '—' : humanSize(e.size) }}</span>
             <span class="fm-meta fm-mode mono">{{ e.mode }}</span>
@@ -74,8 +74,8 @@
               v-if="!e.isDir"
               class="fm-dl"
               :disabled="fm.busy"
-              title="下载到本机"
-              aria-label="下载到本机"
+              :title="t('fm.download')"
+              :aria-label="t('fm.download')"
               @click="download(e)"
             >
               <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
@@ -117,9 +117,9 @@
             v-if="fm.progress.phase === 'downloading'"
             class="sm fm-progress-cancel"
             :disabled="!fm.progress.id"
-            title="取消下载（半成品文件会被清掉）"
+            :title="t('fm.cancelTitle')"
             @click="fmCancelTransfer"
-          >取消</button>
+          >{{ t('fm.cancel') }}</button>
         </div>
         <div class="fm-progress-track">
           <!-- 不定进度（发送阶段）用条纹动画：这一段拿不到回调，
@@ -139,10 +139,10 @@
           class="fm-file"
           @change="onPickFile"
         />
-        <button class="sm" :disabled="fm.busy" @click="pickFile">上传到当前目录</button>
+        <button class="sm" :disabled="fm.busy" @click="pickFile">{{ t('fm.upload') }}</button>
         <span class="fm-spacer"></span>
-        <span class="modal-hint">上传/下载支持二进制</span>
-        <button class="sm primary" @click="close">关闭</button>
+        <span class="modal-hint">{{ t('fm.binaryHint') }}</span>
+        <button class="sm primary" @click="close">{{ t('fm.close') }}</button>
       </div>
     </div>
   </div>
@@ -154,6 +154,7 @@ import {
   store, closeFileManager, loadDir, fmEnter, fmGoParent,
   fmUpload, fmDownload, fmCancelTransfer, fmtBytes
 } from '../store'
+import { t } from '../i18n'
 
 const fm = store.fileManager
 
@@ -204,9 +205,9 @@ const progressText = computed(() => {
     }
     return base
   }
-  if (p.phase === 'downloading') return p.total ? `准备中 · ${size}` : '准备中…'
-  if (p.phase === 'sending') return `发送中 · ${size}`
-  if (p.phase === 'done') return '完成'
+  if (p.phase === 'downloading') return p.total ? t('fm.preparing', { size }) : t('fm.preparingNoSize')
+  if (p.phase === 'sending') return t('fm.sending', { size })
+  if (p.phase === 'done') return t('fm.done')
   return size
 })
 

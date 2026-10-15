@@ -1,5 +1,6 @@
 import { providerTermBadge } from '../providerLogos.js'
 import * as paint from '../termPaint.js'
+import { t } from '../i18n'
 import {
   store,
   push,
@@ -306,7 +307,7 @@ export function bindTerminalEvents(runtime) {
     const id = d && d.id
     if (!id || !store.pending || store.pending.id !== id) return
     store.pending = null
-    push({ kind: 'system', content: `${(d && d.reason) || '审批已失效'}，Agent 不会执行该命令。` })
+    push({ kind: 'system', content: t('console.approval.staleLine', { reason: (d && d.reason) || t('console.approval.gone') }) })
   })
 
   runtime.EventsOn('agent:status', s => {
@@ -346,7 +347,7 @@ export function bindTerminalEvents(runtime) {
       sink(base64ToBytes(d.data))
       armQuietTimer(k)
     } catch (e) {
-      push({ kind: 'error', content: '终端输出解码失败：' + String(e && e.message ? e.message : e) })
+      push({ kind: 'error', content: t('console.decodeFail', { err: String(e && e.message ? e.message : e) }) })
     }
   })
 
@@ -404,7 +405,7 @@ export function bindTerminalEvents(runtime) {
     const st = store.terms[bucketKey(d && d.hostId, d && d.sessionId)]
     if (!st || (st.status !== 'open' && st.status !== 'opening')) return
     st.status = 'closed'
-    st.exitReason = (d && d.reason) || '终端已结束'
+    st.exitReason = (d && d.reason) || t('console.termExited')
     st.cmdActive = false
     st.tuiActive = false
     endCmdPending(d && d.hostId, d && d.sessionId)
@@ -413,7 +414,7 @@ export function bindTerminalEvents(runtime) {
     // 画面，既不知道连接断了，也不知道按键为什么全部失效（表现为假死）。
     // 状态横幅在表面上方，盯着终端的人很容易漏看；在冻结的帧上补一行字，
     // 让「发生了什么」在事发地点可见。
-    paint.paintSystem(surfaceWrite(bucketKey(d && d.hostId, d && d.sessionId)), '终端已断开：' + st.exitReason)
+    paint.paintSystem(surfaceWrite(bucketKey(d && d.hostId, d && d.sessionId)), t('console.termDisconnected', { reason: st.exitReason }))
   })
 
   runtime.EventsOn('agent:snapshot', d => {
