@@ -4,6 +4,8 @@
 
 由 LLM 驱动的 Linux 远程运维桌面台。在本地管理 SSH 主机，用自然语言让 Agent 排查问题，也可以自己敲命令 —— 人敲的命令仅硬拒绝凭据读取与不可逆破坏、其余直接执行；Agent 提出的高危变更才需人工确认。
 
+**官网：** [https://ai-shell-6uejjranwbz.qoder.website/](https://ai-shell-6uejjranwbz.qoder.website/) · **安装包：** [GitHub Releases](https://github.com/3thinkthendoit/Ai-Shell/releases)
+
 基于 [Wails v2](https://wails.io/)（Go + Vue 3）。
 
 ## 功能

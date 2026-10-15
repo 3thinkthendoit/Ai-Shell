@@ -4,6 +4,8 @@
 
 LLM-powered remote Linux operations console. Manage SSH hosts from a desktop app, ask an agent to diagnose problems in natural language, or run shell commands yourself — commands you type run as you with no approval and are only hard-denied when they are irreversible or read credentials; confirmation applies to agent-proposed commands.
 
+**Website:** [https://ai-shell-6uejjranwbz.qoder.website/](https://ai-shell-6uejjranwbz.qoder.website/) · **Releases:** [GitHub Releases](https://github.com/3thinkthendoit/Ai-Shell/releases)
+
 Built with [Wails v2](https://wails.io/) (Go + Vue 3).
 
 

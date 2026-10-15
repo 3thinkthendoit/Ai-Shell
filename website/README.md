@@ -22,4 +22,4 @@ In the GitHub repo settings → Pages:
 
 Or push `website/` contents to a `gh-pages` branch.
 
-Product screenshots are loaded from GitHub user-attachments URLs used in the root README.
+Product screenshots live in `assets/` (`screenshot-chat.png`, `screenshot-terminal.png`). Keep public IPs and host details masked before adding new shots.
