@@ -9,7 +9,8 @@ import {
   store, push, clearLog, clearSession, bootstrap, refreshHosts, refreshSessions, bindEvents,
   ask, approve, stop, dismissAuditError, bucketKey,
   runShellInTerminal, reportActiveSession, selectSession, closeTerminal, termState,
-  registerTermSink, unregisterTermSink, registerLLMHint, textToBase64, bytesToBase64
+  registerTermSink, unregisterTermSink, registerLLMHint, textToBase64, bytesToBase64,
+  titleFromPrompt, maybeAutoTitleSession
 } from '../store.js'
 
 // 桶键由 bucketKey 生成，测试里不要手写 'h1\x00default' 这种字面量 ——
@@ -70,6 +71,7 @@ function makeApp(impl = {}) {
     // 会话列表的默认实现：只有一条默认会话 —— 与后端的不变式一致
     // （每台主机永远至少有一条默认会话）。
     ListSessions: async () => [{ id: 'default', name: '', turns: 0, archivedTurns: 0, isDefault: true }],
+    GetSessionTimeline: async () => [],
     Ask: async () => undefined,
     Approve: async () => true,
     Stop: async () => undefined
@@ -548,10 +550,31 @@ describe('ask 发送一轮对话', () => {
     // 特意选中一条具名会话：若 ask 漏传会话 id，后端会把它落到默认会话上，
     // 用户的提问就会进到另一条对话里 —— 而界面上看不出任何异常。
     store.currentSessionId = 's9'
+    store.sessions = {
+      h1: [{ id: 's9', name: '已有名字', turns: 1, archivedTurns: 0, isDefault: false }]
+    }
     await ask('看看磁盘')
     // 第 4 参是「这一轮用哪套 LLM 方案」：切换随请求即时生效（见 store.ask）。
     expect(calls[0].args).toEqual(['h1', 's9', '看看磁盘', store.selectedProfileId])
     expect(store.running).toBe(true)
+  })
+
+  it('未命名空会话首次发送：用首条消息起名，且不灌系统气泡', async () => {
+    const { app, calls } = makeApp({
+      Ask: async () => undefined,
+      RenameSession: async () => undefined,
+      ListSessions: async () => [{ id: 'default', name: '看看磁盘占用', turns: 0, archivedTurns: 0, isDefault: true }]
+    })
+    install({ runtime: rt, app })
+    store.currentHostId = 'h1'
+    store.currentSessionId = 'default'
+    store.sessions = {
+      h1: [{ id: 'default', name: '', turns: 0, archivedTurns: 0, isDefault: true }]
+    }
+    const entriesBefore = store.entries.length
+    await ask('看看磁盘占用')
+    expect(calls.some(c => c.name === 'RenameSession' && c.args[2] === '看看磁盘占用')).toBe(true)
+    expect(store.entries.length).toBe(entriesBefore)
   })
 
   it('后端同步拒绝（例如已有会话在跑）时复位运行态', async () => {
@@ -1213,15 +1236,15 @@ describe('reportActiveSession 报告活动会话', () => {
     await expect(reportActiveSession('h1', 's1')).resolves.toBeUndefined()
   })
 
-  it('selectSession 切会话时顺带把新会话报给后端', () => {
+  it('selectSession 切会话时顺带把新会话报给后端', async () => {
     const { app, calls } = makeApp({ ReportActiveSession: async () => undefined })
     install({ runtime: rt, app })
     store.currentHostId = 'h1'
-    selectSession('s2')
+    await selectSession('s2')
     expect(store.currentSessionId).toBe('s2')
-    // selectSession 不 await reportActiveSession，但调用是同步发出的。
-    expect(calls.filter(c => c.name === 'ReportActiveSession')).toHaveLength(1)
-    expect(calls[0].args).toEqual(['h1', 's2'])
+    const report = calls.filter(c => c.name === 'ReportActiveSession')
+    expect(report).toHaveLength(1)
+    expect(report[0].args).toEqual(['h1', 's2'])
   })
 })
 
@@ -1471,5 +1494,32 @@ describe('term:cmd 命令运行态', () => {
     expect(st.status).toBe('idle')
     expect(st.cmdActive).toBe(false)
     expect(st.tuiActive).toBe(false)
+  })
+})
+
+describe('titleFromPrompt / 首条消息起名', () => {
+  it('短文原样；超长截断并加省略号', () => {
+    expect(titleFromPrompt('  帮我看磁盘  ')).toBe('帮我看磁盘')
+    const long = '测'.repeat(50)
+    const title = titleFromPrompt(long)
+    expect(Array.from(title).length).toBe(40)
+    expect(title.endsWith('…')).toBe(true)
+    expect(title.startsWith('测'.repeat(39))).toBe(true)
+  })
+
+  it('自动起名失败时 silent 不往对话灌错误', async () => {
+    const { app } = makeApp({
+      RenameSession: async () => { throw new Error('这条会话已经不存在了') },
+      ListSessions: async () => [{ id: 'default', name: '', turns: 0, archivedTurns: 0, isDefault: true }]
+    })
+    install({ runtime: rt, app })
+    store.currentHostId = 'h1'
+    store.currentSessionId = 'default'
+    store.sessions = {
+      h1: [{ id: 'default', name: '', turns: 0, archivedTurns: 0, isDefault: true }]
+    }
+    const before = store.entries.length
+    await maybeAutoTitleSession('帮我查看一下本机配置信息')
+    expect(store.entries.length).toBe(before)
   })
 })

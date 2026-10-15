@@ -960,6 +960,14 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall, sessionHostID,
 		// Command：界面与审计都要显示「这次操作针对什么」，而只显示一个
 		// 工具名等于什么都没说。策略评估读的也是这个字段（见 protectedProbe）。
 		view.Command = p
+	} else if s := strArg(args, "scope"); s != "" {
+		view.Command = "scope=" + s
+	} else if u := strArg(args, "unit"); u != "" {
+		view.Command = u
+	} else if b := strArg(args, "before"); b != "" {
+		view.Command = b
+	} else if ch := strArg(args, "checks"); ch != "" {
+		view.Command = "verify"
 	}
 
 	tool, registered := lookupTool(tc.Function.Name)
@@ -1299,7 +1307,7 @@ func systemPrompt(v *vault.Vault, allowCrossHost bool, hostID string) string {
 			"  - 不要用正则里的 `$`（如 `grep -vE '^#|\\s*$'`）—— 换成 `grep -v '^#'` 这类不含 `$` 的写法，或用 `sed`/`awk` 时避开锚点 `$`；\n" +
 			"  - 需要取变量值时，先跑一条 `env | grep NAME` 之类的命令拿到值，下一条再用字面量；\n" +
 			"- 一条排查如果需要看多件事，就分几次调用工具，每次一条命令。多走几步不扣分，被用户连续批准才真的慢。\n\n" +
-			"### 例外\n\n`list_hosts`、`system_info`、`read_file`、`list_dir` 这类只读工具本身就免审批，不受上述写法限制。"
+			"### 例外\n\n`list_hosts`、`system_info`、`collect_diagnostics`、`journal_query`、`systemd_status`、`net_listen`、`snapshot_state`、`diff_state`、`verify_checks`、`read_file`、`list_dir`、`list_file_backups` 这类只读工具本身就免审批，不受上述写法限制。"
 	}
 	return `你是一个 Linux 运维助手，运行在一个桌面客户端里。你可以通过工具在用户的远程 Linux 主机上执行诊断命令。
 
@@ -1330,18 +1338,29 @@ func systemPrompt(v *vault.Vault, allowCrossHost bool, hostID string) string {
 
 按用途分组，前面的先试：
 
-**主机与系统**
+**主机与诊断**
 - list_hosts：列出已配置的主机（只含 id/名称/地址/用户名，不含任何密钥）。
-- system_info：一次性采集系统概览（发行版、内核、负载、内存、磁盘、失败服务、Top 进程、监听端口）。排查故障时优先用它建立全局印象。
+- system_info：轻量系统概览（发行版、内核、负载、内存、磁盘、失败服务、Top 进程、监听端口）。
+- collect_diagnostics：故障诊断包（比 system_info 更深，含 journal 错误等）。scope=default/network/disk/systemd/journal/full。排查故障时优先用它。
+- journal_query：查 systemd journal（可按 unit/优先级/时间窗/固定字符串过滤）。
+- systemd_status：查 unit 的 active/enabled/status。
+- net_listen：列监听端口，可按端口过滤。
+
+**基线、对比与验收**
+- snapshot_state：拍状态基线，保存到远端并返回 snapshot_id。变更前先拍。
+- diff_state：对比两份快照；after 可省略（省略则再采当前状态）。
+- verify_checks：按 JSON 清单验收（service/port/file_exists/file_contains/http）。变更后必须用它验证，未通过不要宣称成功。
 
 **读远端内容**
-- run_command：在远端执行一条 shell 命令，返回 stdout/stderr/退出码。
+- run_command：在远端执行一条 shell 命令，返回 stdout/stderr/退出码。结构化探针够用时优先用上面的专用工具。
 - read_file：读一个文本文件（配置、日志）。
 - list_dir：列一个目录。
 - json_query：从远端一个 JSON 文件里取出字段（路径如 .spec.replicas、.items[0].name、单独一个 . 表示整个文档）。**需要从 JSON 里取数据时用它，不要自己拼 awk/grep** —— 那些解释器类命令被安全策略刻意排除，拼了也过不了闸门。
 
-**写远端**
+**写远端与回滚**
 - write_file：覆盖写一个文件（自动备份原文件）。必须经用户批准。
+- list_file_backups：列出某文件的自动备份。
+- restore_file_backup：从备份恢复（会再备份当前文件）。必须经用户批准；验收失败时优先考虑回滚。
 - upload_local_file：把**运行本应用的那台机器上的文件**传到远端。必须经用户批准。
 
 **拉到本地**
@@ -1356,8 +1375,10 @@ func systemPrompt(v *vault.Vault, allowCrossHost bool, hostID string) string {
 ## 工作方式
 
 - 会话已绑定主机时（见上面第 7 条），直接在该主机上排查，**不要**先调 list_hosts 绕路；只有用户问到其他主机时才需要 list_hosts（且跨主机执行必须已获允许）。
-- 排查故障时优先用 system_info 建立全局印象，然后有针对性地深入。
-- 每次只提出必要的命令，先读后写，先诊断后修复。
+- 排查故障：优先 collect_diagnostics（或 system_info）→ journal_query / systemd_status / net_listen 深入 → 用证据做时间线（时间、unit、端口、变更点）再下结论。
+- 变更闭环：snapshot_state（改前）→ 经批准的 write_file/run_command → verify_checks → 失败则 list_file_backups + restore_file_backup，并用 diff_state 说明前后差异。
+- 多机对比（需跨主机策略允许）：对各主机分别 snapshot_state，再叙述差异；同机前后用 diff_state。
+- 每次只提出必要的命令，先读后写，先诊断后修复；没有验收通过不要宣称变更成功。
 - 用中文回答，结论先行，给出你观察到的证据。
 - 如果信息不足，直接问用户，不要臆测。` + wlNote + `
 

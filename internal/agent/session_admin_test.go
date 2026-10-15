@@ -365,6 +365,41 @@ func TestRenameSessionUnknownIsError(t *testing.T) {
 	}
 }
 
+func TestSessionTimelineRestoresUserAssistant(t *testing.T) {
+	a := New(nil, nil, noEmit)
+	info, err := a.CreateSession("h1", "查配置")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.remember("h1", info.ID, simpleTurn("帮我查看本机配置", "这是配置摘要"), defaultLimits())
+
+	got := a.SessionTimeline("h1", info.ID)
+	if len(got) != 2 {
+		t.Fatalf("应还原 2 条气泡，实得 %d: %+v", len(got), got)
+	}
+	if got[0].Kind != "user" || got[0].Content != "帮我查看本机配置" {
+		t.Errorf("首条应为用户提问，实得 %+v", got[0])
+	}
+	if got[1].Kind != "assistant" || got[1].Content != "这是配置摘要" {
+		t.Errorf("次条应为助手回答，实得 %+v", got[1])
+	}
+	if a.SessionTimeline("h1", "s-nope") != nil {
+		t.Error("不存在的会话应返回 nil/空")
+	}
+}
+
+// 默认会话尚未落盘时也能改名（列表能看见、map 里还没有）。
+func TestRenameSessionMaterializesDefault(t *testing.T) {
+	a := New(nil, nil, noEmit)
+	if err := a.RenameSession("h1", DefaultSessionID, "帮我查看本机配置"); err != nil {
+		t.Fatal(err)
+	}
+	got := a.ListSessions("h1")
+	if len(got) != 1 || got[0].ID != DefaultSessionID || got[0].Name != "帮我查看本机配置" {
+		t.Fatalf("应物化默认会话并改名，实得 %+v", got)
+	}
+}
+
 // 清空只丢历史，**保留会话本身和它的名字**。
 //
 // 这一条容易写反：如果清空把会话整个删掉，用户会看到自己精心起名的

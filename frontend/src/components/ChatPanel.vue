@@ -1,12 +1,17 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
-  store, ask, stop, approve, clearLog, clearSession, compactSession,
+  store, ask, stop, approve, loadSessionTimeline, currentSessionHasTurns,
   switchProfile, push, openFileManager,
-  noteConversationActivity, onFocusSessionChanged, shouldShowSessionChrome
+  commitDraftHost, ensureFreshTaskSession,
+  noteConversationActivity, onFocusSessionChanged
 } from '../store'
-import { providerBadge, providerTermBadge } from '../providerLogos'
-import { t } from '../i18n'
+import { providerBadge } from '../providerLogos'
+import { formatHostLabel, maskHostAddr } from '../hostDisplay'
+import { renderMarkdown } from '../markdown'
+import { assistantTokenStats, formatTokenCount } from '../tokenEstimate'
+import { i18n, t } from '../i18n'
+import logoSrc from '../assets/logo.svg'
 
 // Agent 对话页：首页对话框 + 气泡时间线（思考过程 / 工具调用）。
 // 终端页仍保留原有 Agent+Shell 分流；本组件是对话优先的第二条入口。
@@ -19,6 +24,8 @@ const logEl = ref(null)
 const showHostPicker = ref(false)
 const showModelPicker = ref(false)
 const showPolicyPicker = ref(false)
+// 仅「发送时因缺模型被拦住」后选模型才自动发出；任务中途换模型绝不偷发草稿。
+const sendAfterModelPick = ref(false)
 const nowTick = ref(Date.now())
 let tickTimer = null
 const modelMenuRoot = ref(null)
@@ -76,15 +83,58 @@ const openGroups = reactive({})
 function toggleGroup(id) { openGroups[id] = !openGroups[id] }
 
 const hasMessages = computed(() => store.entries.length > 0)
-// 营销首页只在「未选主机且无气泡」时出现。已选主机（含从终端切回）时
-// 用贴底工作区，避免终端敲过命令却没有 chat entries 时又掉回欢迎首页。
-const showHomeHero = computed(() => !hasMessages.value && !store.currentHostId)
-const homeDocked = computed(() => hasMessages.value || !!store.currentHostId)
-// 工具条：见过对话后清空记录仍保留；空首页仅选主机不因旧 turns 冒出来。
-const showChatChrome = computed(() => shouldShowSessionChrome())
+// 侧栏点进已绑定任务：有轮次或已加载气泡 → 对话页（勿闪新建欢迎）。
+// 仅预选主机（sessionBound=false）仍留欢迎首页，即使默认会话历史上有 turns。
+// 新建任务态必须无视其它会话残留的 entries / 审批 / 思考，否则会把别的任务
+// 正在流式输出的思考原文盖在欢迎页上。
+const sessionHasHistory = computed(() => {
+  if (store.freshTaskPending) return false
+  return hasMessages.value || (store.sessionBound && currentSessionHasTurns())
+})
+const showHomeHero = computed(() => !sessionHasHistory.value)
+const homeDocked = computed(() => sessionHasHistory.value)
+// 新建欢迎页可换主机；任务已绑定（CreateSession / 侧栏进入）或已有气泡后锁定。
+const hostLocked = computed(() => sessionHasHistory.value || store.sessionBound)
 watch(() => store.entries.length, noteConversationActivity, { immediate: true })
-watch(() => [store.currentHostId, store.currentSessionId], onFocusSessionChanged)
+watch(
+  () => [store.currentHostId, store.currentSessionId],
+  ([h, s]) => {
+    onFocusSessionChanged()
+    // 焦点会话变化时拉历史（selectSession 也会拉；切主机 pending 路径靠这里）。
+    if (h) void loadSessionTimeline(h, s)
+  }
+)
+watch(() => store.hostPickerIntent, () => {
+  if (!store.hostPickerIntent) return
+  // 对话已开始则不可换机；新建首页可随时弹出列表（含预选后重选）。
+  if (hostLocked.value) return
+  showModelPicker.value = false
+  showPolicyPicker.value = false
+  showHostPicker.value = true
+})
+watch(hostLocked, locked => {
+  if (locked) showHostPicker.value = false
+})
 const streamingNow = computed(() => store.entries.some(e => e.streaming))
+// 仅当「当前正在看的」就是正在跑的那一轮时，才显示思考占位。
+// 否则别的任务在跑、点了新建任务/切到别的会话，欢迎页会被全局 running 误刷出「思考中」。
+const viewingActiveRun = computed(() => {
+  if (!store.running) return false
+  if (store.freshTaskPending) return false
+  if (!store.currentHostId || !store.activeHostId) return false
+  if (store.currentHostId !== store.activeHostId) return false
+  // 与 bucketKey 一致：空串与 default 是同一会话。
+  const cur = store.currentSessionId || 'default'
+  const act = store.activeSessionId || 'default'
+  return cur === act
+})
+const showThinkingPlaceholder = computed(() =>
+  viewingActiveRun.value && !store.pending && !streamingNow.value
+)
+// 审批卡也只出现在「正在看的那一轮」，避免新建页被其它任务的批准条撑开。
+const showApprovalHere = computed(() =>
+  !!store.pending && viewingActiveRun.value
+)
 
 const decisionLabel = d => ({ allow: t('tl.decision.allow'), confirm: t('tl.decision.confirm'), deny: t('tl.decision.deny') }[d] || d)
 const decisionClass = d => ({ allow: 'ok', confirm: 'warn', deny: 'danger' }[d] || '')
@@ -93,14 +143,6 @@ const statusLabel = s => ({
   done: t('console.toolStatus.done'), denied: t('console.toolStatus.denied'),
   error: t('console.toolStatus.error')
 }[s] || s)
-
-function archiveBadge(e) {
-  if (e && e.badge) return e.badge
-  if (e && e.model) {
-    try { return providerTermBadge({ model: e.model, name: e.model }) } catch { return null }
-  }
-  return null
-}
 
 const activeProfileId = computed(() =>
   store.selectedProfileId || (store.llmProfiles.find(p => p.active) || {}).id || ''
@@ -144,13 +186,16 @@ function closeMetaMenus() {
 }
 
 function toggleModelMenu() {
-  if (store.running) return
+  // 运行中也允许换模型（选中后会先中断本轮），任务内切换下一轮即用新模型。
   const next = !showModelPicker.value
+  if (next) sendAfterModelPick.value = false
   closeMetaMenus()
   showModelPicker.value = next
 }
 
 function toggleHostMenu() {
+  // 进入对话框后主机已绑定，不可再换。
+  if (hostLocked.value) return
   const next = !showHostPicker.value
   closeMetaMenus()
   showHostPicker.value = next
@@ -189,18 +234,27 @@ onBeforeUnmount(() => {
     clearInterval(tickTimer)
     tickTimer = null
   }
+  if (copiedTimer) {
+    clearTimeout(copiedTimer)
+    copiedTimer = null
+  }
 })
 
-const currentHost = computed(() => store.hosts.find(h => h.id === store.currentHostId))
+// 新建首页用 draftHostId 预选；对话已开始用 currentHostId（已锁定）。
+const composerHostId = computed(() =>
+  hostLocked.value ? store.currentHostId : (store.draftHostId || store.currentHostId)
+)
+const currentHost = computed(() => store.hosts.find(h => h.id === composerHostId.value))
 const workspaceLabel = computed(() => {
   const h = currentHost.value
   if (!h) return t('chat.workspace')
-  return h.name
+  return formatHostLabel(h) || t('chat.workspace')
 })
 const workspaceTitle = computed(() => {
   const h = currentHost.value
   if (!h) return t('chat.workspace')
-  return `${h.name} · ${h.user}@${h.addr}`
+  const ip = maskHostAddr(h.addr)
+  return `${h.name} · ${h.user}@${ip}`
 })
 
 const policyLabel = computed(() =>
@@ -208,15 +262,21 @@ const policyLabel = computed(() =>
 )
 const policyTitle = computed(() => `${t('chat.policy')} · ${policyLabel.value}`)
 
+// 上下文圆环：模型 pill 左侧常显图标；文案 tip 仅悬停时出现。
+const CTX_RING_R = 9
+const CTX_RING_C = 2 * Math.PI * CTX_RING_R
+
 const ctxUsage = computed(() => {
   const { tokens, window: win, messages } = store.contextUsage
-  if (!tokens) return { tip: '', level: '', title: '' }
+  if (!tokens) return { tip: '', level: '', title: '', pct: 0, show: false }
   const used = fmtTokens(tokens)
   if (!win) {
     return {
       tip: t('console.ctx.tipNoWin', { used }),
       level: 'unknown',
-      title: t('console.ctx.unknown')
+      title: t('console.ctx.unknown'),
+      pct: 0,
+      show: true
     }
   }
   const pctNum = tokens * 100 / win
@@ -230,7 +290,17 @@ const ctxUsage = computed(() => {
       win: win.toLocaleString(),
       pct: Math.round(pctNum),
       messages
-    })
+    }),
+    pct: Math.min(100, Math.max(0, pctNum)),
+    show: true
+  }
+})
+
+const ctxRingStyle = computed(() => {
+  const pct = ctxUsage.value.pct || 0
+  return {
+    strokeDasharray: String(CTX_RING_C),
+    strokeDashoffset: String(CTX_RING_C * (1 - pct / 100))
   }
 })
 
@@ -258,17 +328,17 @@ watch(scrollKey, () => scrollLog())
 
 async function onSwitchModel(id) {
   if (!id || id === activeProfileId.value) return
-  const p = store.llmProfiles.find(x => x.id === id)
+  // 本轮还在跑 / busy 时先中断，否则 lane 占着，切换后点发送会一直「上一轮仍在执行」。
+  if (store.running || store.busy) {
+    await stop()
+  }
+  const prev = store.selectedProfileId
   store.selectedProfileId = id
   try {
     await switchProfile(id)
   } catch {
-    return
+    store.selectedProfileId = prev
   }
-  push({
-    kind: 'system',
-    content: t('console.modelSwitched', { name: p ? p.name : id })
-  })
 }
 
 function applyChip(chip) {
@@ -276,30 +346,50 @@ function applyChip(chip) {
   nextTick(() => inputEl.value?.focus())
 }
 
-function onAttach() {
-  if (!store.currentHostId) {
+async function onAttach() {
+  if (hostLocked.value) {
+    if (!store.currentHostId) {
+      showHostPicker.value = true
+      return
+    }
+    openFileManager(store.currentHostId, store.currentSessionId)
+    return
+  }
+  if (!store.draftHostId && !store.currentHostId) {
+    showHostPicker.value = true
+    return
+  }
+  // 附件需要真实主机：预选先提交；新建态则先开新会话再开文件管理。
+  if (!(await commitDraftHost()) || !(await ensureFreshTaskSession())) {
     showHostPicker.value = true
     return
   }
   openFileManager(store.currentHostId, store.currentSessionId)
 }
 
-function ensureReadyToSend() {
-  if (!store.currentHostId) {
+async function ensureReadyToSend() {
+  if (!store.draftHostId && !store.currentHostId) {
     showHostPicker.value = true
     return false
   }
   if (!activeProfileId.value) {
+    sendAfterModelPick.value = true
     showModelPicker.value = true
     return false
   }
+  // 预选主机在发送时才落到 currentHostId；新建态再静默开新会话。
+  if (!(await commitDraftHost())) {
+    showHostPicker.value = true
+    return false
+  }
+  if (!(await ensureFreshTaskSession())) return false
   return true
 }
 
 async function doSend() {
   const text = draft.value.trim()
   if (!text) return
-  if (!ensureReadyToSend()) return
+  if (!(await ensureReadyToSend())) return
   // 仅在 ask 真正发起成功后清草稿；busy / 校验失败 / 同步拒绝都保留输入。
   const ok = await ask(text)
   if (ok) draft.value = ''
@@ -308,6 +398,96 @@ async function doSend() {
 
 function onSendClick() {
   void doSend()
+}
+
+// ---- 消息操作（WorkBuddy 风：时间 + 复制 / 编辑 / 重发）----
+const copiedMsgId = ref(null)
+let copiedTimer = null
+
+function pad2(n) {
+  return String(n).padStart(2, '0')
+}
+
+function formatMsgTime(ts) {
+  if (!ts) return ''
+  const d = new Date(ts)
+  if (Number.isNaN(d.getTime())) return ''
+  if (i18n.locale === 'zh') {
+    return `${d.getMonth() + 1}月${d.getDate()}日 ${pad2(d.getHours())}:${pad2(d.getMinutes())}`
+  }
+  return d.toLocaleString('en-US', {
+    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+  })
+}
+
+async function writeClipboard(text) {
+  if (!text) return false
+  try {
+    await navigator.clipboard.writeText(text)
+    return true
+  } catch { /* 走兜底 */ }
+  const ta = document.createElement('textarea')
+  ta.value = text
+  ta.setAttribute('readonly', '')
+  ta.style.position = 'fixed'
+  ta.style.left = '-9999px'
+  ta.style.opacity = '0'
+  document.body.appendChild(ta)
+  ta.select()
+  let ok = false
+  try { ok = document.execCommand('copy') } catch { ok = false }
+  ta.remove()
+  return ok
+}
+
+async function copyMessage(it) {
+  const text = String(it?.content || '').trim()
+  if (!text) return
+  const ok = await writeClipboard(text)
+  if (!ok) return
+  copiedMsgId.value = it.id
+  if (copiedTimer) clearTimeout(copiedTimer)
+  copiedTimer = setTimeout(() => {
+    if (copiedMsgId.value === it.id) copiedMsgId.value = null
+  }, 1500)
+}
+
+function editMessage(it) {
+  const text = String(it?.content || '')
+  if (!text) return
+  draft.value = text
+  nextTick(() => {
+    inputEl.value?.focus()
+    const el = inputEl.value
+    if (el && typeof el.setSelectionRange === 'function') {
+      const n = text.length
+      el.setSelectionRange(n, n)
+    }
+  })
+}
+
+async function resendMessage(it) {
+  const text = String(it?.content || '').trim()
+  if (!text || store.running || store.busy) return
+  draft.value = text
+  await doSend()
+}
+
+const lastUserMsgId = computed(() => {
+  for (let i = store.entries.length - 1; i >= 0; i--) {
+    if (store.entries[i].kind === 'user') return store.entries[i].id
+  }
+  return null
+})
+
+function assistantTokensLabel(it) {
+  const st = assistantTokenStats(it)
+  if (!st) return ''
+  const out = formatTokenCount(st.out)
+  if (st.in > 0) {
+    return t('chat.msg.tokensIO', { in: formatTokenCount(st.in), out })
+  }
+  return t('chat.msg.tokensOut', { n: out })
 }
 
 function onComposerKeydown(e) {
@@ -319,18 +499,31 @@ function onComposerKeydown(e) {
 }
 
 function pickHost(id) {
-  store.currentHostId = id
+  if (hostLocked.value) return
+  // 只预选：不写 currentHostId，不自动发送；用户再点发送才进入任务。
+  store.draftHostId = id
   showHostPicker.value = false
-  nextTick(() => {
-    if (draft.value.trim() && activeProfileId.value) void doSend()
-  })
+  nextTick(() => inputEl.value?.focus())
+}
+
+async function onGotoTerm() {
+  // 开终端 = 真正开始任务：有预选则提交，新建态再静默开新会话。
+  if (store.draftHostId || store.currentHostId) {
+    if (!(await commitDraftHost())) return
+    if (!(await ensureFreshTaskSession())) return
+  }
+  emit('term')
 }
 
 function pickModel(id) {
   showModelPicker.value = false
+  const autoSend = sendAfterModelPick.value
+  sendAfterModelPick.value = false
   void onSwitchModel(id).then(() => {
-    // 发送前因缺模型被拦住的：选完若草稿还在且已有主机，自动发出。
-    if (draft.value.trim() && store.currentHostId) void doSend()
+    // 只有「点发送时因缺模型被拦住」才自动续发；任务中途换模型保留草稿，由用户再发。
+    if (autoSend && draft.value.trim() && (store.currentHostId || store.draftHostId)) {
+      void doSend()
+    }
   })
 }
 
@@ -358,12 +551,7 @@ async function pickPolicyMode(mode) {
     await api.SavePolicy(payload)
     store.policy = payload
     showPolicyPicker.value = false
-    push({
-      kind: 'system',
-      content: t('chat.policy.switched', {
-        mode: mode === 'whitelist' ? t('chat.policy.whitelist') : t('chat.policy.manual')
-      })
-    })
+    // 底栏 pill 已显示当前模式，不再往对话里灌「已切换为…」系统气泡。
   } catch (e) {
     push({ kind: 'error', content: t('chat.policy.fail', { err: e && e.message ? e.message : e }) })
   } finally {
@@ -374,22 +562,6 @@ async function pickPolicyMode(mode) {
 function goPolicyPage() {
   showPolicyPicker.value = false
   emit('page', 'policy')
-}
-
-async function onClearSession() {
-  if (!store.currentHostId) {
-    showHostPicker.value = true
-    return
-  }
-  await clearSession(store.currentHostId, store.currentSessionId)
-}
-
-async function onCompactSession() {
-  if (!store.currentHostId) {
-    showHostPicker.value = true
-    return
-  }
-  await compactSession(store.currentHostId, store.currentSessionId)
 }
 
 function scrollChips(dir) {
@@ -434,12 +606,19 @@ watch(
 watch(() => store.pending, v => {
   if (v) nextTick(scrollLog)
 })
+watch(showThinkingPlaceholder, v => {
+  if (v) scrollLog()
+})
 </script>
 
 <template>
   <div class="chat" :class="{ empty: showHomeHero }">
     <!-- 消息区：气泡时间线 + 待审批卡（审批进消息流，不盖在输入框上） -->
-    <div v-if="hasMessages || store.pending" class="log archive" ref="logEl">
+    <div
+      v-if="!store.freshTaskPending && (sessionHasHistory || showApprovalHere || showThinkingPlaceholder)"
+      class="log archive"
+      ref="logEl"
+    >
       <div class="log-col">
       <div v-for="it in timeline" :key="it.id" class="entry" :class="'entry-' + it.kind">
         <div v-if="it.kind === 'toolGroup'" class="tool-group">
@@ -488,34 +667,84 @@ watch(() => store.pending, v => {
         </div>
 
         <div v-else-if="it.kind === 'user'" class="msg user">
-          <div class="bubble">{{ it.content }}</div>
+          <div class="msg-col">
+            <div class="bubble">{{ it.content }}</div>
+            <div class="msg-actions" :class="{ revealed: copiedMsgId === it.id }">
+              <span v-if="it.ts" class="msg-time">{{ formatMsgTime(it.ts) }}</span>
+              <button
+                type="button"
+                class="msg-act"
+                :title="copiedMsgId === it.id ? t('chat.msg.copied') : t('chat.msg.copy')"
+                @click="copyMessage(it)"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="9" y="9" width="11" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.7" />
+                  <path d="M5 15V5a2 2 0 0 1 2-2h10" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                class="msg-act"
+                :title="t('chat.msg.resend')"
+                :disabled="store.running || store.busy || it.id !== lastUserMsgId"
+                @click="resendMessage(it)"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M3 12a9 9 0 1 0 3-6.7" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+                  <path d="M3 4v5h5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              </button>
+              <button type="button" class="msg-act" :title="t('chat.msg.edit')" @click="editMessage(it)">
+                <svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4 20h4L18 10l-4-4L4 16v4z M14 6l4 4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              </button>
+            </div>
+          </div>
         </div>
 
         <div v-else-if="it.kind === 'assistant'" class="msg assistant">
           <div class="asst-head">
-            <span
-              v-if="archiveBadge(it)"
-              class="asst-avatar"
-              :style="{ color: archiveBadge(it).color, background: archiveBadge(it).color + '22' }"
-              :title="archiveBadge(it).name"
-            >{{ archiveBadge(it).mark }}</span>
-            <span v-else class="asst-avatar fallback">AI</span>
+            <img class="asst-avatar" :src="logoSrc" alt="Ai-Shell" title="Ai-Shell" />
             <div class="asst-meta">
-              <span class="asst-name">{{ (archiveBadge(it) && archiveBadge(it).name) || it.model || 'Ai-Shell' }}</span>
-              <span v-if="it.streaming" class="asst-status">{{ t('console.reasoning.thinking') }}</span>
-              <span v-else-if="it.model && archiveBadge(it) && archiveBadge(it).name !== it.model" class="asst-status">{{ it.model }}</span>
+              <span class="asst-name">Ai-Shell</span>
+              <span v-if="it.streaming && it.content" class="asst-status">{{ t('console.reasoning.writing') }}</span>
+              <span v-else-if="it.model" class="asst-status">{{ it.model }}</span>
             </div>
           </div>
           <div class="asst-body">
-            <div v-if="it.reasoning" class="reasoning">
+            <!-- 思考阶段或已有思考内容：始终给出「思考过程」区块（推理模型会往里灌增量）。 -->
+            <div v-if="it.reasoning || (it.streaming && !it.content)" class="reasoning">
               <div class="reasoning-head" @click="it.reasoningOpen = !it.reasoningOpen">
                 {{ it.streaming && !it.content ? t('console.reasoning.thinking') : t('console.reasoning.label') }}
-                <span class="reasoning-arrow">{{ it.reasoningOpen ? '▾' : '▸' }}</span>
+                <span class="reasoning-arrow">{{ it.reasoningOpen !== false ? '▾' : '▸' }}</span>
               </div>
-              <div v-show="it.reasoningOpen" class="reasoning-body">{{ it.reasoning }}</div>
+              <div v-show="it.reasoningOpen !== false" class="reasoning-body">
+                <template v-if="it.reasoning">{{ it.reasoning }}</template>
+                <span v-else class="reasoning-wait">{{ t('console.reasoning.wait') }}</span>
+              </div>
             </div>
             <div class="asst-text">
-              {{ it.content }}<span v-if="it.streaming" class="caret"></span><span v-if="!it.content && !it.reasoning && !it.streaming" class="muted tiny">{{ t('console.emptyReply') }}</span>
+              <div v-if="it.content" class="md-body" v-html="renderMarkdown(it.content)"></div>
+              <span v-if="it.streaming && it.content" class="caret"></span>
+              <span v-if="!it.content && !it.reasoning && !it.streaming" class="muted tiny">{{ t('console.emptyReply') }}</span>
+            </div>
+            <div v-if="(it.content || it.reasoning) && !it.streaming" class="msg-footer asst-footer">
+              <span v-if="assistantTokensLabel(it)" class="msg-tokens">{{ assistantTokensLabel(it) }}</span>
+              <div class="msg-actions" :class="{ revealed: copiedMsgId === it.id }">
+                <span v-if="it.ts" class="msg-time">{{ formatMsgTime(it.ts) }}</span>
+                <button
+                  type="button"
+                  class="msg-act"
+                  :title="copiedMsgId === it.id ? t('chat.msg.copied') : t('chat.msg.copy')"
+                  @click="copyMessage(it)"
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true">
+                    <rect x="9" y="9" width="11" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.7" />
+                    <path d="M5 15V5a2 2 0 0 1 2-2h10" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" />
+                  </svg>
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -538,7 +767,7 @@ watch(() => store.pending, v => {
         </div>
       </div>
 
-      <div v-if="store.pending" class="approval in-feed">
+      <div v-if="showApprovalHere" class="approval in-feed">
         <div class="approval-head">
           <span class="badge warn">{{ t('console.approval.title') }}</span>
           <span class="mono">{{ store.pending.name }}</span>
@@ -558,20 +787,47 @@ watch(() => store.pending, v => {
           <button type="button" class="sm" @click="approve(false)">{{ t('console.approval.skip') }}</button>
         </div>
       </div>
+
+      <!-- 首包前占位：同款气泡 + 展开的思考过程区（有推理增量后由正式 assistant 条目接替）。 -->
+      <div
+        v-if="showThinkingPlaceholder"
+        class="msg assistant thinking-placeholder"
+        aria-live="polite"
+      >
+        <div class="asst-head">
+          <img class="asst-avatar" :src="logoSrc" alt="Ai-Shell" title="Ai-Shell" />
+          <div class="asst-meta">
+            <span class="asst-name">Ai-Shell</span>
+          </div>
+        </div>
+        <div class="asst-body">
+          <div class="reasoning">
+            <div class="reasoning-head">
+              {{ t('console.reasoning.thinking') }}
+              <span class="reasoning-arrow">▾</span>
+            </div>
+            <div class="reasoning-body">
+              <span class="reasoning-wait">
+                {{ t('console.reasoning.wait') }}<span class="thinking-dots" aria-hidden="true"><i>.</i><i>.</i><i>.</i></span>
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
       </div>
     </div>
 
     <!-- 空态：分类+快捷；对话中：只留输入框（参考 WorkBuddy 会话页） -->
-    <div class="home" :class="{ docked: homeDocked, conversing: hasMessages }">
+    <div class="home" :class="{ docked: homeDocked, conversing: sessionHasHistory }">
       <template v-if="showHomeHero">
         <h1 class="home-title">{{ t('chat.title') }}</h1>
         <p class="home-sub">{{ t('chat.subtitle') }}</p>
-        <button type="button" class="home-term-link" @click="emit('term')">
+        <button type="button" class="home-term-link" @click="onGotoTerm">
           {{ t('chat.gotoTerm') }}
         </button>
       </template>
 
-      <template v-if="!hasMessages">
+      <template v-if="!sessionHasHistory">
         <div class="tabs">
           <button
             v-for="tab in TABS"
@@ -613,8 +869,10 @@ watch(() => store.pending, v => {
             <div class="composer-left">
               <button type="button" class="tool-icon" :title="t('console.files.title')" @click="onAttach">+</button>
 
+              <!-- 新建任务首页可换主机；发出第一条消息后锁定。 -->
               <div ref="hostMenuRoot" class="host-menu-wrap">
                 <button
+                  v-if="!hostLocked"
                   type="button"
                   class="tool-pill meta-btn"
                   :class="{ open: showHostPicker }"
@@ -629,7 +887,19 @@ watch(() => store.pending, v => {
                   <span class="meta-label">{{ workspaceLabel }}</span>
                   <span class="caret-down">{{ showHostPicker ? '▴' : '▾' }}</span>
                 </button>
-                <div v-if="showHostPicker" class="host-menu" role="listbox">
+                <span
+                  v-else
+                  class="tool-pill meta-btn host-bound"
+                  :title="workspaceTitle"
+                >
+                  <svg class="meta-ico" width="14" height="14" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M4 4h16v6H4z M4 14h16v6H4z M7 7h.01 M7 17h.01"
+                          fill="none" stroke="currentColor" stroke-width="1.7"
+                          stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                  <span class="meta-label">{{ workspaceLabel }}</span>
+                </span>
+                <div v-if="showHostPicker && !hostLocked" class="host-menu" role="listbox">
                   <div v-if="store.hosts.length" class="model-menu-list">
                     <button
                       v-for="h in store.hosts"
@@ -637,15 +907,15 @@ watch(() => store.pending, v => {
                       type="button"
                       class="model-menu-item"
                       role="option"
-                      :aria-selected="h.id === store.currentHostId"
-                      :class="{ on: h.id === store.currentHostId }"
+                      :aria-selected="h.id === composerHostId"
+                      :class="{ on: h.id === composerHostId }"
                       @click="pickHost(h.id)"
                     >
                       <span class="model-menu-text">
                         <span class="model-menu-name">{{ h.name }}</span>
-                        <span class="model-menu-sub">{{ h.user }}@{{ h.addr }}</span>
+                        <span class="model-menu-sub">{{ h.user }}@{{ maskHostAddr(h.addr) }}</span>
                       </span>
-                      <span v-if="h.id === store.currentHostId" class="model-menu-check" aria-hidden="true">✓</span>
+                      <span v-if="h.id === composerHostId" class="model-menu-check" aria-hidden="true">✓</span>
                     </button>
                   </div>
                   <p v-else class="model-menu-empty">{{ t('chat.pickHost.empty') }}</p>
@@ -673,7 +943,7 @@ watch(() => store.pending, v => {
                           fill="none" stroke="currentColor" stroke-width="1.7"
                           stroke-linejoin="round" />
                   </svg>
-                  <span class="meta-label">{{ t('chat.policy') }}</span>
+                  <span class="meta-label">{{ policyLabel }}</span>
                   <span class="caret-down">{{ showPolicyPicker ? '▴' : '▾' }}</span>
                 </button>
                 <div v-if="showPolicyPicker" class="policy-menu" role="listbox">
@@ -717,19 +987,37 @@ watch(() => store.pending, v => {
             </div>
 
             <div class="composer-right">
-              <div ref="modelMenuRoot" class="model-menu-wrap">
-                <!-- 上下文用量：浮在模型 pill 上方的深色 tip（WorkBuddy 同款） -->
+              <!-- 上下文圆环在模型左侧；悬停才显示用量 tip -->
+              <div v-if="ctxUsage.show" class="ctx-ring-wrap">
+                <button
+                  type="button"
+                  class="ctx-ring-btn"
+                  :class="ctxUsage.level"
+                  :title="ctxUsage.title"
+                  :aria-label="ctxUsage.tip"
+                >
+                  <svg class="ctx-ring" viewBox="0 0 24 24" aria-hidden="true">
+                    <circle class="ctx-ring-track" cx="12" cy="12" :r="CTX_RING_R" />
+                    <circle
+                      class="ctx-ring-fill"
+                      cx="12"
+                      cy="12"
+                      :r="CTX_RING_R"
+                      :style="ctxRingStyle"
+                    />
+                  </svg>
+                </button>
                 <div
                   v-if="ctxUsage.tip && !showModelPicker"
                   class="ctx-tip"
                   :class="ctxUsage.level"
-                  :title="ctxUsage.title"
                 >{{ ctxUsage.tip }}</div>
+              </div>
+              <div ref="modelMenuRoot" class="model-menu-wrap">
                 <button
                   type="button"
                   class="model-pill"
                   :class="{ open: showModelPicker }"
-                  :disabled="store.running"
                   @click="toggleModelMenu"
                 >
                   <span
@@ -779,31 +1067,38 @@ watch(() => store.pending, v => {
                   </button>
                 </div>
               </div>
+              <!-- 运行中：发送钮变中断；「思考中」在消息流里（logo + Ai-Shell）。 -->
               <button
+                v-if="store.running || store.busy"
+                type="button"
+                class="send-btn stop-btn"
+                :title="t('console.interrupt')"
+                @click="stop"
+              >
+                <span class="stop-ico" aria-hidden="true"></span>
+              </button>
+              <button
+                v-else
                 type="button"
                 class="send-btn"
-                :disabled="store.running || store.busy || !draft.trim()"
+                :disabled="!draft.trim()"
                 :title="t('chat.send')"
                 @click="onSendClick"
-              >↑</button>
+              >
+                <svg class="send-ico" width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
+                  <path
+                    d="M12 19V5M12 5l-6 6M12 5l6 6"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2.2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+              </button>
             </div>
           </div>
         </div>
-      </div>
-
-      <!-- 压缩/清空等：空首页藏起；见过对话后清空记录仍显示。用量已挂模型 pill 上方。 -->
-      <div v-if="showChatChrome" class="chat-tools">
-        <span
-          v-if="store.running && !store.pending && !streamingNow"
-          class="thinking-inline"
-          aria-live="polite"
-        >{{ t('chat.working') }}<span class="thinking-dots" aria-hidden="true"><i>.</i><i>.</i><i>.</i></span></span>
-        <button class="sm" :disabled="store.compacting" :title="t('console.compact.title')" @click="onCompactSession">
-          {{ store.compacting ? t('console.compact.busy') : t('console.compact.label') }}
-        </button>
-        <button class="sm" @click="onClearSession">{{ t('console.clearCtx') }}</button>
-        <button class="sm" @click="clearLog" :disabled="store.running || store.busy">{{ t('console.clearLog') }}</button>
-        <button v-if="store.running || store.busy" class="sm danger" @click="stop">{{ t('console.interrupt') }}</button>
       </div>
     </div>
 
@@ -815,6 +1110,8 @@ watch(() => store.pending, v => {
   /* 首页 80%；有对话后消息列 90% */
   --home-col: 80%;
   --chat-col: 90%;
+  /* 头像 28 + 间距 8：正文 / 思考 / 工具调用共用左缘 */
+  --asst-indent: 36px;
   flex: 1;
   min-height: 0;
   display: flex;
@@ -963,17 +1260,27 @@ watch(() => store.pending, v => {
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.04);
   padding: 16px 16px 12px;
 }
+/* 盖掉全局 textarea 的边框/内边距/聚焦描边，只留外层 composer-card 一圈。 */
 .composer-input {
   width: 100%;
   border: 0;
+  border-radius: 0;
   outline: none;
+  box-shadow: none;
   resize: none;
   background: transparent;
+  padding: 0;
   color: var(--text);
   font: inherit;
+  font-family: inherit;
   font-size: 15px;
   line-height: 1.55;
   min-height: 64px;
+}
+.composer-input:focus {
+  border: 0;
+  outline: none;
+  box-shadow: none;
 }
 .composer-input::placeholder { color: var(--text-3); }
 .composer-toolbar {
@@ -1025,11 +1332,59 @@ watch(() => store.pending, v => {
   background: var(--surface-2);
   color: var(--text);
 }
+/* 已绑定主机：只读标签，无悬停手型 / 下拉箭头 */
+.tool-pill.host-bound {
+  cursor: default;
+  pointer-events: none;
+}
+.tool-pill.host-bound:hover {
+  background: transparent;
+  color: var(--text-2);
+}
 .model-menu-wrap,
 .host-menu-wrap,
 .policy-menu-wrap {
   position: relative;
 }
+.ctx-ring-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+.ctx-ring-btn {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-3);
+  cursor: default;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.ctx-ring-btn:hover { background: var(--surface-2); color: var(--text-2); }
+.ctx-ring {
+  width: 18px;
+  height: 18px;
+  transform: rotate(-90deg);
+  display: block;
+}
+.ctx-ring-track,
+.ctx-ring-fill {
+  fill: none;
+  stroke-width: 2.2;
+  stroke-linecap: round;
+}
+.ctx-ring-track { stroke: var(--border-strong); }
+.ctx-ring-fill { stroke: currentColor; transition: stroke-dashoffset 0.25s ease; }
+.ctx-ring-btn.ok { color: var(--accent); }
+.ctx-ring-btn.mid { color: #ca8a04; }
+.ctx-ring-btn.warn { color: #b45309; }
+.ctx-ring-btn.danger { color: #b91c1c; }
+.ctx-ring-btn.unknown { color: var(--text-3); }
 .ctx-tip {
   position: absolute;
   left: 50%;
@@ -1045,6 +1400,13 @@ watch(() => store.pending, v => {
   z-index: 35;
   pointer-events: none;
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.12s ease;
+}
+.ctx-ring-wrap:hover .ctx-tip {
+  opacity: 1;
+  visibility: visible;
 }
 .ctx-tip::after {
   content: '';
@@ -1118,21 +1480,34 @@ watch(() => store.pending, v => {
 .policy-menu {
   position: absolute;
   right: 0;
-  bottom: calc(100% + 8px);
+  bottom: calc(100% + 6px);
   width: min(320px, 78vw);
   max-height: min(360px, 50vh);
   display: flex;
   flex-direction: column;
   background: var(--surface);
-  border: 1px solid var(--border-strong);
-  border-radius: 12px;
-  box-shadow: var(--shadow);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
   z-index: 40;
   overflow: hidden;
 }
+/* 主机菜单：轻量锚定，别做成居中对话框观感 */
 .host-menu {
   left: 0;
   right: auto;
+  width: min(260px, 72vw);
+  max-height: min(240px, 36vh);
+  border-radius: 8px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
+}
+.host-menu .model-menu-item { padding: 6px 8px; gap: 8px; }
+.host-menu .model-menu-name { font-size: 12.5px; }
+.host-menu .model-menu-sub { font-size: 10.5px; }
+.host-menu .model-menu-list { padding: 4px; }
+.host-menu .model-menu-foot {
+  padding: 7px 10px;
+  font-size: 12px;
 }
 .policy-menu {
   left: 0;
@@ -1216,21 +1591,40 @@ watch(() => store.pending, v => {
   color: var(--text);
 }
 .send-btn {
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
   border: 0;
   background: var(--accent);
   color: #fff;
-  font-size: 16px;
   cursor: pointer;
   line-height: 1;
   flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+.send-btn .send-ico {
+  display: block;
 }
 .send-btn:disabled {
-  opacity: 0.35;
+  opacity: 1;
   cursor: not-allowed;
-  background: var(--text-3);
+  background: #c4c8ce;
+  color: #fff;
+}
+.send-btn.stop-btn {
+  background: var(--text);
+}
+.send-btn.stop-btn:hover {
+  background: var(--danger);
+}
+.stop-ico {
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  background: #fff;
 }
 
 .meta-ico { flex-shrink: 0; }
@@ -1241,21 +1635,13 @@ watch(() => store.pending, v => {
   white-space: nowrap;
 }
 
-.chat-tools {
-  width: var(--chat-col);
-  max-width: 100%;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
+.thinking-placeholder {
   margin-top: 4px;
 }
-.thinking-inline {
+.thinking-placeholder .asst-status {
   display: inline-flex;
   align-items: center;
-  gap: 2px;
-  font-size: 12px;
-  color: var(--text-3);
+  gap: 1px;
 }
 .thinking-dots i {
   animation: blink 1.2s infinite;
@@ -1363,8 +1749,15 @@ watch(() => store.pending, v => {
   display: flex;
   justify-content: flex-end;
 }
-.msg.user .bubble {
+.msg.user .msg-col {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
   max-width: min(85%, 520px);
+}
+.msg.user .bubble {
+  width: 100%;
   background: var(--surface-2);
   color: var(--text);
   border-radius: 16px 16px 4px 16px;
@@ -1373,6 +1766,70 @@ watch(() => store.pending, v => {
   line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-word;
+}
+.msg-footer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  min-height: 22px;
+}
+.asst-footer {
+  margin-top: 6px;
+}
+.msg-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 22px;
+  transition: opacity 0.12s;
+}
+/* 精细指针设备：默认隐藏时间和操作钮，悬停 / 焦点 / 刚复制时再显示。 */
+@media (hover: hover) and (pointer: fine) {
+  .msg-actions {
+    opacity: 0;
+  }
+  .msg.user:hover .msg-actions,
+  .msg.assistant:hover .msg-actions,
+  .msg-actions:focus-within,
+  .msg-actions.revealed {
+    opacity: 1;
+  }
+}
+.msg-time {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-right: 4px;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+.msg-tokens {
+  font-size: 11px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+.msg-act {
+  width: 26px;
+  min-height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.msg-act:hover:not(:disabled) {
+  background: var(--hover-overlay);
+  color: var(--text);
+  border-color: transparent;
+}
+.msg-act:disabled {
+  opacity: 0.28;
+  cursor: not-allowed;
 }
 .msg.assistant {
   display: flex;
@@ -1389,17 +1846,12 @@ watch(() => store.pending, v => {
 .asst-avatar {
   width: 28px;
   height: 28px;
-  border-radius: 50%;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 10px;
-  font-weight: 700;
+  border-radius: 8px;
   flex-shrink: 0;
-  background: var(--surface-2);
-  color: var(--accent);
+  object-fit: cover;
+  display: block;
+  background: #0B1220;
 }
-.asst-avatar.fallback { font-size: 11px; }
 .asst-meta {
   display: flex;
   flex-direction: column;
@@ -1417,14 +1869,99 @@ watch(() => store.pending, v => {
 }
 .asst-body {
   width: 100%;
-  padding-left: 36px;
+  padding-left: var(--asst-indent);
+  box-sizing: border-box;
 }
 .asst-text {
   font-size: 14px;
   line-height: 1.6;
-  white-space: pre-wrap;
   word-break: break-word;
   color: var(--text);
+}
+.asst-text .md-body > :first-child { margin-top: 0; }
+.asst-text .md-body > :last-child { margin-bottom: 0; }
+.asst-text .md-body p { margin: 0.55em 0; }
+.asst-text .md-body h1,
+.asst-text .md-body h2,
+.asst-text .md-body h3,
+.asst-text .md-body h4 {
+  margin: 0.9em 0 0.4em;
+  font-weight: 650;
+  line-height: 1.35;
+  color: var(--text);
+}
+.asst-text .md-body h1 { font-size: 1.25em; }
+.asst-text .md-body h2 { font-size: 1.12em; }
+.asst-text .md-body h3,
+.asst-text .md-body h4 { font-size: 1.02em; }
+.asst-text .md-body ul,
+.asst-text .md-body ol {
+  margin: 0.45em 0;
+  padding-left: 1.35em;
+}
+.asst-text .md-body li { margin: 0.2em 0; }
+.asst-text .md-body li > ul,
+.asst-text .md-body li > ol { margin: 0.15em 0; }
+.asst-text .md-body strong { font-weight: 650; }
+.asst-text .md-body a {
+  color: var(--accent);
+  text-decoration: none;
+}
+.asst-text .md-body a:hover { text-decoration: underline; }
+.asst-text .md-body code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+  background: var(--inset-bg);
+  border: 1px solid var(--border);
+}
+.asst-text .md-body pre {
+  margin: 0.55em 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+  border-radius: 8px;
+  background: var(--inset-bg);
+  border: 1px solid var(--border);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.asst-text .md-body pre code {
+  padding: 0;
+  border: none;
+  background: transparent;
+  font-size: inherit;
+}
+.asst-text .md-body blockquote {
+  margin: 0.55em 0;
+  padding: 0.15em 0 0.15em 0.85em;
+  border-left: 3px solid var(--border);
+  color: var(--text-2);
+}
+.asst-text .md-body table {
+  width: 100%;
+  margin: 0.65em 0;
+  border-collapse: collapse;
+  font-size: 13px;
+  display: block;
+  overflow-x: auto;
+}
+.asst-text .md-body th,
+.asst-text .md-body td {
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+.asst-text .md-body th {
+  background: var(--inset-bg);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.asst-text .md-body hr {
+  margin: 0.85em 0;
+  border: none;
+  border-top: 1px solid var(--border);
 }
 .msg.error .error-text { color: #b91c1c; padding-left: 0; }
 .msg.system {
@@ -1466,8 +2003,14 @@ watch(() => store.pending, v => {
   font-size: 12px;
   color: var(--text-2);
   white-space: pre-wrap;
+  line-height: 1.55;
+}
+.reasoning-wait {
+  color: var(--text-3);
+  font-style: italic;
 }
 .tool-group {
+  margin-left: var(--asst-indent);
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--surface);

@@ -744,7 +744,12 @@ func (a *App) OpenTerminal(hostID, sessionID string, cols, rows int) error {
 	}
 
 	key := termKey(hostID, sessionID)
-	// 只留当前任务：关掉这台主机上其它任务的 shell（各自触发 onExit 定格 + term:exit）。
+	// 只留当前任务：关掉同主机其它任务的 shell。
+	// 先 Abandon 再关：切会话是主动卸下，不要把登录 MOTD 当「结束画面」灌进对话；
+	// top/vim 有意义的帧在退出全屏时已经 Flush 过了。
+	for _, oldKey := range a.listHostTermKeysExcept(hostID, key) {
+		a.abandonTermVT(oldKey)
+	}
 	for _, oldKey := range a.ssh.CloseHostPTYsExcept(hostID, key) {
 		a.dropTermVT(oldKey, nil)
 	}
@@ -1004,6 +1009,32 @@ func (a *App) activeSession(hostID string) string {
 	return a.activeSess[hostID]
 }
 
+// abandonTermVT 放弃定格（不删登记）：随后 ClosePTY 触发的 onExit.Final 会空过。
+func (a *App) abandonTermVT(key string) {
+	a.mu.Lock()
+	if vt, ok := a.termVT[key]; ok {
+		vt.snapper.Abandon()
+	}
+	a.mu.Unlock()
+}
+
+// listHostTermKeysExcept 列出某主机上除 keepKey 外已登记的 VT 键（关之前 Abandon 用）。
+func (a *App) listHostTermKeysExcept(hostID, keepKey string) []string {
+	prefix := hostID + termKeySep
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]string, 0)
+	for k := range a.termVT {
+		if k == keepKey {
+			continue
+		}
+		if strings.HasPrefix(k, prefix) {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
 // dropTermVT 停掉并移除某个终端（按 termKey）的 VT 管线。幂等。
 //
 // want 是身份守卫：非空时只有当前登记的仍是 want 才删。一条终端晚到的
@@ -1104,6 +1135,8 @@ func (a *App) CloseTerminal(hostID, sessionID string) bool {
 		return false
 	}
 	key := termKey(hostID, sessionID)
+	// 主动关闭：放弃定格，避免登录 banner 进对话（见 Snapshotter.Abandon）。
+	a.abandonTermVT(key)
 	if !a.ssh.ClosePTY(key) {
 		return false
 	}
@@ -1182,6 +1215,14 @@ func (a *App) CreateSession(hostID, name string) (agent.SessionInfo, error) {
 		return agent.SessionInfo{}, err
 	}
 	return a.ag.CreateSession(hostID, name)
+}
+
+// GetSessionTimeline 拉取某条会话的历史气泡，供侧栏点进任务时还原对话页。
+func (a *App) GetSessionTimeline(hostID, sessionID string) []agent.TimelineEntry {
+	if err := a.ready(); err != nil {
+		return nil
+	}
+	return a.ag.SessionTimeline(hostID, sessionID)
 }
 
 // RenameSession 改会话名。默认会话**也可以**改名 ——

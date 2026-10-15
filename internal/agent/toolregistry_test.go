@@ -192,13 +192,17 @@ func newTestVault(t *testing.T) *vault.Vault {
 func TestToolVerdictsMatchReadWriteIntent(t *testing.T) {
 	pol := vault.PolicySettings{Mode: vault.ModeWhitelist}
 	writeTools := map[string]bool{
-		"write_file": true, "upload_local_file": true,
+		"write_file": true, "upload_local_file": true, "restore_file_backup": true,
 	}
 	for _, tool := range toolRegistry() {
 		if tool.Local {
 			continue
 		}
 		view := &ToolCallView{Name: tool.Name, Command: "/tmp/x"}
+		// verify_checks 的策略要从 checks JSON 里取路径，测试里补一份无害清单。
+		if tool.Name == "verify_checks" {
+			view.Args = `{"checks":[{"type":"port","port":80}]}`
+		}
 		got := tool.Evaluate(view, pol)
 		if writeTools[tool.Name] {
 			if got.Decision != policy.Confirm {

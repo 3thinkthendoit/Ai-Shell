@@ -15,6 +15,7 @@ import {
   bucketKey,
   termState
 } from '../store.js'
+import { estimateTokens } from '../tokenEstimate.js'
 
 const EV_NAMES = [
   'agent:delta', 'agent:message', 'agent:reasoning', 'agent:tool', 'agent:toolResult',
@@ -247,11 +248,22 @@ export function bindTerminalEvents(runtime) {
       if (m.model) live.model = m.model
       live.streaming = false
       live.reasoningOpen = false
+      // 定稿时记下本步上下文估算 + 本条输出估算，供气泡底栏展示。
+      live.tokensIn = store.contextUsage.tokens || live.tokensIn || 0
+      live.tokensOut = estimateTokens(`${live.reasoning || ''}${m.content || ''}`)
       paint.paintAssistantEnd(w)
       return
     }
     const badge = m.model ? providerTermBadge({ model: m.model, name: m.model }) : currentModelBadge()
-    push({ kind: 'assistant', content: m.content, model: m.model, badge })
+    const tokensOut = estimateTokens(m.content || '')
+    push({
+      kind: 'assistant',
+      content: m.content,
+      model: m.model,
+      badge,
+      tokensIn: store.contextUsage.tokens || 0,
+      tokensOut
+    })
     paint.paintAssistantHeader(w, badge)
     paint.paintAssistantDelta(w, m.content)
     paint.paintAssistantEnd(w)
@@ -284,6 +296,9 @@ export function bindTerminalEvents(runtime) {
     store.contextUsage.tokens = d.tokens || 0
     store.contextUsage.window = d.window || 0
     store.contextUsage.messages = d.messages || 0
+    // 挂到当前流式助手气泡，定稿后底栏可显示「上下文 / 输出」。
+    const live = targetEntries().find(e => e.kind === 'assistant' && e.streaming)
+    if (live) live.tokensIn = d.tokens || 0
   })
 
   runtime.EventsOn('agent:injection', e => {

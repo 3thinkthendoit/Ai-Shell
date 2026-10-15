@@ -6,7 +6,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import {
   store, push, clearSession, compactSession, refreshSessions, refreshHosts, bindEvents, ask,
-  createSession, renameSession, deleteSession, selectSession, bucketKey
+  createSession, renameSession, deleteSession, selectSession, loadSessionTimeline, bucketKey
 } from '../store.js'
 
 // ---- 测试替身 ----
@@ -36,7 +36,8 @@ function makeApp(impl = {}) {
     CompactSession: async () => ({ compacted: true, message: '已压缩。' }),
     CreateSession: async () => namedSession('s1', '新会话'),
     RenameSession: async () => undefined,
-    DeleteSession: async () => undefined
+    DeleteSession: async () => undefined,
+    GetSessionTimeline: async () => []
   }
   const merged = { ...base, ...impl }
   const app = {}
@@ -151,6 +152,33 @@ describe('refreshSessions 拉取会话列表', () => {
     await refreshSessions('h1')
 
     expect(store.currentSessionId).toBe('s2')
+  })
+
+  it('晚到的旧 ListSessions 不得覆盖较新的列表', async () => {
+    let releaseSlow
+    const slow = new Promise(r => { releaseSlow = r })
+    let n = 0
+    const { app } = makeApp({
+      ListSessions: async () => {
+        n += 1
+        if (n === 1) {
+          await slow
+          return [defaultSession()]
+        }
+        return [defaultSession(), namedSession('s-fresh', '新任务')]
+      }
+    })
+    install(app)
+    store.currentHostId = 'h1'
+    const p1 = refreshSessions('h1')
+    const p2 = refreshSessions('h1')
+    await p2
+    expect(store.currentSessions.map(s => s.id)).toEqual(['default', 's-fresh'])
+    store.currentSessionId = 's-fresh'
+    releaseSlow()
+    await p1
+    expect(store.currentSessions.map(s => s.id)).toEqual(['default', 's-fresh'])
+    expect(store.currentSessionId).toBe('s-fresh')
   })
 
   // 拉列表失败时**不能**把界面清空：用户会以为自己所有会话都没了。
@@ -294,11 +322,47 @@ describe('清空与压缩都作用于指定的那条会话', () => {
 // ---- 增删改 ----
 
 describe('会话的增删改', () => {
-  it('selectSession 切换当前会话，空值落到默认会话', () => {
-    selectSession('s3')
+  it('selectSession 切换当前会话，空值落到默认会话', async () => {
+    await selectSession('s3')
     expect(store.currentSessionId).toBe('s3')
-    selectSession('')
+    await selectSession('')
     expect(store.currentSessionId).toBe('')
+  })
+
+  it('点进有历史的任务时 loadSessionTimeline 还原气泡', async () => {
+    const { app, calls } = makeApp({
+      GetSessionTimeline: async () => [
+        { kind: 'user', content: '刚才在讨论什么' },
+        { kind: 'assistant', content: '我们在看本机配置' }
+      ]
+    })
+    install(app)
+    store.currentHostId = 'h1'
+    store.currentSessionId = 's1'
+    store.sessions = {
+      h1: [defaultSession(), namedSession('s1', '未命名任务', 2)]
+    }
+
+    await loadSessionTimeline('h1', 's1')
+
+    expect(calls.some(c => c.name === 'GetSessionTimeline' && c.args[0] === 'h1' && c.args[1] === 's1')).toBe(true)
+    expect(store.bySession[at('h1', 's1')].map(e => e.kind)).toEqual(['user', 'assistant'])
+    expect(store.entries.map(e => e.content)).toEqual(['刚才在讨论什么', '我们在看本机配置'])
+  })
+
+  it('本地已有气泡时不再覆盖历史', async () => {
+    const { app, calls } = makeApp({
+      GetSessionTimeline: async () => [{ kind: 'user', content: '旧的' }]
+    })
+    install(app)
+    store.currentHostId = 'h1'
+    store.currentSessionId = 's1'
+    push({ kind: 'user', content: '当场新问' }, 'h1', 's1')
+
+    await loadSessionTimeline('h1', 's1')
+
+    expect(calls.filter(c => c.name === 'GetSessionTimeline')).toHaveLength(0)
+    expect(store.entries.map(e => e.content)).toEqual(['当场新问'])
   })
 
   // 新建之后必须**切过去**：用户的意图就是「开一段新对话」，
@@ -347,17 +411,20 @@ describe('会话的增删改', () => {
     expect(store.currentSessions.find(s => s.id === 's1').name).toBe('新名字')
   })
 
-  it('删掉当前选中的会话后回落到默认会话', async () => {
+  it('删掉最后一条可见任务后回到新建任务态（清主机）', async () => {
     const { app } = makeApp({
       ListSessions: async () => [defaultSession()]
     })
     install(app)
     store.currentHostId = 'h1'
     store.currentSessionId = 's1'
+    store.chatHomeIntent = 0
 
     await deleteSession('s1')
 
-    expect(store.currentSessionId).toBe('default')
+    expect(store.currentHostId).toBe('')
+    expect(store.currentSessionId).toBe('')
+    expect(store.chatHomeIntent).toBe(1)
   })
 
   // 上一条用例里，回落其实是**刷新的兜底**顺手做的（列表里没有 s1 了，
@@ -403,21 +470,42 @@ describe('会话的增删改', () => {
     expect(store.currentSessionId).toBe('s1')
   })
 
-  it('删除默认会话会清掉对话气泡并提示已删除', async () => {
+  it('删除默认会话后若无剩余可见任务则回到新建任务态', async () => {
     const { app, calls } = makeApp({
       ListSessions: async () => [defaultSession()]
     })
     install(app)
     store.currentHostId = 'h1'
     store.currentSessionId = 'default'
+    store.chatHomeIntent = 0
     push({ kind: 'user', content: 'hi' })
 
     await deleteSession('default')
 
     expect(calls.filter(c => c.name === 'DeleteSession')).toHaveLength(1)
+    expect(store.currentHostId).toBe('')
+    expect(store.currentSessionId).toBe('')
+    expect(store.chatHomeIntent).toBe(1)
     expect(store.entries.filter(e => e.kind === 'user')).toHaveLength(0)
-    expect(store.entries.at(-1).kind).toBe('system')
-    expect(store.entries.at(-1).content).toContain('已删除')
+  })
+
+  it('删后仍有可见任务时留在当前主机，不灌「已删除」气泡', async () => {
+    const { app } = makeApp({
+      ListSessions: async () => [defaultSession(), namedSession('s2', '还在')]
+    })
+    install(app)
+    store.currentHostId = 'h1'
+    store.currentSessionId = 's1'
+    store.sessions = {
+      h1: [defaultSession(), namedSession('s1', '待删'), namedSession('s2', '还在')]
+    }
+    const before = store.entries.length
+
+    await deleteSession('s1')
+
+    expect(store.currentHostId).toBe('h1')
+    expect(store.entries.length).toBe(before)
+    expect(store.entries.some(e => String(e.content || '').includes('已删除'))).toBe(false)
   })
 
   it('没有选中主机时增删改都不打后端', async () => {

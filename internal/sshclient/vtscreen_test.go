@@ -181,6 +181,18 @@ func TestSnapshotterStopIsFinal(t *testing.T) {
 	}
 }
 
+func TestSnapshotterAbandonSuppressesFinal(t *testing.T) {
+	s := NewScreen(20, 3)
+	s.Feed([]byte("Welcome to Ubuntu\n"))
+	var n int
+	sn := NewSnapshotter(s, 0, func(string, bool) { n++ })
+	sn.Abandon()
+	sn.Final() // 主动关闭路径：不应把 MOTD 当结束画面送出
+	if n != 0 {
+		t.Fatalf("Abandon 后 Final 不该送帧，实得 %d 次", n)
+	}
+}
+
 // 备用屏幕开关是「全屏 TUI 接管/让出屏幕」的信号，必须被精确捕获，
 // 且私有模式序列本身不能被当字面字符印到屏幕上。
 func TestScreenAltScreenDetect(t *testing.T) {

@@ -104,6 +104,20 @@ export const store = reactive({
   },
   currentHostId: '',
 
+  // draftHostId：新建任务首页底栏「预选」的主机。
+  // 还没发对话 / 开终端前不写入 currentHostId，避免侧栏切到该主机、
+  // 首页被会话列表拖走。真正开始任务时再 commitDraftHost()。
+  draftHostId: '',
+
+  // freshTaskPending：处于「新建任务」欢迎态。发对话 / 开终端时要先
+  // createSession，避免落到该主机已有上下文的默认会话上串线。
+  // 点侧栏已有任务进入时清掉。
+  freshTaskPending: false,
+
+  // sessionBound：任务已真正开始（新建会话成功 / 侧栏进入已有任务）。
+  // 与 hasMessages 一起锁定底栏主机：CreateSession 后、首条气泡前也不能换机。
+  sessionBound: false,
+
   // currentSessionId 是当前选中的会话，空串表示默认会话。
   //
   // 敢用「空串表示默认」，是因为后端守住了一条不变式：**每台主机
@@ -187,9 +201,15 @@ export const store = reactive({
   activeHostId: '',
   activeSessionId: '',
 
-  // newTaskIntent：侧栏「新建任务」点一下就 +1。ConsolePanel 监听后弹出命名框。
+  // newTaskIntent：主导航「新建任务」点一下就 +1；ConsolePanel 回欢迎首页。
   // 用计数而不是布尔：连续点两次也要各触发一次。
   newTaskIntent: 0,
+
+  // chatHomeIntent：删光侧栏任务等场景 +1；ConsolePanel 切回对话欢迎首页。
+  chatHomeIntent: 0,
+
+  // hostPickerIntent：需要用户先选主机时 +1；ChatPanel 监听后弹出主机列表。
+  hostPickerIntent: 0,
 
   pending: null,
   running: false,
@@ -431,6 +451,10 @@ export async function refreshHosts() {
   await refreshSessions(store.currentHostId)
 }
 
+// 会话列表拉取代数：并发 refresh（切主机 watch + createSession）时，
+// 晚到的旧 ListSessions 不得覆盖新列表、更不得把刚选中的会话打回默认。
+const sessionListEpoch = Object.create(null)
+
 // refreshSessions 拉取某台主机的会话列表，并把「当前选中的会话」修正到有效值。
 //
 // 这一步不能省。列表是用户操作（新建/改名/删除）之后唯一的事实来源，
@@ -441,6 +465,7 @@ export async function refreshSessions(hostId) {
     store.currentSessionId = ''
     return
   }
+  const epoch = (sessionListEpoch[hostId] = (sessionListEpoch[hostId] || 0) + 1)
   let list
   try {
     list = (await api().ListSessions(hostId)) || []
@@ -450,6 +475,9 @@ export async function refreshSessions(hostId) {
     push({ kind: 'error', content: t('msg.sessionsFail', { err: e && e.message ? e.message : e }) }, hostId)
     return
   }
+  // 已被更新的拉取取代：丢弃这份过期结果，避免冲掉刚 CreateSession 的列表。
+  if (epoch !== sessionListEpoch[hostId]) return
+
   store.sessions = { ...store.sessions, [hostId]: list }
 
   // 选中的会话可能指向一条**已经被删掉**的会话，也可能还是初始的空串。
@@ -517,7 +545,10 @@ export function liveAssistant(step) {
   if (step === undefined || step === null) return undefined
   // 认的是「正在跑那一轮」的时间线，不是当前选中的会话 ——
   // 跑到一半切了主机或会话，流式消息仍在原来那条时间线上。
-  return targetEntries().find(e => e.kind === 'assistant' && e.stream === step)
+  // step 统一成 Number：Wails/JSON 偶发字符串，严格 === 会对不上、思考增量无法挂载。
+  const want = Number(step)
+  if (Number.isNaN(want)) return undefined
+  return targetEntries().find(e => e.kind === 'assistant' && Number(e.stream) === want)
 }
 
 // bindEvents 注册所有后端事件。必须可安全重复调用：
@@ -564,18 +595,20 @@ export async function ask(prompt) {
     push({ kind: 'system', content: t('msg.busyRound') })
     return false
   }
-  // 记下这一轮属于哪条时间线。后续所有事件都按它归档 ——
-  // 用户中途切了主机或会话也不会把输出写错地方。
-  store.activeHostId = store.currentHostId
-  store.activeSessionId = store.currentSessionId
-  // 本轮 PTY 写入标记从零计数：上一轮结束时已消费，期间的零星写入
-  // （如空回车让 shell 打新提示符）不代表「本轮 shell 自己打印过提示符」。
-  ptyDirty.delete(bucketKey(store.activeHostId, store.activeSessionId))
   store.contextUsage.tokens = 0
   store.contextUsage.window = 0
   store.contextUsage.messages = 0
   store.running = true
   try {
+    // 未命名的空会话：用首条用户消息当任务标题（与欢迎首页「先聊再起名」一致）。
+    await maybeAutoTitleSession(prompt)
+    // 会话可能刚被 createSession / 自动起名确定：在 Ask 前再钉 active*，
+    // 避免事件落到旧桶。
+    store.activeHostId = store.currentHostId
+    store.activeSessionId = store.currentSessionId
+    // 本轮 PTY 写入标记从零计数：上一轮结束时已消费，期间的零星写入
+    // （如空回车让 shell 打新提示符）不代表「本轮 shell 自己打印过提示符」。
+    ptyDirty.delete(bucketKey(store.activeHostId, store.activeSessionId))
     // 带上「这一轮用哪套方案」：切换随请求即时生效，不再依赖全局激活指针。
     await api().Ask(store.currentHostId, store.currentSessionId, prompt, profileId)
     return true
@@ -662,20 +695,148 @@ export async function compactSession(hostId, sessionId) {
 
 // ---- 会话的增删改查 ----
 
+// loadSessionTimeline：侧栏点进任务时，把后端历史灌进本地 bySession。
+// 已有气泡则跳过（当场听过的事件优先，避免冲掉流式中的半条助手消息）。
+export async function loadSessionTimeline(hostId, sessionId) {
+  if (!api() || !hostId) return
+  const key = bucketKey(hostId, sessionId)
+  const existing = store.bySession[key]
+  if (existing && existing.length > 0) return
+  let rows
+  try {
+    rows = (await api().GetSessionTimeline(hostId, sessionId || '')) || []
+  } catch {
+    return
+  }
+  // 异步回来时焦点可能已切走：只写目标桶，不碰 current*。
+  if (store.bySession[key] && store.bySession[key].length > 0) return
+  const list = []
+  for (const r of rows) {
+    if (!r || !r.kind) continue
+    if (r.kind === 'tool') {
+      list.push({
+        id: ++seq,
+        ts: Date.now(),
+        kind: 'tool',
+        toolId: r.toolId || '',
+        tool: {
+          id: r.toolId || '',
+          name: r.name || 'tool',
+          command: r.content || '',
+          status: 'done',
+          decision: 'allow'
+        }
+      })
+      continue
+    }
+    if (r.kind === 'result') {
+      list.push({
+        id: ++seq,
+        ts: Date.now(),
+        kind: 'result',
+        toolId: r.toolId || '',
+        exitCode: 0,
+        content: r.content || '',
+        redacted: 0,
+        injection: []
+      })
+      continue
+    }
+    list.push({
+      id: ++seq,
+      ts: Date.now(),
+      kind: r.kind,
+      content: r.content || '',
+      reasoning: r.reasoning || '',
+      reasoningOpen: false
+    })
+  }
+  store.bySession[key] = list
+  if (hostId === store.currentHostId &&
+      (sessionId || '') === (store.currentSessionId || '') &&
+      list.length > 0) {
+    noteConversationActivity()
+  }
+}
+
 // selectSession 切换当前会话。
 //
 // 刻意**不**在运行中禁止切换：事件按 activeSessionId 归档（见 targetKey），
 // 切过去之后这一轮的输出仍然落在原来那条会话上，不会写错地方 ——
 // 与切主机的行为一致。禁掉反而多一个「为什么点不动」的解释负担。
-export function selectSession(sessionId) {
+export async function selectSession(sessionId) {
+  bindSession()
   store.currentSessionId = sessionId || ''
   // 告诉后端「这台主机现在看着哪条会话」：之后常驻终端定格的快照要落到这条上。
   reportActiveSession(store.currentHostId, store.currentSessionId)
+  await loadSessionTimeline(store.currentHostId, store.currentSessionId)
 }
 
-// requestNewTask 供侧栏主入口调用：切到对话页并由 ConsolePanel 弹出「新建任务」命名框。
+// requestNewTask 供主导航调用：切到对话欢迎首页（真正开任务等发消息/开终端）。
 export function requestNewTask() {
   store.newTaskIntent++
+}
+
+// requestHostPicker 弹出对话页主机列表。
+export function requestHostPicker() {
+  store.hostPickerIntent++
+}
+
+// beginFreshTask：回到新建欢迎态（可预选主机，尚未绑定任务）。
+export function beginFreshTask() {
+  store.freshTaskPending = true
+  store.sessionBound = false
+}
+
+export function clearFreshTask() {
+  store.freshTaskPending = false
+}
+
+// bindSession：任务已落地（侧栏进入 / CreateSession 成功），锁定底栏主机。
+export function bindSession() {
+  store.freshTaskPending = false
+  store.sessionBound = true
+}
+
+export function unbindSession() {
+  store.sessionBound = false
+}
+
+// commitDraftHost：把底栏预选主机落到 currentHostId（发起对话 / 开终端时调用）。
+// 已选中同一台则只清草稿；返回是否已有可用主机。
+export async function commitDraftHost() {
+  const id = store.draftHostId || store.currentHostId
+  if (!id) return false
+  store.draftHostId = ''
+  if (store.currentHostId !== id) {
+    store.currentHostId = id
+  }
+  // 与 ConsolePanel 的 host watch 并行时多拉一次无害；保证 ask 前会话列表已就绪。
+  await refreshSessions(id)
+  return true
+}
+
+// ensureFreshTaskSession：新建任务真正开始时静默开一条新会话，
+// 避免落到该主机默认会话上串旧上下文。
+// 失败时退回「仅预选」：currentHostId 清空、draftHostId 恢复，便于重试。
+export async function ensureFreshTaskSession() {
+  if (!store.freshTaskPending) {
+    // 已有主机会话（侧栏进入 / 非新建）：视为已绑定。
+    if (store.currentHostId) bindSession()
+    return true
+  }
+  const hostId = store.currentHostId
+  if (!hostId) return false
+  const info = await createSession(t('msg.untitledTask'), { silent: true })
+  if (!info) {
+    store.draftHostId = hostId
+    store.currentHostId = ''
+    store.currentSessionId = ''
+    // freshTaskPending 保持 true，允许再次发送/开终端。
+    return false
+  }
+  bindSession()
+  return true
 }
 
 // currentSessionHasTurns：当前会话是否已有对话轮次（后端元信息）。
@@ -708,32 +869,92 @@ export function shouldShowSessionChrome() {
   return store.entries.length > 0 || (sawConversation && currentSessionHasTurns())
 }
 
+// 与后端 maxSessionNameRunes 对齐：按 Unicode 字符截断，避免中文被按字节切坏。
+const MAX_SESSION_NAME_RUNES = 40
+
+export function titleFromPrompt(prompt) {
+  const s = String(prompt || '').replace(/\s+/g, ' ').trim()
+  if (!s) return ''
+  const chars = Array.from(s)
+  if (chars.length <= MAX_SESSION_NAME_RUNES) return s
+  // 超长留省略号（占 1 个字符位），与后端 maxSessionNameRunes 对齐。
+  return chars.slice(0, MAX_SESSION_NAME_RUNES - 1).join('') + '…'
+}
+
+function isUntitledSession(s) {
+  if (!s) return false
+  const name = String(s.name || '').trim()
+  if (!name) return true
+  return name === t('msg.untitledTask') || name === t('ss.unnamedTask') || name === t('console.unnamed')
+}
+
+// maybeAutoTitleSession：空的未命名会话用首条用户消息起名（静默，不灌系统气泡）。
+export async function maybeAutoTitleSession(prompt) {
+  const list = store.currentSessions || []
+  const sid = store.currentSessionId || DEFAULT_SESSION
+  const cur = list.find(s => s.id === sid)
+  if (!cur) {
+    // 列表里没有当前会话：只允许给「尚未物化」的默认槽起名。
+    // 其它 id 缺失多半是测试/瞬时态，乱 rename→refresh 会把选中冲回默认。
+    if (sid !== DEFAULT_SESSION) return
+  } else if (cur.turns > 0 || !isUntitledSession(cur)) {
+    return
+  }
+  const title = titleFromPrompt(prompt)
+  if (!title) return
+  await renameSession(sid, title, { silent: true })
+}
+
 // createSession 在当前主机下新建一条会话，并立刻切过去。
 //
 // 新建后必须切过去：用户的意图就是「开一段新对话」，
 // 建完还停在旧会话上，他会以为新建失败了。
-export async function createSession(name) {
-  const hostId = store.currentHostId
+// opts.silent：不往时间线塞「已新建」—— 欢迎首页选主机/新建后仍留在当前界面。
+export async function createSession(name, opts = {}) {
+  const hostId = opts.hostId || store.currentHostId
   if (!hostId) {
     push({ kind: 'error', content: t('msg.pickHost') })
-    return
+    return null
   }
   try {
     const info = await api().CreateSession(hostId, name)
+    // 先钉选中再拉列表：避免并发 refreshSessions 用「建之前」的旧列表
+    // 把 currentSessionId 从空/默认「修正」走，首条消息自动起名就会打到错会话。
+    store.currentSessionId = info.id
     await refreshSessions(hostId)
     store.currentSessionId = info.id
-    push({ kind: 'system', content: t('msg.taskCreated', { name: info.name }) }, hostId, info.id)
+    // 并发旧列表若仍缺这条，本地补上，保证 maybeAutoTitleSession 能认出未命名会话。
+    const list = store.sessions[hostId] || []
+    if (!list.some(s => s.id === info.id)) {
+      store.sessions = {
+        ...store.sessions,
+        [hostId]: list.concat([{
+          id: info.id,
+          name: info.name || '',
+          turns: info.turns || 0,
+          archivedTurns: info.archivedTurns || 0,
+          isDefault: !!info.isDefault
+        }])
+      }
+    }
+    if (!opts.silent) {
+      push({ kind: 'system', content: t('msg.taskCreated', { name: info.name }) }, hostId, info.id)
+    }
+    return info
   } catch (e) {
     push({
       kind: 'error',
       content: t('msg.taskCreateFail', { err: e && e.message ? e.message : e })
     }, hostId)
+    return null
   }
 }
 
 // renameSession 改会话名。改名**不**影响会话的身份 —— 它是由 ID 认定的。
-export async function renameSession(sessionId, name) {
-  const hostId = store.currentHostId
+// opts.silent：首条消息自动起名时不灌系统气泡、失败也不弹错（避免欢迎页被刷）。
+// opts.hostId：侧栏跨主机操作时显式指定，避免为改名而切走当前主区。
+export async function renameSession(sessionId, name, opts = {}) {
+  const hostId = opts.hostId || store.currentHostId
   if (!hostId) {
     push({ kind: 'error', content: t('msg.pickHost') })
     return
@@ -741,8 +962,11 @@ export async function renameSession(sessionId, name) {
   try {
     await api().RenameSession(hostId, sessionId, name)
     await refreshSessions(hostId)
-    push({ kind: 'system', content: t('msg.taskRenamed', { name }) }, hostId, sessionId)
+    if (!opts.silent) {
+      push({ kind: 'system', content: t('msg.taskRenamed', { name }) }, hostId, sessionId)
+    }
   } catch (e) {
+    if (opts.silent) return
     push({
       kind: 'error',
       content: t('msg.renameFail', { err: e && e.message ? e.message : e })
@@ -750,12 +974,28 @@ export async function renameSession(sessionId, name) {
   }
 }
 
+// 与侧栏 visibleTasks 同口径：默认空会话（turns=0）不算「最近任务」。
+function visibleTaskCount(list) {
+  return (list || []).filter(s => !s.isDefault || s.turns > 0).length
+}
+
+function returnToNewTaskHome() {
+  store.currentHostId = ''
+  store.currentSessionId = ''
+  store.draftHostId = ''
+  beginFreshTask()
+  resetSessionChromeSeen()
+  store.chatHomeIntent++
+}
+
 // deleteSession 删掉一条会话。
 //
 // 默认会话：后端清空内容但保留槽位（侧栏 turns>0 才显示）。本地时间线
 // 也要清掉，否则列表没了、屏幕上还挂着旧气泡。
-export async function deleteSession(sessionId) {
-  const hostId = store.currentHostId
+// 若删完后**当前正在看的那台主机**已无可见任务 → 回到新建欢迎态。
+// opts.hostId：侧栏跨主机删除时显式指定，不切走主区焦点。
+export async function deleteSession(sessionId, opts = {}) {
+  const hostId = opts.hostId || store.currentHostId
   if (!hostId) {
     push({ kind: 'error', content: t('msg.pickHost') })
     return
@@ -766,9 +1006,14 @@ export async function deleteSession(sessionId) {
     // 删掉的正好是当前选中的那条：先切回默认会话，再刷新列表。
     // 顺序不能反 —— 先刷新的话，refreshSessions 里的兜底也会把它置空，
     // 结果相同但意图看不出来。
-    if (store.currentSessionId === sessionId) store.currentSessionId = ''
+    if (store.currentHostId === hostId && store.currentSessionId === sessionId) {
+      store.currentSessionId = ''
+    }
     await refreshSessions(hostId)
-    push({ kind: 'system', content: t('msg.sessionDeleted') }, hostId)
+    if (store.currentHostId === hostId && visibleTaskCount(store.sessions[hostId]) === 0) {
+      returnToNewTaskHome()
+    }
+    // 删除成功不灌系统气泡：侧栏列表变化已是反馈。
   } catch (e) {
     push({
       kind: 'error',

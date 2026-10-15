@@ -270,7 +270,8 @@ func protectedProbe(tool, path string) string {
 		return ""
 	}
 	switch tool {
-	case "read_file":
+	case "read_file", "list_file_backups", "restore_file_backup",
+		"diff_state", "snapshot_state":
 		return "cat " + path
 	case "list_dir":
 		return "ls " + path

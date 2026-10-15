@@ -2,7 +2,7 @@
 export const chat = {
   zh: {
     'chat.title': 'Ai-Shell',
-    'chat.subtitle': '挑一个感兴趣的方向，来跟我一起排查与创作吧',
+    'chat.subtitle': '连上 Linux 主机，用自然语言排查问题、安全执行运维命令',
     'chat.placeholder': '今天帮你做什么？直接说需求，或点上方快捷方向',
     'chat.tab.ops': '运维排障',
     'chat.tab.config': '配置变更',
@@ -48,12 +48,18 @@ export const chat = {
     'chat.pickModel.cancel': '取消',
     'chat.empty.hint': '发送第一条消息开始 Agent 对话。需要敲命令时，切到顶部的「终端」。',
     'chat.gotoTerm': '需要敲命令？打开终端',
-    'chat.working': 'Working',
-    'chat.noModel': '（暂无模型）'
+    'chat.working': '思考中',
+    'chat.noModel': '（暂无模型）',
+    'chat.msg.copy': '复制',
+    'chat.msg.copied': '已复制',
+    'chat.msg.edit': '编辑到输入框',
+    'chat.msg.resend': '再次发送',
+    'chat.msg.tokensOut': '输出约 {n} tokens',
+    'chat.msg.tokensIO': '上下文 {in} · 输出约 {out} tokens'
   },
   en: {
     'chat.title': 'Ai-Shell',
-    'chat.subtitle': 'Pick a direction and let’s troubleshoot or create together',
+    'chat.subtitle': 'Connect a Linux host, troubleshoot in natural language, and run ops commands with approval',
     'chat.placeholder': 'What can I help with today? Type a request, or tap a chip above',
     'chat.tab.ops': 'Ops & Debug',
     'chat.tab.config': 'Config Changes',
@@ -100,6 +106,12 @@ export const chat = {
     'chat.empty.hint': 'Send your first message to start an Agent chat. For raw shell, switch to Terminal at the top.',
     'chat.gotoTerm': 'Need a shell? Open Terminal',
     'chat.working': 'Working',
-    'chat.noModel': '(no model)'
+    'chat.noModel': '(no model)',
+    'chat.msg.copy': 'Copy',
+    'chat.msg.copied': 'Copied',
+    'chat.msg.edit': 'Edit in composer',
+    'chat.msg.resend': 'Send again',
+    'chat.msg.tokensOut': '~{n} tokens out',
+    'chat.msg.tokensIO': 'ctx {in} · ~{out} tokens out'
   }
 }

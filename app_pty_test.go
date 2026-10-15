@@ -446,6 +446,37 @@ func TestPersistentTerminalFinalSnapshotOnTUICommandEnd(t *testing.T) {
 	})
 }
 
+// 用户点「关闭终端」/ 切会话主动卸下：不应把登录 MOTD 当结束画面灌进对话。
+// top/vim 有意义的帧在退出全屏时已 Flush；这里再 Final 是纯噪音。
+func TestCloseTerminalDoesNotInjectFinalSnapshot(t *testing.T) {
+	a, hostID := newTermTestApp(t)
+	if err := a.OpenTerminal(hostID, "s1", 80, 24); err != nil {
+		t.Fatalf("打开失败: %v", err)
+	}
+	if err := a.ReportActiveSession(hostID, "s1"); err != nil {
+		t.Fatalf("报告会话失败: %v", err)
+	}
+	// 等 MOTD / 提示符落到屏幕上，再主动关闭。
+	time.Sleep(300 * time.Millisecond)
+	if !a.CloseTerminal(hostID, "s1") {
+		t.Fatal("关闭应当返回 true")
+	}
+	waitForTerm(t, "关闭审计落盘", func() bool {
+		for _, e := range a.ListAudit(0).Entries {
+			if e.Kind == audit.KindTerminal && strings.Contains(e.Note, "关闭了交互终端") {
+				return true
+			}
+		}
+		return false
+	})
+	time.Sleep(200 * time.Millisecond)
+	for _, e := range a.ListAudit(0).Entries {
+		if e.Kind == audit.KindTerminal && strings.Contains(e.Note, "终端结束画面进入模型上下文") {
+			t.Errorf("主动关闭不该定格结束画面，实得 %q", e.Note)
+		}
+	}
+}
+
 // PTY 退出（人手敲 exit，shell 结束）是定格的第三个触发点：哪怕这条
 // 命令没有全屏重绘，退出时的最后一屏也要留给模型 —— 「死亡现场」
 // 往往就是结论本身。

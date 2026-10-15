@@ -4,6 +4,7 @@ import { store, bootstrap, bindEvents, dismissAuditError, initTheme, requestNewT
 import { t } from './i18n'
 import ConsolePanel from './components/ConsolePanel.vue'
 import HostsPanel from './components/HostsPanel.vue'
+import PrefsPanel from './components/PrefsPanel.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
 import PolicyPanel from './components/PolicyPanel.vue'
 import AuditPanel from './components/AuditPanel.vue'
@@ -13,18 +14,16 @@ import logoSrc from './assets/logo.svg'
 
 const tab = ref('console')
 
-// 高频导航只留两页；LLM 设置/安全策略/审计日志收进底部齿轮（SettingsMenu）。
+// 主导航只留「新建任务」；主机管理与 LLM/策略/审计一并收进底部齿轮。
 // tabs 用 computed：语言切换时 t() 重新求值，导航文案跟着换。
 const tabs = computed(() => [
-  { key: 'console', label: t('app.nav.console') },
-  { key: 'hosts', label: t('app.nav.hosts') }
+  { key: 'console', label: t('app.nav.console') }
 ])
 
 // 导航图标：内联 SVG（线性风格，stroke 跟随文字颜色），不引第三方图标库。
 const icons = {
   // 新建任务：对话气泡 + 加号（对齐 WorkBuddy 主入口）
-  console: 'M4 6h11a3 3 0 0 1 3 3v5a3 3 0 0 1-3 3H9l-4 3v-3H7a3 3 0 0 1-3-3V9a3 3 0 0 1 3-3z M19 4v6 M16 7h6',
-  hosts: 'M6 4h12v7H6z M6 13h12v7H6z M9 7.5h.01 M9 16.5h.01' // 服务器两台叠放
+  console: 'M4 6h11a3 3 0 0 1 3 3v5a3 3 0 0 1-3 3H9l-4 3v-3H7a3 3 0 0 1-3-3V9a3 3 0 0 1 3-3z M19 4v6 M16 7h6'
 }
 
 function onNav(key) {
@@ -71,7 +70,7 @@ onMounted(async () => {
       <SessionsSidebar v-if="store.ready" class="ssb-wrap" @open="tab = 'console'" />
 
       <div class="posture" v-if="store.ready">
-        <!-- 偏好与设置类页面的统一入口（主题/语言/终端字体 + 页面跳转）。 -->
+        <!-- 设置类页面入口（基本配置 / 主机 / LLM / 策略 / 审计）。 -->
         <SettingsMenu :active-page="tab" @page="tab = $event" />
       </div>
     </aside>
@@ -95,6 +94,7 @@ onMounted(async () => {
         </div>
 
         <ConsolePanel v-show="tab === 'console'" @page="tab = $event" />
+        <PrefsPanel v-if="tab === 'prefs'" />
         <HostsPanel v-if="tab === 'hosts'" />
         <SettingsPanel v-if="tab === 'settings'" />
         <PolicyPanel v-if="tab === 'policy'" />
@@ -160,16 +160,16 @@ nav {
 }
 
 .nav-btn {
-  /* 跟全局 button 一样居中：图标+文案在胶囊里水平居中（「新建任务」CTA） */
   gap: 9px;
-  justify-content: center;
-  text-align: center;
+  justify-content: flex-start;
+  text-align: left;
   width: 100%;
   border: none;
   background: transparent;
   padding: 0 10px;
   border-radius: 8px;
   color: var(--text-2);
+  font-weight: 600;
 }
 .nav-icon { flex-shrink: 0; opacity: 0.75; }
 .nav-btn.active .nav-icon { opacity: 1; }
@@ -177,7 +177,7 @@ nav {
 .nav-btn.active {
   background: var(--surface);
   color: var(--accent);
-  font-weight: 500;
+  font-weight: 600;
   border: 1px solid var(--border);
 }
 

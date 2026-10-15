@@ -48,6 +48,17 @@ type SessionInfo struct {
 	IsDefault     bool      `json:"isDefault"`
 }
 
+// TimelineEntry 是给对话页还原历史用的一条气泡（从 LLM 消息压成 UI 形状）。
+// 侧栏点进旧任务时，前端本地 bySession 可能是空的（重启 / 未当场听过事件），
+// 必须能从这里把用户/助手轮次拉回来，否则会误显示「新建任务」欢迎页。
+type TimelineEntry struct {
+	Kind      string `json:"kind"`                // user | assistant | tool | result
+	Content   string `json:"content,omitempty"`
+	Reasoning string `json:"reasoning,omitempty"`
+	Name      string `json:"name,omitempty"`   // 工具名
+	ToolID    string `json:"toolId,omitempty"`
+}
+
 // info 把会话压成元信息。
 func (s *session) info(id string) SessionInfo {
 	return SessionInfo{
@@ -132,6 +143,59 @@ func (a *Agent) CreateSession(hostID, name string) (SessionInfo, error) {
 	return info, nil
 }
 
+// SessionTimeline 把某条会话的历史压成对话页时间线条目。
+// 不存在的会话返回空切片（不是 error）—— 界面按「还没聊过」处理即可。
+func (a *Agent) SessionTimeline(hostID, sessionID string) []TimelineEntry {
+	sessionID = normalizeSessionID(sessionID)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	s := a.sessionOf(hostID, sessionID)
+	if s == nil {
+		return nil
+	}
+	out := make([]TimelineEntry, 0, len(s.turns)*2)
+	for _, turn := range s.turns {
+		for _, m := range turn {
+			switch m.Role {
+			case "user":
+				if strings.TrimSpace(m.Content) == "" {
+					continue
+				}
+				out = append(out, TimelineEntry{Kind: "user", Content: m.Content})
+			case "assistant":
+				if strings.TrimSpace(m.Content) != "" || strings.TrimSpace(m.Reasoning) != "" {
+					out = append(out, TimelineEntry{
+						Kind:      "assistant",
+						Content:   m.Content,
+						Reasoning: m.Reasoning,
+					})
+				}
+				for _, tc := range m.ToolCalls {
+					name := tc.Function.Name
+					if name == "" {
+						name = "tool"
+					}
+					cmd := strings.TrimSpace(tc.Function.Arguments)
+					out = append(out, TimelineEntry{
+						Kind:    "tool",
+						Name:    name,
+						ToolID:  tc.ID,
+						Content: cmd,
+					})
+				}
+			case "tool":
+				out = append(out, TimelineEntry{
+					Kind:    "result",
+					ToolID:  m.ToolCallID,
+					Name:    m.Name,
+					Content: m.Content,
+				})
+			}
+		}
+	}
+	return out
+}
+
 // RenameSession 改会话名。
 //
 // 默认会话**可以**改名：它是由 ID 认定的，不是由名字认定的。
@@ -145,6 +209,15 @@ func (a *Agent) RenameSession(hostID, sessionID, name string) error {
 
 	a.mu.Lock()
 	s := a.sessionOf(hostID, sessionID)
+	// 默认会话在 ListSessions 里始终可见，但可能尚未写入 map。
+	// 首条消息自动起名会打到它：此时物化槽位，而不是报「不存在」。
+	if s == nil && sessionID == DefaultSessionID {
+		if a.sessions[hostID] == nil {
+			a.sessions[hostID] = map[string]*session{}
+		}
+		s = &session{updatedAt: time.Now()}
+		a.sessions[hostID][DefaultSessionID] = s
+	}
 	if s == nil {
 		a.mu.Unlock()
 		return fmt.Errorf("这条会话已经不存在了（可能在别处被删掉），请刷新后重试")

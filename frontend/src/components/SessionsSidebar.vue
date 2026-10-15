@@ -1,102 +1,108 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
-  store, push, selectSession, renameSession, deleteSession, refreshAllSessionLists
+  store, push, selectSession, renameSession, deleteSession, refreshAllSessionLists,
+  bindSession, clearFreshTask
 } from '../store'
 import { t } from '../i18n'
+import { maskHostAddr } from '../hostDisplay'
 
 // 侧边栏的会话区（参考 WorkBuddy 的任务列表交互）：
-// 列表常驻侧边栏，条目上的「…」按钮悬停才出现，点开才有「重命名 / 删除」。
-// 会话属于当前选中的主机 —— 切了主机，这里的列表会跟着换。
+// 始终按主机分组；启动任务后也不切成「单主机列表」。
+// 条目上的「…」悬停才出现，点开才有「重命名 / 删除」。
 const emit = defineEmits(['open'])
 
-// 侧栏：隐藏从未聊过的默认会话；有 turns 的默认会话仍展示（否则首页对话会「失踪」）。
-// 具名任务一律展示。
+// 侧栏：隐藏从未聊过的默认会话；有 turns 的默认会话仍展示为「未命名任务」。
+// 具名任务一律展示。空默认会话的身份由顶栏/窗口标题「未命名任务」承担。
 function visibleTasks(list) {
   return (list || []).filter(s => !s.isDefault || s.turns > 0)
 }
 
-const sessions = computed(() => visibleTasks(store.currentSessions))
-
-// ---- 按主机分组的任务视图（未选主机时的欢迎态） ----
-//
-// 没选主机时不再只是干巴巴一句提示，而是把每台主机的任务分组列出来：
-// 点组头进入该主机，点组内任务直达那条会话。重命名/删除只对当前主机
-// 有意义（store 的会话操作都以 currentHostId 为准），分组视图里不提供。
+// 只展示有可见任务的主机分组；空分组不占位、组头不可点。
 const groups = computed(() =>
-  store.hosts.map(h => ({
-    host: h,
-    list: visibleTasks(store.sessions[h.id])
-  }))
+  store.hosts
+    .map(h => ({
+      host: h,
+      list: visibleTasks(store.sessions[h.id])
+    }))
+    .filter(g => g.list.length > 0)
 )
 
-// 分组里的任务名用短名：组头已经标明主机；有内容的默认会话用「未命名任务」。
+const totalVisible = computed(() =>
+  groups.value.reduce((n, g) => n + g.list.length, 0)
+)
+
 function shortLabel(s) {
   const base = s.name || (s.isDefault ? t('ss.unnamedTask') : t('console.unnamed'))
   return s.turns > 0 ? base + t('ss.turns', { n: s.turns }) : base
 }
 
-function enterHost(hostId) {
-  store.currentHostId = hostId
-  emit('open')
+// 删除确认框用完整标签（含轮数），与列表文案一致。
+function label(s) {
+  return shortLabel(s)
 }
 
-async function enterSession(hostId, s) {
+function isActive(hostId, s) {
+  return hostId === store.currentHostId && s.id === store.currentSessionId
+}
+
+function enterSession(hostId, s) {
+  // 已在该主机：只切会话，避免再走一遍 host watch。
+  if (store.currentHostId === hostId) {
+    clearFreshTask()
+    void selectSession(s.id)
+    emit('open')
+    return
+  }
+  clearFreshTask()
+  bindSession()
   store.pendingSessionId = s.id
   store.currentHostId = hostId
   emit('open')
 }
 
-// 分组视图的数据源是全部主机的会话列表。已选主机时当前主机的列表由
-// 切换流程维护，其它主机也要拉一次才能显示；主机集合变化（增删）时重拉。
-// 只读填充、不碰选中状态（见 refreshAllSessionLists）。
+// 分组数据源是全部主机的会话列表。当前主机由切换/操作里的 refreshSessions
+// 维护；其它主机在主机集合变化时拉齐（见 refreshAllSessionLists）。
 watch(
   () => store.hosts.map(h => h.id).join('\n'),
   () => { refreshAllSessionLists() },
   { immediate: true }
 )
 
-function label(s) {
-  const base = s.name || (s.isDefault ? t('ss.unnamedTask') : t('console.unnamed'))
-  return s.turns > 0 ? base + t('ss.turns', { n: s.turns }) : base
-}
-
-function open(s) {
-  selectSession(s.id)
-  emit('open')
-}
-
-// 新建会话入口在控制台顶栏（ConsolePanel），这里只管列表与重命名/删除。
+// 新建会话入口在主导航「新建任务」，这里只管列表与重命名/删除。
 
 // ---- 重命名（应用内弹窗：与新建/删除同形式，交互一致） ----
 const renaming = ref(null)
 const renameVal = ref('')
 const renameEl = ref(null)
 
-function startRename(s) {
-  // 双保险：默认任务的名字就是节点标识（主机名 (user@addr)），
-  // 菜单入口虽已隐藏，这里仍拦一道，防止其它路径误入。
-  if (s.isDefault) return
+function startRename(hostId, s) {
+  // 默认会话也可改名（身份仍由 ID 认定，名字只是侧栏标签）。
   menuFor.value = ''
-  renaming.value = s
+  renaming.value = { hostId, session: s }
   renameVal.value = s.name || ''
   nextTick(() => { if (renameEl.value) renameEl.value.focus() })
 }
 
 async function commitRename() {
-  const s = renaming.value
+  const ctx = renaming.value
   const name = renameVal.value.trim()
   renaming.value = null
   renameVal.value = ''
-  if (!s || !name || name === (s.name || '')) return
-  await renameSession(s.id, name)
+  if (!ctx || !name || name === (ctx.session.name || '')) return
+  await renameSession(ctx.session.id, name, { hostId: ctx.hostId })
 }
 
 // ---- 「…」菜单 ----
 const menuFor = ref('')
 
-function toggleMenu(s) {
-  menuFor.value = menuFor.value === s.id ? '' : s.id
+function menuKey(hostId, s) {
+  return `${hostId}\0${s.id}`
+}
+
+function toggleMenu(hostId, s) {
+  const key = menuKey(hostId, s)
+  menuFor.value = menuFor.value === key ? '' : key
 }
 
 function onDocMousedown(e) {
@@ -108,15 +114,15 @@ function onDocMousedown(e) {
 // ---- 删除（应用内弹窗：WKWebView 上原生 confirm 不弹） ----
 const deleting = ref(null)
 
-function askDelete(s) {
+function askDelete(hostId, s) {
   menuFor.value = ''
-  deleting.value = s
+  deleting.value = { hostId, session: s }
 }
 
 async function confirmDelete() {
-  const s = deleting.value
+  const ctx = deleting.value
   deleting.value = null
-  if (s) await deleteSession(s.id)
+  if (ctx) await deleteSession(ctx.session.id, { hostId: ctx.hostId })
 }
 
 // ---- 分组折叠（WorkBuddy 风格：点「会话 (N) ⌄」收起/展开列表） ----
@@ -149,7 +155,7 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocMousedown))
       :aria-expanded="!collapsed"
       @click="collapsed = !collapsed"
     >
-      <span>{{ t('ss.head', { n: sessions.length }) }}</span>
+      <span>{{ t('ss.head', { n: totalVisible }) }}</span>
       <svg class="ssb-caret" :class="{ open: !collapsed }" width="9" height="6" viewBox="0 0 10 6" aria-hidden="true">
         <path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.5"
               stroke-linecap="round" stroke-linejoin="round" />
@@ -157,55 +163,39 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocMousedown))
     </button>
 
     <template v-if="!collapsed">
-      <!-- 未选主机：按主机分组列出全部任务，点组头/任务可直接进入。 -->
-      <template v-if="!store.currentHostId">
-        <div v-if="!groups.length" class="ssb-empty">{{ t('ss.empty.none') }}</div>
-        <div v-for="g in groups" :key="g.host.id" class="ssb-group">
-          <button class="ssb-group-head" :title="t('ss.enterHost')" @click="enterHost(g.host.id)">
-            <span class="ssb-group-name">{{ g.host.name }}</span>
-            <span class="ssb-group-meta mono">{{ g.host.user }}@{{ g.host.addr }}</span>
-            <span class="ssb-group-count">{{ g.list.length }}</span>
-          </button>
-          <div
-            v-for="s in g.list"
-            :key="s.id"
-            class="ssb-item ssb-item-nested"
-            @click="enterSession(g.host.id, s)"
-          >
-            <span class="ssb-name" :title="shortLabel(s)">{{ shortLabel(s) }}</span>
-            <span class="ssb-time" :title="s.updatedAt">{{ timeAgo(s.updatedAt) }}</span>
+      <!-- 始终按主机分组（启动任务后也不切换成单主机列表）。 -->
+      <div v-if="!groups.length" class="ssb-empty">{{ t('ss.empty.none') }}</div>
+      <div v-for="g in groups" :key="g.host.id" class="ssb-group">
+        <div class="ssb-group-head">
+          <span class="ssb-group-name">{{ g.host.name }}</span>
+          <span class="ssb-group-meta mono">{{ g.host.user }}@{{ maskHostAddr(g.host.addr) }}</span>
+          <span class="ssb-group-count">{{ g.list.length }}</span>
+        </div>
+        <div
+          v-for="s in g.list"
+          :key="s.id"
+          class="ssb-item ssb-item-nested"
+          :class="{ active: isActive(g.host.id, s) }"
+          @click="enterSession(g.host.id, s)"
+        >
+          <span class="ssb-name" :title="shortLabel(s)">{{ shortLabel(s) }}</span>
+          <span class="ssb-time" :title="s.updatedAt">{{ timeAgo(s.updatedAt) }}</span>
+          <button
+            class="ssb-more"
+            :aria-expanded="menuFor === menuKey(g.host.id, s)"
+            :title="t('ss.more')"
+            @click.stop="toggleMenu(g.host.id, s)"
+          >⋯</button>
+
+          <div v-if="menuFor === menuKey(g.host.id, s)" class="ssb-menu" @click.stop>
+            <button @click="startRename(g.host.id, s)">{{ t('ss.rename') }}</button>
+            <button
+              class="ssb-menu-danger"
+              @click="askDelete(g.host.id, s)"
+            >{{ t('ss.delete') }}</button>
           </div>
         </div>
-      </template>
-      <template v-else>
-      <div v-if="!sessions.length" class="ssb-empty">{{ t('ss.empty.none') }}</div>
-
-      <div
-        v-for="s in sessions"
-        :key="s.id"
-        class="ssb-item"
-        :class="{ active: s.id === store.currentSessionId }"
-        @click="open(s)"
-      >
-        <span class="ssb-name" :title="label(s)">{{ label(s) }}</span>
-        <span class="ssb-time" :title="s.updatedAt">{{ timeAgo(s.updatedAt) }}</span>
-        <!-- 默认任务可删（后端清空内容）；改名仍只给具名任务 -->
-        <button
-          class="ssb-more"
-          :aria-expanded="menuFor === s.id"
-          :title="t('ss.more')"
-          @click.stop="toggleMenu(s)"
-        >⋯</button>
-
-        <div v-if="menuFor === s.id" class="ssb-menu" @click.stop>
-          <button v-if="!s.isDefault" @click="startRename(s)">{{ t('ss.rename') }}</button>
-          <button
-            class="ssb-menu-danger"
-            @click="askDelete(s)"
-          >{{ t('ss.delete') }}</button>
-        </div>
       </div>
-      </template>
 
       <!-- 重命名弹窗（应用内，与新建/删除同形式） -->
       <div v-if="renaming" class="overlay" @click.self="renaming = null">
@@ -231,7 +221,7 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocMousedown))
       <div class="modal">
         <h3>{{ t('ss.deleteTitle') }}</h3>
         <p>
-          {{ t('ss.delete.p1') }}<b>{{ label(deleting) }}</b>{{ t('ss.delete.p2') }}
+          {{ t('ss.delete.p1') }}<b>{{ label(deleting.session) }}</b>{{ t('ss.delete.p2') }}
         </p>
         <div class="modal-actions">
           <button class="sm" @click="deleting = null">{{ t('ss.cancel') }}</button>
@@ -286,16 +276,12 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocMousedown))
   display: flex;
   align-items: center;
   gap: 6px;
-  border: none;
-  background: transparent;
-  text-align: left;
   padding: 5px 10px;
-  border-radius: 6px;
-  cursor: pointer;
   min-height: 0;
   color: var(--text-2);
+  pointer-events: none;
+  user-select: none;
 }
-.ssb-group-head:hover { background: var(--hover-overlay); color: var(--text); }
 .ssb-group-name {
   font-size: 12px;
   font-weight: 600;

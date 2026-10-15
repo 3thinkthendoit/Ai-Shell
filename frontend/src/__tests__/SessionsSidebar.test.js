@@ -235,8 +235,12 @@ describe('SessionsSidebar 会话列表', () => {
     expect(list[1].find('.ssb-more').exists()).toBe(true)
   })
 
-  it('默认任务菜单只有删除、没有重命名', async () => {
-    mountWithHost()
+  it('默认任务菜单也有重命名，可改成自定义名', async () => {
+    mountWithHost({
+      ListSessions: async () => [
+        { id: 'default', name: '本机配置排查', turns: 4, archivedTurns: 0, isDefault: true }
+      ]
+    })
     store.sessions = {
       h1: [
         { id: 'default', name: '', turns: 4, archivedTurns: 0, isDefault: true }
@@ -245,7 +249,17 @@ describe('SessionsSidebar 会话列表', () => {
     await nextTick()
     const item = await openMenu('未命名任务')
     const labels = item.findAll('.ssb-menu button').map(b => b.text())
-    expect(labels).toEqual(['删除'])
+    expect(labels).toEqual(['重命名', '删除'])
+    await item.findAll('.ssb-menu button').find(b => b.text() === '重命名').trigger('click')
+    await nextTick()
+    const input = wrapper.find('.modal input')
+    expect(input.exists()).toBe(true)
+    await input.setValue('本机配置排查')
+    await input.trigger('keydown.enter')
+    await flushPromises()
+    const c = calls.filter(x => x.name === 'RenameSession')
+    expect(c).toHaveLength(1)
+    expect(c[0].args).toEqual(['h1', 'default', '本机配置排查'])
   })
 
   it('删除默认任务会调 DeleteSession 并清本地时间线', async () => {
@@ -284,7 +298,7 @@ describe('SessionsSidebar 会话列表', () => {
     expect(wrapper.text()).toContain('暂无任务')
   })
 
-  // ---- 分组视图（未选主机时的欢迎态） ----
+  // ---- 始终按主机分组（含已启动任务） ----
 
   describe('按主机分组的任务', () => {
     const HOSTS = [
@@ -292,9 +306,10 @@ describe('SessionsSidebar 会话列表', () => {
       { id: 'h2', name: 'db', user: 'ubuntu', addr: '10.0.0.2' }
     ]
 
-    function mountGroups() {
+    function mountGroups(hostId = '') {
       store.hosts = HOSTS.map(h => ({ ...h }))
-      store.currentHostId = ''
+      store.currentHostId = hostId
+      store.currentSessionId = hostId ? 's1' : ''
       store.sessions = {
         h1: copy(),
         h2: [{ id: 'g9', name: '备份迁移', turns: 2, archivedTurns: 0, isDefault: false }]
@@ -307,7 +322,7 @@ describe('SessionsSidebar 会话列表', () => {
       const heads = wrapper.findAll('.ssb-group-head')
       expect(heads).toHaveLength(2)
       expect(heads[0].text()).toContain('web')
-      expect(heads[0].text()).toContain('root@10.0.0.1')
+      expect(heads[0].text()).toContain('root@10.***.***.1')
       expect(heads[0].text()).toContain('2')
       expect(heads[1].text()).toContain('db')
       expect(heads[1].text()).toContain('1')
@@ -318,11 +333,38 @@ describe('SessionsSidebar 会话列表', () => {
       expect(nested[2].text()).toContain('备份迁移')
     })
 
-    it('点组头进入该主机', async () => {
+    it('已选主机启动任务后仍按主机分组，不高亮切成单列表', () => {
+      mountGroups('h1')
+      expect(wrapper.findAll('.ssb-group-head')).toHaveLength(2)
+      expect(wrapper.findAll('.ssb-item-nested')).toHaveLength(3)
+      const active = wrapper.findAll('.ssb-item-nested').filter(w => w.classes().includes('active'))
+      expect(active).toHaveLength(1)
+      expect(active[0].text()).toContain('nginx 排查')
+    })
+
+    it('无可见任务的主机不显示分组', () => {
+      store.hosts = HOSTS.map(h => ({ ...h })).concat([
+        { id: 'h3', name: 'idle', user: 'root', addr: '10.0.0.3' }
+      ])
+      store.currentHostId = ''
+      store.currentSessionId = ''
+      store.sessions = {
+        h1: copy(),
+        h2: [{ id: 'g9', name: '备份迁移', turns: 2, archivedTurns: 0, isDefault: false }],
+        h3: [{ id: 'd3', name: '默认任务', turns: 0, archivedTurns: 0, isDefault: true }]
+      }
+      mountSidebar({})
+      const heads = wrapper.findAll('.ssb-group-head')
+      expect(heads).toHaveLength(2)
+      expect(wrapper.text()).not.toContain('idle')
+      expect(wrapper.text()).not.toContain('10.0.0.3')
+    })
+
+    it('组头不可点击，不切换主机', async () => {
       mountGroups()
+      expect(store.currentHostId).toBe('')
       await wrapper.findAll('.ssb-group-head')[1].trigger('click')
-      expect(store.currentHostId).toBe('h2')
-      expect(store.pendingSessionId).toBe('')
+      expect(store.currentHostId).toBe('')
     })
 
     it('点组内任务直达那条会话：先记意图再切主机', async () => {

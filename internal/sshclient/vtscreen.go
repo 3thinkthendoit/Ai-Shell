@@ -619,6 +619,10 @@ type Snapshotter struct {
 	timer   *time.Timer
 	lastSum uint64
 	stopped bool
+	// abandoned：用户主动关终端 / 切会话时置位。此后 Final 不再送帧 ——
+	// 有意义的 TUI 画面在退出全屏时已 Flush；再定格只会把登录 MOTD
+	// 灌进对话，纯噪音。远端自己 exit / 断连仍走 Final（未 Abandon）。
+	abandoned bool
 }
 
 func NewSnapshotter(screen *Screen, idle time.Duration, onSnap func(text string, final bool)) *Snapshotter {
@@ -691,10 +695,28 @@ func (sn *Snapshotter) Flush() {
 
 // Final 停表并送出最后一帧（PTY 退出时调用）。哪怕之前已 Stop 也送：
 // 这是把「死亡现场」留给模型和用户的最后机会。内容与上次相同时
-// 自动去重，不会重复进上下文。
+// 自动去重，不会重复进上下文。已 Abandon 的不送。
 func (sn *Snapshotter) Final() {
 	sn.Stop()
+	sn.mu.Lock()
+	abandoned := sn.abandoned
+	sn.mu.Unlock()
+	if abandoned {
+		return
+	}
 	sn.fire(true)
+}
+
+// Abandon 停表并放弃定格：主动关闭 / 切会话时调用，阻止后续 Final。
+func (sn *Snapshotter) Abandon() {
+	sn.mu.Lock()
+	defer sn.mu.Unlock()
+	sn.stopped = true
+	sn.abandoned = true
+	if sn.timer != nil {
+		sn.timer.Stop()
+		sn.timer = nil
+	}
 }
 
 // Stop 停掉计时器（块关闭或复用让位时调用）。幂等。

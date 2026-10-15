@@ -1,12 +1,14 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
-  store, approve, stop, clearLog, clearSession, compactSession, push,
-  createSession, refreshSessions, switchProfile, syncWindowTitle,
-  closeTerminal, reportActiveSession,
+  store, approve, stop, push,
+  refreshSessions, switchProfile, syncWindowTitle,
+  closeTerminal, reportActiveSession, loadSessionTimeline,
   openFileManager, closeFileManager,
-  bucketKey, noteConversationActivity, onFocusSessionChanged, shouldShowSessionChrome
+  bucketKey, noteConversationActivity, onFocusSessionChanged, shouldShowSessionChrome,
+  resetSessionChromeSeen, beginFreshTask, ensureFreshTaskSession
 } from '../store'
+import { formatHostLabel, maskHostAddr } from '../hostDisplay'
 import { providerBadge } from '../providerLogos'
 
 // 未选主机的欢迎页按钮会向上切页签（App.vue 接住后改 tab），script 里也要
@@ -44,10 +46,13 @@ let ro = null
 // 默认进对话页：打开软件即见对话框；需要敲命令时切回「终端」。
 const showArchive = ref(true)
 
-// 空对话框首页藏顶栏；见过对话后清空记录仍保留。终端视图始终保留顶栏。
-// 不能单靠 turns：空首页选主机时旧会话 turns>0 会把顶栏突然顶出来。
+// 顶栏：
+// - 终端视图始终显示（要切回对话 / 关终端）
+// - 已选主机时对话页也显示：切「对话」= 进当前任务对话框，不是新建；
+//   顶栏保留主机与「对话/终端」切换，任务名用「未命名任务」兜底。
+// - 未选主机的空欢迎首页仍藏顶栏。
 const showTopBar = computed(() =>
-  !showArchive.value || shouldShowSessionChrome()
+  !showArchive.value || shouldShowSessionChrome() || !!store.currentHostId
 )
 watch(() => store.entries.length, noteConversationActivity, { immediate: true })
 watch(() => [store.currentHostId, store.currentSessionId], onFocusSessionChanged)
@@ -176,19 +181,26 @@ async function onClose() {
   await closeTerminal(hostId, store.currentSessionId)
   disposeSurface(key)
   if (attachedKey === key) attachedKey = ''
+  // 关终端 = 断 SSH + 回对话；再点「终端」由 goTermView 重建连接。
+  showArchive.value = true
+}
+
+function goTermView() {
+  showArchive.value = false
 }
 
 function onRetry() {
   ensureSurface(store.currentHostId, store.currentSessionId)
 }
 
-// 从归档切回表面时重新测量：隐藏期间容器是 0x0，fit 一直跳过。
-// 顺带重画一次欢迎引导：用户切走又回来，视线重新落到这个 shell 上，
-// 此刻提示「这里能说人话」正是有效时机（whyHintShown 的「每次回来都提示」
-// 语义就落在这一句上）。
+// 切回终端：隐藏期间容器是 0x0，需 fit；关闭后表面已卸则重建 PTY。
 watch(showArchive, async on => {
   if (on) return
   await nextTick()
+  if (store.currentHostId) {
+    // 仍开着 → ensureTerm 只 fit；关过 → 重新 OpenTerminal。
+    await attachSurface(store.currentHostId, store.currentSessionId)
+  }
   doFit(currentKey.value)
   paintWelcomeHintIfNeeded(currentKey.value, true)
 })
@@ -335,16 +347,33 @@ async function attachSurface(hostId, sessionId) {
 watch(() => store.currentHostId, async id => {
   hostSwitching = true
   try {
-    store.currentSessionId = ''
-    await refreshSessions(id)
+    // 清主机：卸掉旧 PTY，回到新建首页（侧栏分组视图）。
+    if (!id) {
+      if (attachedKey) {
+        await detachSurface(attachedKey)
+        attachedKey = ''
+      }
+      store.currentSessionId = ''
+      return
+    }
     // 侧栏分组视图「点其它主机的某条任务直达」：意图记在 pendingSessionId，
     // 列表里确实存在才落选中（用完即清；普通切主机时它是空串，走默认兜底）。
+    // 不再先把 currentSessionId 置空：refreshSessions 会把无效 id 兜到默认会话，
+    // 避免与 commitDraftHost / ask 并发时把刚选好的会话冲掉。
     const want = store.pendingSessionId
     store.pendingSessionId = ''
+    await refreshSessions(id)
     if (want && (store.sessions[id] || []).some(s => s.id === want)) {
       store.currentSessionId = want
     }
-    if (id) await attachSurface(id, store.currentSessionId)
+    // 侧栏直达任务：立刻还原该会话历史（勿等 ChatPanel watch）。
+    if (!store.freshTaskPending) {
+      await loadSessionTimeline(id, store.currentSessionId)
+    }
+    // 新建态刚 commit 主机：等 ensureFreshTaskSession 建完会话再附着，
+    // 避免先对默认会话空开一趟 PTY。
+    if (store.freshTaskPending) return
+    await attachSurface(id, store.currentSessionId)
   } finally {
     hostSwitching = false
   }
@@ -368,17 +397,28 @@ const currentSession = computed(
 const currentSessionName = computed(() => {
   const s = currentSession.value
   if (!s) return ''
-  if (s.name) return s.name
-  if (s.isDefault) {
-    const h = store.hosts.find(x => x.id === store.currentHostId)
-    if (h) return `${h.name} (${h.user}@${h.addr})`
-  }
-  return t('console.unnamed')
+  // 空名 / 默认会话：统一「未命名任务」。
+  const name = String(s.name || '').trim()
+  if (name) return name
+  return t('ss.unnamedTask')
 })
-const hostOptions = computed(() =>
-  store.hosts.map(h => ({ value: h.id, label: `${h.name} — ${h.user}@${h.addr}` }))
-)
-watch(currentSessionName, name => syncWindowTitle(name), { immediate: true })
+// 窗口标题 / 顶栏：主机名 + 脱敏 IP；中间两段用 ***（见 maskHostAddr）。
+const hostTitle = computed(() => formatHostLabel(currentHost.value))
+const windowTitleLabel = computed(() => {
+  const host = hostTitle.value
+  const task = currentSessionName.value
+  if (host && task) return `${host} · ${task}`
+  return host || task
+})
+const hostDetailTitle = computed(() => {
+  const h = currentHost.value
+  if (!h) return ''
+  const ip = maskHostAddr(h.addr)
+  const name = String(h.name || '').trim()
+  const who = h.user ? `${h.user}@${ip}` : ip
+  return name ? `${name} · ${who}` : who
+})
+watch(windowTitleLabel, name => syncWindowTitle(name), { immediate: true })
 
 // 选中的方案：优先用 store.selectedProfileId（用户刚点的那个，同步写入），
 // 回退到后端标记的 active。前者保证「界面上显示选中的」与「本轮请求带的」一致。
@@ -395,77 +435,57 @@ const modelOptions = computed(() =>
 )
 async function onSwitchModel(id) {
   if (!id || id === activeProfileId.value) return
-  const p = store.llmProfiles.find(x => x.id === id)
-  // 同步生效：先把选中项写上，紧接着这一轮的请求就会带上它（见 store.ask）。
+  // 任务中途换模型：先中断本轮，避免 lane 占着导致下一轮发不出去。
+  if (store.running || store.busy) {
+    await stop()
+  }
+  const prev = store.selectedProfileId
   store.selectedProfileId = id
   try {
     await switchProfile(id)
   } catch {
-    return // 失败提示已由 switchProfile 推送，成功消息不能照发
+    store.selectedProfileId = prev
   }
-  push({
-    kind: 'system',
-    content: t('console.modelSwitched', { name: p ? p.name : id })
-  })
 }
 
-async function onClearSession() {
-  if (!store.currentHostId) {
-    push({ kind: 'error', content: t('msg.pickHost') })
-    return
-  }
-  await clearSession(store.currentHostId, store.currentSessionId)
+async function pickTermHost(id) {
+  if (!id) return
+  store.currentHostId = id
+  // 从新建首页进终端空态选主机 = 真正开始任务。
+  await ensureFreshTaskSession()
 }
 
-async function onCompactSession() {
-  if (!store.currentHostId) {
-    push({ kind: 'error', content: t('msg.pickHost') })
-    return
-  }
-  await compactSession(store.currentHostId, store.currentSessionId)
+// ---- 命令详细弹窗 ----
+
+function goChatView() {
+  // 纯视图切换：已有主机则停在当前会话对话框，绝不顺手新建任务。
+  showArchive.value = true
 }
-
-// ---- 弹窗：新建任务 / 命令详细 ----
-
-const showNewModal = ref(false)
-const newName = ref('')
-const newEl = ref(null)
 
 function startNewSession() {
-  if (!store.currentHostId) {
-    push({ kind: 'error', content: t('msg.pickHost') })
-    return
-  }
   showArchive.value = true
-  newName.value = ''
-  showNewModal.value = true
-  nextTick(() => { if (newEl.value) newEl.value.focus() })
+  // 新建任务 = 回欢迎首页：不立刻建会话、不占某一台主机。
+  // 侧栏保持「按主机分组」；底栏预选主机用 draftHostId，发对话/开终端才真正开始。
+  store.draftHostId = ''
+  beginFreshTask()
+  if (store.currentHostId) {
+    store.currentHostId = ''
+  }
+  store.currentSessionId = ''
+  resetSessionChromeSeen()
 }
 
-// 侧栏「新建任务」入口：切到对话页并弹出命名框（无主机时给出提示）。
+// 主导航「新建任务」：回对话欢迎首页，标记待开新会话。
 watch(() => store.newTaskIntent, () => {
   if (!store.newTaskIntent) return
   startNewSession()
 })
 
-async function commitNewSession() {
-  const name = newName.value.trim()
-  showNewModal.value = false
-  newName.value = ''
-  if (!name) return
-  await createSession(name)
-}
-
-function onNewKeydown(e) {
-  if (e.isComposing || e.keyCode === 229) return
-  if (e.key === 'Enter') {
-    e.preventDefault()
-    commitNewSession()
-  } else if (e.key === 'Escape') {
-    e.preventDefault()
-    showNewModal.value = false
-  }
-}
+// 删光侧栏任务等：回到对话欢迎首页（新建任务态）。
+watch(() => store.chatHomeIntent, () => {
+  if (!store.chatHomeIntent) return
+  showArchive.value = true
+})
 
 const showCmdDetail = ref(false)
 const cmdCopied = ref(false)
@@ -578,8 +598,6 @@ function openFiles() {
 }
 
 function onWinKeydown(e) {
-  // 新建任务弹窗在顶层时这里让路，避免一次 Esc 同时关掉两层。
-  if (showNewModal.value) return
   // 文件管理弹窗最外层优先：它盖住整个界面，Esc 应该先关它。
   if (e.key === 'Escape' && store.fileManager.open) {
     closeFileManager()
@@ -624,22 +642,9 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="console">
-    <!-- 有对话（或已在终端）才显示顶栏：空对话框首页只留中央 composer。 -->
+    <!-- 顶栏：文件 + 当前主机（只读）+ 对话/终端。主机不可在此切换。 -->
     <header v-if="showTopBar" class="bar">
       <div class="row grow">
-        <label class="inline-label">{{ t('console.bar.host') }}</label>
-        <UiSelect
-          v-model="store.currentHostId"
-          class="host-select"
-          :options="hostOptions"
-          :placeholder="t('console.bar.noHosts')"
-        />
-        <button
-          class="sm tonal new-session-btn"
-          :disabled="!store.currentHostId"
-          :title="t('console.new.title')"
-          @click="startNewSession"
-        >{{ t('console.new.label') }}</button>
         <!-- 文件管理：默认打开当前终端所在的远端目录（目录由那条 shell
              通过 OSC 7 上报，见 store 的 term:cwd 处理）。 -->
         <button
@@ -648,29 +653,17 @@ onBeforeUnmount(() => {
           :title="t('console.files.title')"
           @click="openFiles"
         >{{ t('console.files.label') }}</button>
+        <span
+          v-if="hostTitle"
+          class="bar-host"
+          :title="hostDetailTitle"
+        >{{ hostTitle }}</span>
       </div>
 
       <div class="seg">
-        <button :class="{ on: showArchive }" @click="showArchive = true">{{ t('console.view.chat') }}</button>
-        <button :class="{ on: !showArchive }" @click="showArchive = false">{{ t('console.view.term') }}</button>
-      </div>
-
-      <!-- 新建任务弹窗（应用内，WKWebView 上原生 prompt 不弹） -->
-      <div v-if="showNewModal" class="overlay" @click.self="showNewModal = false">
-        <div class="modal">
-          <h3>{{ t('console.new.heading') }}</h3>
-          <input
-            ref="newEl"
-            v-model="newName"
-            :placeholder="t('console.new.placeholder')"
-            @keydown="onNewKeydown"
-          />
-          <div class="modal-hint">{{ t('console.new.hint') }}</div>
-          <div class="modal-actions">
-            <button class="sm" @click="showNewModal = false">{{ t('console.new.cancel') }}</button>
-            <button class="sm primary" @click="commitNewSession">{{ t('console.new.create') }}</button>
-          </div>
-        </div>
+        <!-- 切对话：只切视图，不建任务；落到当前会话（空名即「未命名任务」）。 -->
+        <button :class="{ on: showArchive }" @click="goChatView">{{ t('console.view.chat') }}</button>
+        <button :class="{ on: !showArchive }" @click="goTermView">{{ t('console.view.term') }}</button>
       </div>
     </header>
 
@@ -683,7 +676,24 @@ onBeforeUnmount(() => {
     <!-- 活表面：整幅 xterm，附着当前主机的常驻 shell PTY（终端内仍可 Agent+Shell 分流） -->
     <div class="surface" ref="rootEl" v-show="!showArchive">
       <div v-if="!store.currentHostId" class="surface-empty">
-        <p class="term-empty">{{ t('msg.pickHost') }}</p>
+        <p class="term-empty-title">{{ t('console.term.pickHost') }}</p>
+        <p class="term-empty-hint">{{ t('console.term.pickHostHint') }}</p>
+        <div v-if="store.hosts.length" class="term-host-list" role="listbox">
+          <button
+            v-for="h in store.hosts"
+            :key="h.id"
+            type="button"
+            class="term-host-item"
+            role="option"
+            @click="pickTermHost(h.id)"
+          >
+            <span class="term-host-name">{{ h.name }}</span>
+            <span class="term-host-addr">{{ h.user }}@{{ maskHostAddr(h.addr) }}</span>
+          </button>
+        </div>
+        <button type="button" class="sm term-host-add" @click="emit('page', 'hosts')">
+          {{ t('console.term.addHost') }}
+        </button>
       </div>
       <template v-else>
         <div v-if="statusLine" class="surface-status" :class="{ bad: st && st.status === 'error' }">
@@ -706,7 +716,7 @@ onBeforeUnmount(() => {
     <ChatPanel
       v-show="showArchive"
       @page="emit('page', $event)"
-      @term="showArchive = false"
+      @term="goTermView"
       @cmd-detail="showCmdDetail = true"
     />
 
@@ -769,21 +779,10 @@ onBeforeUnmount(() => {
           class="model-select"
           :model-value="activeProfileId"
           :options="modelOptions"
-          :disabled="store.running || !store.llmProfiles.length"
+          :disabled="!store.llmProfiles.length"
           :placeholder="t('console.noProviders')"
           @change="onSwitchModel"
         />
-        <button
-          class="sm"
-          :disabled="store.compacting"
-          :title="store.compacting ? '' : t('console.compact.title')"
-          @click="onCompactSession"
-        >
-          {{ store.compacting ? t('console.compact.busy') : t('console.compact.label') }}
-        </button>
-        <button class="sm" @click="onClearSession">{{ t('console.clearCtx') }}</button>
-        <span class="composer-sep"></span>
-        <button class="sm" @click="clearLog" :disabled="store.running || store.busy">{{ t('console.clearLog') }}</button>
         <button v-if="store.running || store.busy" class="sm danger" @click="stop">{{ t('console.interrupt') }}</button>
       </div>
     </div>
@@ -824,9 +823,23 @@ onBeforeUnmount(() => {
   background: var(--surface);
   flex-shrink: 0;
 }
-.inline-label { font-size: 12px; color: var(--text-2); margin: 0; white-space: nowrap; }
-.host-select { max-width: 420px; }
 .new-session-btn { flex-shrink: 0; white-space: nowrap; font-size: 13px; }
+.bar-host {
+  min-width: 0;
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+}
+.bar-host::before {
+  content: '·';
+  margin-right: 8px;
+  color: var(--text-3);
+  font-weight: 400;
+}
 
 /* 弹窗（应用内，与侧边栏删除确认同风格） */
 .overlay {
@@ -878,7 +891,17 @@ onBeforeUnmount(() => {
   background: var(--surface);
   color: var(--text-2);
 }
-.seg button.on { background: var(--accent-bg); color: var(--accent); font-weight: 500; }
+.seg button.on {
+  background: var(--accent);
+  color: #0a0c0a;
+  font-weight: 600;
+}
+.seg button.on:hover:not(:disabled) {
+  background: var(--accent);
+  color: #0a0c0a;
+  filter: brightness(1.06);
+  border-color: transparent;
+}
 /* 模型选择器：宽度随内容自适应（不再固定 300px，否则名字短时右侧会空一大截）。
    class="model-select" 会透传到 UiSelect 的根元素（就是 .uis），所以这里直接生效：
    width:max-content 让按钮"文字多宽、按钮多宽"；max-width 兜住超长名字。 */
@@ -903,8 +926,6 @@ onBeforeUnmount(() => {
   flex-direction: column;
   background: var(--bg);
 }
-.surface-empty { padding: 24px 16px; color: var(--text-3); font-size: 13px; }
-
 /* 欢迎页：未选主机时的默认界面。居中卡片，介绍三条输入路径并引导选主机。 */
 .welcome {
   display: flex;
@@ -1216,13 +1237,64 @@ onBeforeUnmount(() => {
 .approval-countdown { font-size: 12px; white-space: nowrap; }
 .approval-countdown.urgent { color: var(--warn); font-weight: 600; }
 
-.term-empty {
-  margin: 0;
-  padding: 48px 24px;
-  text-align: center;
-  color: var(--text-3);
-  font-size: 14px;
+.surface-empty {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 32px 20px;
 }
+.term-empty-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+.term-empty-hint {
+  margin: 0 0 6px;
+  font-size: 12.5px;
+  color: var(--text-3);
+}
+.term-host-list {
+  width: min(360px, 92%);
+  max-height: min(280px, 50vh);
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+.term-host-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  padding: 9px 11px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.term-host-item:hover { background: var(--surface-2); }
+.term-host-name {
+  font-size: 13px;
+  font-weight: 500;
+}
+.term-host-addr {
+  font-size: 11px;
+  color: var(--text-3);
+  font-family: var(--mono, ui-monospace, monospace);
+}
+.term-host-add { margin-top: 4px; }
 .composer-bar.approval-only {
   border-top: 0;
   background: transparent;

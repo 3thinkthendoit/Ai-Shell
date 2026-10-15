@@ -216,9 +216,7 @@ function withWriteClipboard() {
   return box
 }
 
-// selectHost 通过 UiSelect（自绘下拉）切换目标主机。
-// 原生 select 已被替换：触发器是按钮，选项是列表项，不能用 setValue。
-// 空对话时顶栏隐藏，切换主机/视图前先确保顶栏在。
+// 空对话时顶栏隐藏，切换视图前先确保顶栏在。
 async function ensureTopBar() {
   if (!wrapper.find('.bar').exists()) {
     push({ kind: 'system', content: '·' })
@@ -226,15 +224,9 @@ async function ensureTopBar() {
   }
 }
 
+// 顶栏已去掉目标主机下拉；切主机与底栏/空态一致，直接写 store。
 async function selectHost(id) {
-  const h = store.hosts.find(x => x.id === id)
-  await ensureTopBar()
-  await wrapper.find('.host-select .uis-trigger').trigger('click')
-  await flushPromises()
-  const item = wrapper
-    .findAll('.host-select .uis-item')
-    .filter(w => w.text() === `${h.name} — ${h.user}@${h.addr}`)[0]
-  await item.trigger('click')
+  store.currentHostId = id
   await flushPromises()
   await nextTick()
 }
@@ -643,7 +635,7 @@ describe('常驻终端表面 退出与关闭', () => {
     expect(store.entries.filter(e => e.kind === 'error').length).toBe(errs0)
   })
 
-  it('自己点关闭会打后端并销毁本地实例', async () => {
+  it('自己点关闭会打后端并销毁本地实例，并回到对话', async () => {
     withHost()
     setup()
     await attached()
@@ -654,6 +646,24 @@ describe('常驻终端表面 退出与关闭', () => {
 
     expect(callsOf('CloseTerminal').map(c => c.args[0])).toEqual(['h1'])
     expect(instances[0].disposed).toBe(true)
+    expect(wrapper.find('.chat').isVisible()).toBe(true)
+    expect(wrapper.find('.sess-banner').exists()).toBe(false)
+  })
+
+  it('关闭后再切终端会重新 OpenTerminal', async () => {
+    withHost()
+    setup()
+    await attached()
+    await toSurface()
+    expect(callsOf('OpenTerminal')).toHaveLength(1)
+
+    await wrapper.find('.sess-banner button').trigger('click')
+    await flushPromises()
+    expect(callsOf('CloseTerminal')).toHaveLength(1)
+
+    await toSurface()
+    expect(callsOf('OpenTerminal')).toHaveLength(2)
+    expect(wrapper.find('.sess-banner').exists()).toBe(true)
   })
 
   it('自己关掉的终端不再弹一条「已断开」', async () => {

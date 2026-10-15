@@ -155,6 +155,7 @@ import {
   fmUpload, fmDownload, fmCancelTransfer, fmtBytes
 } from '../store'
 import { t } from '../i18n'
+import { maskHostAddr } from '../hostDisplay'
 
 const fm = store.fileManager
 
@@ -213,7 +214,8 @@ const progressText = computed(() => {
 
 const hostLabel = computed(() => {
   const h = store.hosts.find(x => x.id === fm.hostId)
-  return h ? `${h.name} · ${h.user}@${h.addr}` : ''
+  if (!h) return ''
+  return `${h.name} · ${h.user}@${maskHostAddr(h.addr)}`
 })
 
 // 目录在前、文件在后，各自按名字排。与文件管理器的通行习惯一致，

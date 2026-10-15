@@ -10,7 +10,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import { nextTick } from 'vue'
 import ConsolePanel from '../components/ConsolePanel.vue'
-import { store, push, textToBase64, bindEvents, writeTerminal, isPtyDirty, ask, clearSession, compactSession, resetSessionChromeSeen } from '../store.js'
+import { store, push, textToBase64, bindEvents, writeTerminal, isPtyDirty, ask, resetSessionChromeSeen } from '../store.js'
 import { instances, resetInstances } from './stubs/xterm.js'
 
 // ---- Wails 运行时与后端替身 ----
@@ -84,6 +84,9 @@ function makeApp(impl = {}) {
 function resetStore() {
   store.hosts = []
   store.currentHostId = ''
+  store.draftHostId = ''
+  store.freshTaskPending = false
+  store.sessionBound = false
   store.bySession = {}
   store.sessions = {}
   store.terms = {}
@@ -188,14 +191,55 @@ describe('ConsolePanel 空状态与主机选择', () => {
     expect(wrapper.find('.composer-bar').exists()).toBe(false)
   })
 
-  it('已有主机时列出「名称 — user@addr」', async () => {
+  it('已有主机时顶栏显示主机名与脱敏 IP（只读）+ 文件 + 对话/终端，无下拉', async () => {
     withHost()
     setup()
-    // 空对话时顶栏隐藏；先推一条消息让顶栏出现再断言主机文案。
-    push({ kind: 'user', content: 'hi' })
     await nextTick()
-    expect(wrapper.text()).toContain('web')
-    expect(wrapper.text()).toContain('root@10.0.0.1')
+    expect(wrapper.find('.bar').exists()).toBe(true)
+    expect(wrapper.find('.bar-host').exists()).toBe(true)
+    expect(wrapper.find('.bar-host').text()).toContain('web')
+    expect(wrapper.find('.bar-host').text()).toContain('10.***.***.1')
+    expect(wrapper.find('.bar-host').text()).not.toContain('10.0.0.1')
+    expect(wrapper.find('.host-select').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('目标主机')
+    expect(wrapper.findAll('.seg button').map(b => b.text())).toEqual(['对话', '终端'])
+  })
+
+  it('窗口标题含主机名、脱敏 IP 与任务名', async () => {
+    const titles = []
+    rt.WindowSetTitle = (t) => { titles.push(t) }
+    withHost()
+    store.sessions = {
+      h1: [{ id: 'default', name: '', turns: 0, archivedTurns: 0, isDefault: true }]
+    }
+    store.currentSessionId = 'default'
+    setup()
+    await nextTick()
+    expect(titles.some(t =>
+      t.includes('web') && t.includes('10.***.***.1') && t.includes('未命名任务')
+    )).toBe(true)
+  })
+
+  it('终端切「对话」只换视图、不新建任务', async () => {
+    withHost()
+    setup({
+      CreateSession: async () => ({ id: 's-should-not', name: '新任务', turns: 0, archivedTurns: 0, isDefault: false })
+    })
+    store.sessions = {
+      h1: [{ id: 'default', name: '', turns: 0, archivedTurns: 0, isDefault: true }]
+    }
+    store.currentSessionId = 'default'
+    store.freshTaskPending = false
+    await wrapper.find('.home-term-link').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('.surface').isVisible()).toBe(true)
+    const before = store.currentSessionId
+    await wrapper.findAll('.seg button')[0].trigger('click')
+    await flushPromises()
+    expect(wrapper.find('.chat').isVisible()).toBe(true)
+    expect(wrapper.find('.bar').exists()).toBe(true)
+    expect(store.currentSessionId).toBe(before)
+    expect(calls.filter(c => c.name === 'CreateSession')).toHaveLength(0)
   })
 
   it('真正有对话后顶栏出现，分段是「对话 / 终端」', async () => {
@@ -403,32 +447,40 @@ describe('ConsolePanel 审批条', () => {
     }
   })
 
-  it('新建任务弹窗打开时 Esc 让路，只在其关闭后才收命令弹窗', async () => {
+  it('有主机触发新建任务意图 → 回欢迎首页，清主机、标记待开新会话', async () => {
     withHost()
-    setup()
-    // 空对话时顶栏（含「新建任务」）隐藏，先有一条记录。
+    setup({
+      CreateSession: async () => ({ id: 's-new', name: '新任务', turns: 0, archivedTurns: 0, isDefault: false }),
+      ListSessions: async () => [
+        { id: 'default', name: '', turns: 0, archivedTurns: 0, isDefault: true }
+      ]
+    })
     push({ kind: 'user', content: 'hi' })
-    store.pending = { id: 'a7', name: 'run_command', command: 'ls' }
     await nextTick()
-    await wrapper.findAll('.approval button').find(b => b.text() === '详细').trigger('click')
-    await nextTick()
-    // 叠加打开新建任务弹窗
-    await wrapper.findAll('button').find(b => b.text().includes('新建任务')).trigger('click')
-    await nextTick()
-    expect(wrapper.find('.cmd-modal').exists()).toBe(true)
+    expect(store.entries.length).toBeGreaterThan(0)
+    store.newTaskIntent++
+    await flushPromises()
+    expect(wrapper.find('.modal').exists()).toBe(false)
+    expect(store.currentHostId).toBe('')
+    expect(store.draftHostId).toBe('')
+    expect(store.currentSessionId).toBe('')
+    expect(store.freshTaskPending).toBe(true)
+    expect(calls.filter(c => c.name === 'CreateSession')).toHaveLength(0)
+    expect(wrapper.find('.home-title').exists()).toBe(true)
+  })
 
-    // 新建弹窗在顶层：Esc 不应误关命令弹窗
-    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
+  it('无主机点新建任务 → 仍停在欢迎首页，标记待开新会话', async () => {
+    setup()
+    withoutHost()
+    store.hosts = [{ id: 'h1', name: 'web', user: 'root', addr: '10.0.0.1' }]
+    store.hostPickerIntent = 0
+    const entriesBefore = store.entries.length
+    store.newTaskIntent++
     await nextTick()
-    expect(wrapper.find('.cmd-modal').exists()).toBe(true)
-    expect(wrapper.find('.modal').exists()).toBe(true)
-
-    // 新建弹窗关掉后，Esc 恢复关闭命令弹窗
-    await wrapper.findAll('.modal-actions button').find(b => b.text() === '取消').trigger('click')
-    await nextTick()
-    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
-    await nextTick()
-    expect(wrapper.find('.cmd-modal').exists()).toBe(false)
+    expect(store.hostPickerIntent).toBe(0)
+    expect(store.freshTaskPending).toBe(true)
+    expect(store.entries.length).toBe(entriesBefore)
+    expect(wrapper.find('.home-title').exists()).toBe(true)
   })
 })
 
@@ -437,30 +489,37 @@ describe('ConsolePanel 审批条', () => {
 // 输入已整体搬进终端表面（分流用例见 terminal.test.js 的直接输入组），
 // composer-bar 只剩工具条；这里锁住工具条上的运行指示。
 describe('ConsolePanel 运行指示', () => {
-  it('运行中显示「中断」', async () => {
+  it('运行中发送钮变为中断', async () => {
     withHost()
     store.running = true
     setup()
     push({ kind: 'user', content: 'hi' })
     await nextTick()
-    expect(wrapper.text()).toContain('中断')
+    expect(wrapper.find('.send-btn.stop-btn').exists()).toBe(true)
   })
 
-  it('运行中且无审批时显示「Working」', async () => {
+  it('运行中且无审批时在消息流显示思考占位（logo + Ai-Shell）', async () => {
     store.running = true
+    store.activeHostId = 'h1'
+    store.activeSessionId = 'default'
     setup()
     push({ kind: 'user', content: 'hi' })
     await nextTick()
-    expect(wrapper.text()).toContain('Working')
+    const tip = wrapper.find('.thinking-placeholder')
+    expect(tip.exists()).toBe(true)
+    expect(tip.find('.asst-name').text()).toBe('Ai-Shell')
+    expect(tip.text()).toContain('思考中')
   })
 
-  it('等待审批时不显示「Working」（此时在等人，不是在算）', async () => {
+  it('等待审批时不显示思考占位（此时在等人，不是在算）', async () => {
     store.running = true
+    store.activeHostId = 'h1'
+    store.activeSessionId = 'default'
     store.pending = { id: 'a1', name: 'run_command', command: 'ls' }
     setup()
     push({ kind: 'user', content: 'hi' })
     await nextTick()
-    expect(wrapper.text()).not.toContain('Working')
+    expect(wrapper.find('.thinking-placeholder').exists()).toBe(false)
   })
 })
 
@@ -876,21 +935,43 @@ describe('ConsolePanel 对话页', () => {
     expect(wrapper.find('.surface').isVisible()).toBe(false)
   })
 
-  it('已选主机时空对话是贴底工作区，不是营销首页', async () => {
+  it('无主机进终端 → 空态列出主机，点选后附着', async () => {
     setup()
-    expect(wrapper.find('.home-title').exists()).toBe(false)
-    expect(wrapper.find('.home.docked').exists()).toBe(true)
+    withoutHost()
+    store.hosts = [
+      { id: 'h1', name: 'web', user: 'root', addr: '10.0.0.1' },
+      { id: 'h2', name: 'db', user: 'root', addr: '10.0.0.2' }
+    ]
+    await wrapper.find('.home-term-link').trigger('click')
+    await nextTick()
+    expect(wrapper.find('.surface').isVisible()).toBe(true)
+    expect(wrapper.find('.surface-empty').exists()).toBe(true)
+    expect(wrapper.findAll('.term-host-item')).toHaveLength(2)
+    await wrapper.findAll('.term-host-item')[1].trigger('click')
+    await flushPromises()
+    expect(store.currentHostId).toBe('h2')
+    expect(wrapper.find('.surface-empty').exists()).toBe(false)
+  })
+
+  it('已选主机且无气泡时仍是欢迎首页（选主机不改布局）', async () => {
+    setup()
+    expect(wrapper.find('.home-title').exists()).toBe(true)
+    expect(wrapper.find('.home.docked').exists()).toBe(false)
     expect(wrapper.find('.composer-input').exists()).toBe(true)
   })
 
-  it('从终端切回对话：有主机无气泡时不掉回营销首页', async () => {
+  it('从终端切回对话：有主机无气泡时仍是欢迎首页', async () => {
     setup()
-    await toSurface()
+    store.freshTaskPending = false
+    // 走首页链接进终端，避免 ensureTopBar 往时间线塞气泡干扰布局断言
+    await wrapper.find('.home-term-link').trigger('click')
+    await flushPromises()
     expect(wrapper.find('.surface').isVisible()).toBe(true)
-    await toArchive()
+    await wrapper.findAll('.seg button')[0].trigger('click')
+    await nextTick()
     expect(wrapper.find('.chat').isVisible()).toBe(true)
-    expect(wrapper.find('.home-title').exists()).toBe(false)
-    expect(wrapper.find('.home.docked').exists()).toBe(true)
+    expect(wrapper.find('.home-title').exists()).toBe(true)
+    expect(wrapper.find('.home.docked').exists()).toBe(false)
   })
 
   it('时间线条目本身无按钮（工具组用可点击行展开）', async () => {
@@ -1039,20 +1120,22 @@ describe('ConsolePanel 流式输出', () => {
     expect(wrapper.find('.msg.assistant .caret').exists()).toBe(false)
   })
 
-  it('正在逐字输出时不显示「Working」（此时在输出，不是在算）', async () => {
+  it('正在逐字输出时不显示思考占位（此时在输出，不是在算）', async () => {
     store.running = true
     setup()
     push({ kind: 'assistant', content: '输出中', stream: 0, streaming: true })
     await nextTick()
-    expect(wrapper.text()).not.toContain('Working')
+    expect(wrapper.find('.thinking-placeholder').exists()).toBe(false)
   })
 
-  it('思考阶段（还没有任何增量）仍显示「Working」', async () => {
+  it('思考阶段（还没有任何增量）在消息流显示思考占位', async () => {
     store.running = true
+    store.activeHostId = 'h1'
+    store.activeSessionId = 'default'
     setup()
     push({ kind: 'user', content: 'hi' })
     await nextTick()
-    expect(wrapper.text()).toContain('Working')
+    expect(wrapper.find('.thinking-placeholder').text()).toContain('思考中')
   })
 
   it('生成过程中内容增长会触发自动滚动', async () => {
@@ -1118,228 +1201,28 @@ describe('ConsolePanel 思考过程', () => {
   })
 })
 
-// ---- 清空会话上下文 ----
-//
-// 这个按钮和「清空记录」长得像，干的事完全不同：
-// 一个清屏幕上的文字，一个清 LLM 的记忆。界面上必须都能点得到，
-// 且点的是各自那一个 —— 混在一起用户就永远学不到它们不是一回事。
-describe('ConsolePanel 清空会话上下文', () => {
-  function setupWithHost(impl) {
+// 清空上下文 / 清空记录按钮已从界面移除（agent 自动 trim；API 仍由 store 测）。
+describe('ConsolePanel 不再提供清空按钮', () => {
+  it('对话与终端底栏都不出现「清空上下文」「清空记录」', async () => {
     withHost()
-    return setup(impl)
-  }
-
-  // 按**文字**找按钮，不要按下标。
-  //
-  // 早先这里写的是 wrapper.find('.ctx-bar button')，靠位置取到第一个 ——
-  // 后来在旁边加了个「压缩上下文」，它就成了第一个，四条用例一起红。
-  // 位置选择在「同一个容器里会有几个按钮」这件事上没有表达力。
-  // 对话页工具条在 .chat-tools；终端视图仍在 .composer-bar。
-  function ctxBtn(label) {
-    const b = wrapper.findAll('.chat-tools button, .composer-bar button').find(x => x.text().includes(label))
-    if (!b) throw new Error(`未找到按钮：${label}`)
-    return b
-  }
-
-  it('点「清空上下文」把当前主机 id 与会话 id 都发给后端', async () => {
-    setupWithHost({ ClearSession: async () => ({ cleared: 2, busy: false }) })
+    setup({})
     push({ kind: 'user', content: 'hi' })
     await nextTick()
-    // 特意选中一条具名会话。只断言主机 id 的话，「永远传空会话」
-    // 这种 bug 会照样绿 —— 而那正是「清空清错了会话」的成因：
-    // 用户点的是「nginx 排查」，被清掉的却是默认会话。
-    store.currentSessionId = 's7'
-    await ctxBtn('清空上下文').trigger('click')
-    await flushPromises()
-
-    expect(calls.filter(c => c.name === 'ClearSession')).toHaveLength(1)
-    expect(calls.filter(c => c.name === 'ClearSession')[0].args).toEqual(['h1', 's7'])
-  })
-
-  it('清掉若干轮时把轮数显示出来', async () => {
-    setupWithHost({ ClearSession: async () => ({ cleared: 3, busy: false }) })
-    push({ kind: 'user', content: 'hi' })
-    await nextTick()
-    await ctxBtn('清空上下文').trigger('click')
-    await flushPromises()
-    expect(wrapper.text()).toContain('3 轮')
-  })
-
-  it('有会话在跑时说明原因，而不是按钮点了没反应', async () => {
-    setupWithHost({ ClearSession: async () => ({ cleared: 0, busy: true }) })
-    push({ kind: 'user', content: 'hi' })
-    await nextTick()
-    await ctxBtn('清空上下文').trigger('click')
-    await flushPromises()
-    expect(wrapper.text()).toContain('正在运行')
-  })
-
-  it('没选主机时不打后端，给出提示', async () => {
-    // 对话页未选主机时点清空会弹选主机层；守卫本身仍值得钉住。
-    setup({ ClearSession: async () => ({ cleared: 1, busy: false }) })
-    withoutHost()
-    clearSession()
-    await flushPromises()
-
-    expect(calls.filter(c => c.name === 'ClearSession')).toHaveLength(0)
-    expect(wrapper.text()).toContain('请先选择一台主机')
-  })
-
-  // 「清空记录」只清屏幕：不能顺手把上下文也清了。
-  it('点「清空记录」不会打到后端的 ClearSession', async () => {
-    setupWithHost({ ClearSession: async () => ({ cleared: 1, busy: false }) })
-    push({ kind: 'user', content: '一条记录' })
-    await nextTick()
-
-    const btn = wrapper.findAll('.chat-tools button, .composer-bar button').find(b => b.text() === '清空记录')
-    await btn.trigger('click')
-    await flushPromises()
-
-    expect(calls.filter(c => c.name === 'ClearSession')).toHaveLength(0)
-    expect(store.entries, '屏幕上的记录应被清掉').toEqual([])
-  })
-
-  it('两个按钮都在界面上，名称可区分', async () => {
-    setupWithHost({ ClearSession: async () => ({ cleared: 0, busy: false }) })
-    push({ kind: 'user', content: 'hi' })
-    await nextTick()
-    const clearCtx = ctxBtn('清空上下文').text()
-    const clearLog = wrapper.findAll('.chat-tools button, .composer-bar button').map(b => b.text())
-    expect(clearCtx).toContain('清空上下文')
-    expect(clearLog).toContain('清空记录')
-    expect(clearCtx).not.toBe('清空记录')
+    expect(wrapper.text()).not.toContain('清空上下文')
+    expect(wrapper.text()).not.toContain('清空记录')
+    // 切到终端视图再确认一次
+    const termBtn = wrapper.findAll('.seg button').find(b => b.text() === '终端')
+    if (termBtn) {
+      await termBtn.trigger('click')
+      await nextTick()
+    }
+    expect(wrapper.text()).not.toContain('清空上下文')
+    expect(wrapper.text()).not.toContain('清空记录')
   })
 })
 
-// ---- 压缩会话上下文 ----
-//
-// 与「清空上下文」是一对：清空是丢掉记忆，压缩是换一种更省的方式留着。
-// 界面上必须都能点到，且用户能从措辞上分清 —— 两者混起来，
-// 用户就永远学不到「压缩之后模型还记得」这件事。
-describe('ConsolePanel 压缩会话上下文', () => {
-  function setupWithHost(impl) {
-    withHost()
-    return setup(impl)
-  }
-
-  function ctxBtn(label) {
-    const b = wrapper.findAll('.chat-tools button, .composer-bar button').find(x => x.text().includes(label))
-    if (!b) throw new Error(`未找到按钮：${label}`)
-    return b
-  }
-
-  async function withChatTools(impl) {
-    setupWithHost(impl)
-    push({ kind: 'user', content: 'hi' })
-    await nextTick()
-  }
-
-  it('点「压缩上下文」把当前主机 id 与会话 id 都发给后端', async () => {
-    await withChatTools({
-      CompactSession: async () => ({ compacted: true, turns: 5, bytes: 300, message: '已把 5 轮对话压缩成 300 字节的摘要。' })
-    })
-    // 同「清空上下文」：会话 id 必须跟着走，否则压的是另一条会话的历史，
-    // 用户会看到「压缩成功」但当前这条对话一点没变。
-    store.currentSessionId = 's7'
-    await ctxBtn('压缩上下文').trigger('click')
-    await flushPromises()
-
-    expect(calls.filter(c => c.name === 'CompactSession')).toHaveLength(1)
-    expect(calls.filter(c => c.name === 'CompactSession')[0].args).toEqual(['h1', 's7'])
-  })
-
-  // 后端把话说全了，前端照搬即可 —— 在前端重写一遍措辞，两处迟早漂移。
-  it('把后端返回的说明原样显示出来', async () => {
-    await withChatTools({
-      CompactSession: async () => ({ compacted: true, turns: 5, bytes: 300, message: '已把 5 轮对话压缩成 300 字节的摘要。' })
-    })
-    await ctxBtn('压缩上下文').trigger('click')
-    await flushPromises()
-    expect(wrapper.text()).toContain('已把 5 轮对话压缩成 300 字节的摘要。')
-  })
-
-  // 「没得压」「正忙」是预期内的状态，必须以普通提示呈现。
-  // 渲染成红色报错会让用户以为功能坏了。
-  it('没得压时给普通提示而不是报错', async () => {
-    await withChatTools({
-      CompactSession: async () => ({ compacted: false, busy: false, message: '这台主机还没有会话记录。' })
-    })
-    await ctxBtn('压缩上下文').trigger('click')
-    await flushPromises()
-
-    expect(wrapper.text()).toContain('这台主机还没有会话记录。')
-    expect(wrapper.find('.entry.error').exists()).toBe(false)
-  })
-
-  it('有会话在跑时说明原因，而不是按钮点了没反应', async () => {
-    await withChatTools({
-      CompactSession: async () => ({ compacted: false, busy: true, message: '该主机正在执行一轮对话，等它结束或先点「中断」再压缩。' })
-    })
-    await ctxBtn('压缩上下文').trigger('click')
-    await flushPromises()
-    expect(wrapper.text()).toContain('正在执行一轮对话')
-  })
-
-  // 真故障走 error 通道，而且要说明「原历史没被改动」——
-  // 否则用户会担心压缩失败把上下文弄丢了。
-  it('后端报错时说明原历史未被改动', async () => {
-    await withChatTools({
-      CompactSession: async () => { throw new Error('尚未配置 LLM API Key') }
-    })
-    await ctxBtn('压缩上下文').trigger('click')
-    await flushPromises()
-
-    expect(wrapper.text()).toContain('尚未配置 LLM API Key')
-    expect(wrapper.text()).toContain('原历史未被改动')
-  })
-
-  it('没选主机时不打后端，给出提示', async () => {
-    // 同「清空上下文」：UI 路径已随 composer 隐藏，直接钉 store 层守卫。
-    setup({ CompactSession: async () => ({ compacted: true }) })
-    withoutHost()
-    compactSession()
-    await flushPromises()
-
-    expect(calls.filter(c => c.name === 'CompactSession')).toHaveLength(0)
-    expect(wrapper.text()).toContain('请先选择一台主机')
-  })
-
-  // 压缩要等好几秒，允许连点会发出多个并发请求，
-  // 而后端只有第一个能成功（其余因「会话已变化」被放弃）——
-  // 用户会看到一串自相矛盾的提示。
-  it('压缩期间按钮禁用并显示进度', async () => {
-    let release
-    const gate = new Promise(r => { release = r })
-    await withChatTools({
-      CompactSession: async () => { await gate; return { compacted: true, message: 'done' } }
-    })
-
-    await ctxBtn('压缩上下文').trigger('click')
-    await nextTick()
-
-    const btn = ctxBtn('压缩')
-    expect(btn.attributes('disabled')).toBeDefined()
-    expect(btn.text()).toContain('压缩中')
-
-    release()
-    await flushPromises()
-    expect(ctxBtn('压缩').attributes('disabled')).toBeUndefined()
-  })
-
-  // 运行中**不禁用**：后端会回一句「正在跑一轮」，那句话比点不动的按钮有用。
-  it('运行中仍可点击，由后端说明原因', async () => {
-    store.running = true
-    await withChatTools({
-      CompactSession: async () => ({ compacted: false, busy: true, message: '该主机正在执行一轮对话。' })
-    })
-    const btn = ctxBtn('压缩上下文')
-    expect(btn.attributes('disabled')).toBeUndefined()
-
-    await btn.trigger('click')
-    await flushPromises()
-    expect(calls.filter(c => c.name === 'CompactSession')).toHaveLength(1)
-  })
-})
+// Manual compact UI removed: agent auto-trims/archives when over limit
+// (see internal/agent session.trim). CompactSession API kept for internal use.
 
 // ---- 上下文存放位置的说明 ----
 //

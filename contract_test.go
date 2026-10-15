@@ -130,7 +130,7 @@ var requiredMethods = []string{
 	"ClearSession", "CompactSession",
 	// 会话的增删改查。这四条一起构成「一台主机多条会话」的全部入口，
 	// 少任何一条，对应的界面操作就会静默失效（点了没反应）。
-	"ListSessions", "CreateSession", "RenameSession", "DeleteSession",
+	"ListSessions", "CreateSession", "RenameSession", "DeleteSession", "GetSessionTimeline",
 	"ListAudit", "VerifyAudit", "ExportAudit",
 }
 

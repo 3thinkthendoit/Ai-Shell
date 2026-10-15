@@ -1,4 +1,4 @@
-// locales/settingsMenu.js —— 侧栏底部设置弹层（外观/终端/页面入口）文案。
+// locales/settingsMenu.js —— 侧栏底部设置弹层 + 基本配置页共用文案。
 export const settingsMenu = {
   zh: {
     'menu.gear': '设置',
@@ -11,10 +11,19 @@ export const settingsMenu = {
     'menu.font': '字体',
     'menu.font.system': '系统默认',
     'menu.fontSize': '字号',
-    'menu.pages': '页面',
+    'menu.page.prefs': '基本配置',
+    'menu.page.hosts': '主机管理',
     'menu.page.settings': 'LLM 设置',
     'menu.page.policy': '安全策略',
-    'menu.page.audit': '审计日志'
+    'menu.page.audit': '审计日志',
+    'prefs.title': '基本配置',
+    'prefs.headHint': '外观、语言与终端显示偏好，立即生效。',
+    'prefs.theme.hint': '界面配色，切换后立刻应用',
+    'prefs.lang.hint': '界面文案语言',
+    'prefs.font.hint': '终端等宽字体',
+    'prefs.fontSize.hint': '终端字号，步进 0.5',
+    'prefs.fontSize.dec': '减小字号',
+    'prefs.fontSize.inc': '增大字号'
   },
   en: {
     'menu.gear': 'Settings',
@@ -27,9 +36,18 @@ export const settingsMenu = {
     'menu.font': 'Font',
     'menu.font.system': 'System default',
     'menu.fontSize': 'Font size',
-    'menu.pages': 'Pages',
+    'menu.page.prefs': 'Preferences',
+    'menu.page.hosts': 'Hosts',
     'menu.page.settings': 'LLM Settings',
     'menu.page.policy': 'Security Policy',
-    'menu.page.audit': 'Audit Log'
+    'menu.page.audit': 'Audit Log',
+    'prefs.title': 'Preferences',
+    'prefs.headHint': 'Appearance, language, and terminal display. Changes apply immediately.',
+    'prefs.theme.hint': 'App colors, applied instantly',
+    'prefs.lang.hint': 'UI language',
+    'prefs.font.hint': 'Terminal monospace font',
+    'prefs.fontSize.hint': 'Terminal size, steps of 0.5',
+    'prefs.fontSize.dec': 'Decrease font size',
+    'prefs.fontSize.inc': 'Increase font size'
   }
 }

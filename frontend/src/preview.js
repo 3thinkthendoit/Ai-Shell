@@ -86,12 +86,15 @@ async function CompactSession() {
   await new Promise(r => setTimeout(r, 400))
   return { compacted: false, busy: false, message: '这条会话还没有记录。' }
 }
+async function GetSessionTimeline() {
+  return []
+}
 
 window.go = {
   main: {
     App: {
       TestLLM, ClearSession, CompactSession,
-      ListSessions, CreateSession, RenameSession, DeleteSession,
+      ListSessions, CreateSession, RenameSession, DeleteSession, GetSessionTimeline,
       SaveLLM: async () => {},
       Bootstrap: async () => ({ llm: store.llm }),
       // 常驻终端绑定：预览里不开真 PTY，表面保持静态即可。

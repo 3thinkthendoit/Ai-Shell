@@ -975,9 +975,10 @@ func RunCommand(cmd string, ch ssh.Channel, srv *Server) int {
 	case c == "pwd" || strings.HasPrefix(c, "pwd "):
 		fmt.Fprintln(ch, "/home/test")
 
-	case strings.HasPrefix(c, "mkdir ") || c == "mkdir" ||
-		strings.HasPrefix(c, "touch ") || c == "touch":
-		// 高危变更类：假远端一律成功，真测的是策略裁决而不是文件系统。
+	case (strings.HasPrefix(c, "mkdir ") || c == "mkdir" ||
+		strings.HasPrefix(c, "touch ") || c == "touch") &&
+		!strings.Contains(c, "&&") && !strings.Contains(c, ";"):
+		// high-risk mkdir/touch stub; skip multi-statement scripts
 		return 0
 
 	// rm 必须**真的删**：文件管理弹窗的删除要能端到端验证
@@ -1004,6 +1005,37 @@ func RunCommand(cmd string, ch ssh.Channel, srv *Server) int {
 			return runBinaryWriteScript(c, ch, fs, failBackup)
 		}
 		return runWriteScript(c, ch, fs, failBackup)
+
+
+	// ops diagnostics/snapshot/verify/restore — before system_info (== os ==)
+	case strings.Contains(c, "== meta =="):
+		return runCollectDiagnostics(c, ch)
+
+	case strings.Contains(c, "diff -u") && strings.Contains(c, "aishell-snapshots"):
+		return runDiffScript(c, ch, fs)
+
+	case strings.Contains(c, "aishell-snapshots") && strings.Contains(c, "AISHELL_SNAPSHOT"):
+		return runSnapshotScript(c, ch, fs)
+
+	case strings.Contains(c, "VERIFY_RESULT="):
+		return runVerifyScript(c, ch)
+
+	case strings.Contains(c, ".bak.") && strings.Contains(c, "ls -lt"):
+		return runListBackups(c, ch, fs)
+
+	case strings.Contains(c, "pre-restore") || strings.Contains(c, "restored_from="):
+		return runRestoreBackup(c, ch, fs)
+
+	case strings.Contains(c, "journalctl"):
+		fmt.Fprint(ch, "-- Journal begins --\nOct 15 10:00:01 testhost nginx[1]: fake journal error line\n")
+		return 0
+
+	case strings.Contains(c, "systemctl "):
+		return runSystemctl(c, ch)
+
+	case strings.Contains(c, "ss -tulpn") || strings.Contains(c, "netstat -tulpn"):
+		fmt.Fprint(ch, "== listening ==\nLISTEN 0 128 0.0.0.0:22 0.0.0.0:*\nLISTEN 0 128 0.0.0.0:80 0.0.0.0:*\n")
+		return 0
 
 	case strings.Contains(c, "uname -a") || strings.Contains(c, "== os =="):
 		fmt.Fprint(ch, "== os ==\nNAME=\"Test Linux\"\nVERSION=\"1.0\"\n"+
