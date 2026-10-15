@@ -7,9 +7,13 @@ LLM-powered remote Linux operations console. Manage SSH hosts from a desktop app
 Built with [Wails v2](https://wails.io/) (Go + Vue 3).
 
 
-<img width="1370" height="890" alt="1" src="https://github.com/user-attachments/assets/94ef192e-9f1f-431e-ab4c-50a79d02532a" />
+<img width="1367" height="893" alt="1" src="https://github.com/user-attachments/assets/8c73182d-f07b-4449-9e4c-7eebf3a45369" />
 
-<img width="1366" height="891" alt="2" src="https://github.com/user-attachments/assets/be961635-5ce2-4aab-824c-440d2b2c5555" />
+<img width="1364" height="891" alt="2" src="https://github.com/user-attachments/assets/bd8951b2-9917-4e2e-947b-323b060bf99d" />
+
+
+
+
 
 
 ## Features
