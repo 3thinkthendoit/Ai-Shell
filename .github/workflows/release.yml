@@ -1,0 +1,195 @@
+# Build Windows + macOS binaries with Wails and publish to GitHub Releases.
+#
+# Trigger:
+#   - Push a version tag:  git tag v0.1.0 && git push origin v0.1.0
+#   - Or run manually (Actions → Release → Run workflow) with an optional tag
+#
+# Assets (example for v0.1.0):
+#   Ai-Shell-windows-amd64.zip
+#   Ai-Shell-darwin-universal.zip
+#   SHA256SUMS.txt
+#
+# https://github.com/3thinkthendoit/Ai-Shell/releases
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and attach (e.g. v0.1.0). Leave empty to only upload workflow artifacts.'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}-${{ inputs.tag || 'none' }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.26.x'
+  NODE_VERSION: '20'
+  # Keep in sync with go.mod wails/v2 version.
+  WAILS_VERSION: 'v2.16.0'
+  NODE_OPTIONS: '--max-old-space-size=4096'
+  APP_NAME: 'Ai-Shell'
+
+jobs:
+  build:
+    name: Build (${{ matrix.artifact }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows/amd64
+            artifact: Ai-Shell-windows-amd64
+          - os: macos-latest
+            platform: darwin/universal
+            artifact: Ai-Shell-darwin-universal
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag != '' && inputs.tag || github.ref }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_VERSION }}
+
+      - name: Add Go bin to PATH
+        shell: bash
+        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Build Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          wails doctor || true
+          # Match scripts/build.ps1: embed WebView2 bootstrapper for machines without it.
+          wails build -clean -trimpath -webview2 embed -platform "${{ matrix.platform }}"
+
+      - name: Build macOS
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          wails doctor || true
+          # Match scripts/build.sh mac target (universal binary).
+          wails build -clean -trimpath -platform "${{ matrix.platform }}"
+
+      - name: Package Windows zip
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $exe = "build\bin\${{ env.APP_NAME }}.exe"
+          if (-not (Test-Path $exe)) { throw "missing $exe" }
+          Compress-Archive -Path $exe -DestinationPath "dist\${{ matrix.artifact }}.zip" -Force
+
+      - name: Package macOS zip
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          APP="build/bin/${APP_NAME}.app"
+          test -d "$APP"
+          # ditto preserves .app bundle metadata better than zip alone.
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "dist/${{ matrix.artifact }}.zip"
+
+      - name: SHA256 checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum *.zip | tee SHA256SUMS.txt
+          else
+            shasum -a 256 *.zip | tee SHA256SUMS.txt
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    # Tag push always publishes; manual run publishes only when a tag is provided.
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect release files
+        id: pack
+        run: |
+          set -euo pipefail
+          mkdir -p release-files
+          # Flatten per-platform zips
+          find artifacts -type f -name '*.zip' -print -exec cp -f {} release-files/ \;
+          # Merge checksum files (one line per zip)
+          : > release-files/SHA256SUMS.txt
+          find artifacts -type f -name 'SHA256SUMS.txt' -exec cat {} \; >> release-files/SHA256SUMS.txt
+          sort -u -o release-files/SHA256SUMS.txt release-files/SHA256SUMS.txt
+          echo "---- release files ----"
+          ls -la release-files/
+          cat release-files/SHA256SUMS.txt
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Create / update Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.pack.outputs.tag }}
+          name: Ai-Shell ${{ steps.pack.outputs.tag }}
+          draft: false
+          prerelease: ${{ contains(steps.pack.outputs.tag, '-') }}
+          generate_release_notes: true
+          files: |
+            release-files/*.zip
+            release-files/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

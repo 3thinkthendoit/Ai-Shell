@@ -76,6 +76,17 @@ wails dev
 wails build
 ```
 
+### 预编译包
+
+推送 `v*` 标签后，GitHub Actions 会打包 Windows / macOS 并发布到 [Releases](https://github.com/3thinkthendoit/Ai-Shell/releases)（见 `.github/workflows/release.yml`）：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+产物：`Ai-Shell-windows-amd64.zip`、`Ai-Shell-darwin-universal.zip`，以及 `SHA256SUMS.txt`。
+
 ### Windows 一键打包
 
 命令行跑直接可用的脚本（不受 PowerShell Execution Policy 限制）：

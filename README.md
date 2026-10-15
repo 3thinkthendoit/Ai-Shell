@@ -82,6 +82,17 @@ wails dev
 wails build
 ```
 
+### Prebuilt binaries
+
+Windows and macOS builds are published on [GitHub Releases](https://github.com/3thinkthendoit/Ai-Shell/releases) when a `v*` tag is pushed (see `.github/workflows/release.yml`):
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Assets: `Ai-Shell-windows-amd64.zip`, `Ai-Shell-darwin-universal.zip`, plus `SHA256SUMS.txt`.
+
 ### One-command build on Windows
 
 A cmd batch script that runs without any PowerShell Execution Policy hassle:
