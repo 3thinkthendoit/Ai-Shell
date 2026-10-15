@@ -15,6 +15,7 @@ import { nextTick } from 'vue'
 import ConsolePanel from '../components/ConsolePanel.vue'
 import {
   store,
+  push,
   bindEvents,
   bucketKey,
   bytesToBase64,
@@ -132,6 +133,8 @@ function resetStore() {
   store.activeSessionId = ''
   store.pending = null
   store.running = false
+  store.llmProfiles = [{ id: 'p1', name: 'default', model: 'm', active: true }]
+  store.selectedProfileId = 'p1'
 }
 
 let calls
@@ -215,8 +218,17 @@ function withWriteClipboard() {
 
 // selectHost 通过 UiSelect（自绘下拉）切换目标主机。
 // 原生 select 已被替换：触发器是按钮，选项是列表项，不能用 setValue。
+// 空对话时顶栏隐藏，切换主机/视图前先确保顶栏在。
+async function ensureTopBar() {
+  if (!wrapper.find('.bar').exists()) {
+    push({ kind: 'system', content: '·' })
+    await nextTick()
+  }
+}
+
 async function selectHost(id) {
   const h = store.hosts.find(x => x.id === id)
+  await ensureTopBar()
   await wrapper.find('.host-select .uis-trigger').trigger('click')
   await flushPromises()
   const item = wrapper
@@ -227,15 +239,15 @@ async function selectHost(id) {
   await nextTick()
 }
 
-// toArchive / toSurface 切换主区：只读时间线 vs 活表面。
-// 表面用 v-show 常驻，切换不会销毁实例（滚动回放不丢）。
 async function toArchive() {
-  await wrapper.findAll('.seg button')[1].trigger('click')
+  await ensureTopBar()
+  await wrapper.findAll('.seg button')[0].trigger('click')
   await flushPromises()
   await nextTick()
 }
 async function toSurface() {
-  await wrapper.findAll('.seg button')[0].trigger('click')
+  await ensureTopBar()
+  await wrapper.findAll('.seg button')[1].trigger('click')
   await flushPromises()
   await nextTick()
 }
@@ -290,7 +302,7 @@ describe('常驻终端表面 建立会话', () => {
     expect(open[0].args).toEqual(['h1', 'default', 100, 30])
   })
 
-  it('切到对话归档再切回：复用同一实例，也不重复开远端会话', async () => {
+  it('切到对话再切回终端：复用同一实例，也不重复开远端会话', async () => {
     withHost()
     setup()
     await attached()
@@ -330,25 +342,15 @@ describe('常驻终端表面 建立会话', () => {
     expect(callsOf('OpenTerminal').map(c => c.args[0])).toEqual(['h1', 'h2', 'h1'])
   })
 
-  it('没选主机时不去开终端，显示功能介绍欢迎页', async () => {
+  it('没选主机时不去开终端，默认显示对话首页（无对话则无顶栏）', async () => {
     setup()
     await attached()
 
     expect(callsOf('OpenTerminal')).toHaveLength(0)
     expect(instances).toHaveLength(0)
-    // 空态已升级为欢迎页。测试环境没有主机 → 「新建任务」禁用并提示去加主机。
-    expect(wrapper.text()).toContain('欢迎使用 Ai-Shell')
-    // 模型已配置（llmReady=true），缺的是主机 → title 指向「主机管理」。
-    store.llmProfiles = [{ id: 'p1', name: 'deepseek', active: true }]
-    await nextTick()
-    // 三个快捷入口按钮在位（模型 → 主机 → 新建任务）。
-    const acts = wrapper.findAll('.welcome-btn')
-    expect(acts.map(b => b.text())).toEqual(['LLM 设置', '主机管理', '＋ 新建任务'])
-    expect(acts[2].attributes('disabled')).toBeDefined()
-    expect(acts[2].attributes('title')).toContain('主机')
-    // 风险说明的钉子（从原横幅用例迁来）：三条路径与硬拒绝边界必须在欢迎页写明。
-    expect(wrapper.text()).toContain('自然语言交给 LLM')
-    expect(wrapper.text()).toContain('硬拒绝')
+    expect(wrapper.find('.chat').exists()).toBe(true)
+    expect(wrapper.find('.composer-input').exists()).toBe(true)
+    expect(wrapper.find('.bar').exists()).toBe(false)
   })
 })
 
@@ -645,6 +647,7 @@ describe('常驻终端表面 退出与关闭', () => {
     withHost()
     setup()
     await attached()
+    await toSurface()
 
     await wrapper.find('.sess-banner button').trigger('click')
     await flushPromises()
@@ -657,6 +660,7 @@ describe('常驻终端表面 退出与关闭', () => {
     withHost()
     setup()
     await attached()
+    await toSurface()
 
     await wrapper.find('.sess-banner button').trigger('click')
     await flushPromises()
@@ -686,6 +690,7 @@ describe('常驻终端表面 风险提示', () => {
     withHost()
     setup()
     await attached()
+    await toSurface()
 
     const banner = wrapper.find('.sess-banner')
     expect(banner.exists()).toBe(true)
@@ -694,6 +699,14 @@ describe('常驻终端表面 风险提示', () => {
     expect(banner.text()).not.toContain('硬拒绝')
     // 已连上主机的界面不应出现欢迎页。
     expect(wrapper.find('.welcome').exists()).toBe(false)
+  })
+
+  it('对话页选主机后台开 PTY 时不插入关闭横幅（避免首页抖动）', async () => {
+    withHost()
+    setup()
+    await attached()
+    expect(wrapper.find('.sess-banner').exists()).toBe(false)
+    expect(wrapper.find('.chat').exists()).toBe(true)
   })
 })
 
@@ -1522,6 +1535,7 @@ describe('命令运行中 输入归命令', () => {
     withHost()
     setup()
     await attached()
+    await toSurface()
     rt.emit('term:cmd', { hostId: 'h1', active: true })
     await flushPromises()
     expect(store.terms[bucketKey('h1', 'default')].cmdActive).toBe(true)

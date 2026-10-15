@@ -12,6 +12,7 @@ import { reactive } from 'vue'
 import { app } from './locales/app'
 import { settingsMenu } from './locales/settingsMenu'
 import { console as consoleDomain } from './locales/console'
+import { chat as chatDomain } from './locales/chat'
 import { timeline } from './locales/timeline'
 import { storeMsg } from './locales/storeMsg'
 import { panels } from './locales/panels'
@@ -24,11 +25,11 @@ const LOCALE_KEY = 'aishell.locale'
 // 抽离任务）并行各管各的域，不需要碰同一个文件。
 const dicts = {
   zh: {
-    ...app.zh, ...settingsMenu.zh, ...consoleDomain.zh, ...timeline.zh,
+    ...app.zh, ...settingsMenu.zh, ...consoleDomain.zh, ...chatDomain.zh, ...timeline.zh,
     ...storeMsg.zh, ...panels.zh, ...files.zh, ...sessions.zh
   },
   en: {
-    ...app.en, ...settingsMenu.en, ...consoleDomain.en, ...timeline.en,
+    ...app.en, ...settingsMenu.en, ...consoleDomain.en, ...chatDomain.en, ...timeline.en,
     ...storeMsg.en, ...panels.en, ...files.en, ...sessions.en
   }
 }

@@ -70,6 +70,8 @@ function resetStore() {
   store.pending = null
   store.running = false
   store.busy = false
+  store.llmProfiles = [{ id: 'p1', name: 'default', model: 'm', active: true }]
+  store.selectedProfileId = 'p1'
 }
 
 let calls

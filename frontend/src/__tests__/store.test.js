@@ -97,6 +97,8 @@ function resetStore() {
   store.posture = { keyProtection: '', configDir: '', hostCount: 0, degraded: false }
   store.hosts = []
   store.llm = { baseUrl: '', model: '', hasApiKey: false }
+  store.llmProfiles = [{ id: 'p1', name: 'default', model: 'm', active: true }]
+  store.selectedProfileId = 'p1'
   store.policy = { mode: 'manual', whitelist: [], redactOutput: true, maxOutput: 32768, maxSteps: 12 }
   store.currentHostId = ''
   // bySession 是会话记录的真实存储（entries 只是当前会话的派生视图），
@@ -525,6 +527,18 @@ describe('ask 发送一轮对话', () => {
     await ask('看看磁盘')
     expect(calls.filter(c => c.name === 'Ask')).toHaveLength(0)
     expect(store.entries.at(-1)).toMatchObject({ kind: 'error' })
+  })
+
+  it('没选模型时直接提示，不打后端', async () => {
+    const { app, calls } = makeApp()
+    install({ runtime: rt, app })
+    store.currentHostId = 'h1'
+    store.llmProfiles = []
+    store.selectedProfileId = ''
+    await ask('看看磁盘')
+    expect(calls.filter(c => c.name === 'Ask')).toHaveLength(0)
+    expect(store.entries.at(-1)).toMatchObject({ kind: 'error' })
+    expect(store.entries.at(-1).content).toMatch(/模型|LLM|profile/i)
   })
 
   it('正常发送：置运行态、带上主机 id、会话 id 与原文', async () => {

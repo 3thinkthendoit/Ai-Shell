@@ -12,8 +12,9 @@ import (
 
 // ---- 会话的增删改查 ----
 //
-// 每台主机天生有一条默认会话（DefaultSessionID），它**不能被删除**。
-// 这是本文件要守住的核心不变式：任何时刻，每台主机都至少有一条会话可用。
+// 每台主机天生有一条默认会话（DefaultSessionID），**身份不能从列表拿掉**
+// （它是空会话 ID 的落点）。用户侧栏里点「删除」默认任务时，语义是
+// **清空内容**：turns 归零后侧栏不再展示「未命名任务」，但槽位仍在。
 //
 // 有了它，Run / ClearSession / CompactSession 都能接受一个空会话 ID
 // 而不会落进「这台机器一条会话都没有」这个需要到处特判的状态 ——
@@ -159,15 +160,32 @@ func (a *Agent) RenameSession(hostID, sessionID, name string) error {
 
 // DeleteSession 删掉一条会话。
 //
-// 默认会话不能删：它是「不带会话 ID 地跑一轮」的落点（见 DefaultSessionID）。
-// 想让它空掉用 ClearSession —— 那才是用户真正想要的效果。
+// 默认会话：不能从映射里抹掉（见文件头不变式），改为清空内容与名字。
+// 侧栏只展示 turns>0 的默认任务，清空后「未命名任务」自然消失 ——
+// 这就是用户点「删除」时期待的效果。
 func (a *Agent) DeleteSession(hostID, sessionID string) error {
 	sessionID = normalizeSessionID(sessionID)
-	if sessionID == DefaultSessionID {
-		return fmt.Errorf("默认会话不能删除，用「清空上下文」把它清空即可")
-	}
 
 	a.mu.Lock()
+	if a.running {
+		a.mu.Unlock()
+		return fmt.Errorf("有会话正在运行，无法删除。等这一轮结束或点「中断」后再试")
+	}
+
+	if sessionID == DefaultSessionID {
+		s := a.sessionOf(hostID, sessionID)
+		if s != nil {
+			*s = session{updatedAt: time.Now()}
+			delete(a.snaps, snapKey(hostID, sessionID))
+			snap := a.snapshotLocked()
+			a.mu.Unlock()
+			a.persist(snap)
+			return nil
+		}
+		a.mu.Unlock()
+		return nil
+	}
+
 	m := a.sessions[hostID]
 	if m == nil {
 		a.mu.Unlock()

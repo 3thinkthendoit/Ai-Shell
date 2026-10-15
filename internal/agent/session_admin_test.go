@@ -50,7 +50,7 @@ func TestListSessionsAlwaysIncludesDefault(t *testing.T) {
 		t.Errorf("那条应是默认会话，实得 %q", got[0].ID)
 	}
 	if !got[0].IsDefault {
-		t.Error("IsDefault 应为 true，界面靠它决定「不能删」")
+		t.Error("IsDefault 应为 true，界面靠它区分默认任务（可删=清空）")
 	}
 	if got[0].Turns != 0 {
 		t.Errorf("还没聊过，轮数应为 0，实得 %d", got[0].Turns)
@@ -220,33 +220,35 @@ func TestCreateSessionEnforcesPerHostLimit(t *testing.T) {
 	}
 }
 
-// 默认会话删不掉 —— 它是「不带会话 ID 跑一轮」的落点。
-//
-// 而且要确认它**没被误删**：只断言「返回了错误」是不够的，
-// 万一实现是先删再报错，用户的历史就没了。
-func TestDeleteSessionRefusesDefault(t *testing.T) {
+// 删除默认会话 = 清空内容，槽位仍在（侧栏 turns>0 才展示「未命名任务」）。
+func TestDeleteSessionResetsDefault(t *testing.T) {
 	a := New(nil, nil, noEmit)
 	rememberDefault(a, "h1", simpleTurn("重要的问", "重要的答"), defaultLimits())
 
-	if err := a.DeleteSession("h1", DefaultSessionID); err == nil {
-		t.Fatal("默认会话不该被删掉")
+	if err := a.DeleteSession("h1", DefaultSessionID); err != nil {
+		t.Fatalf("删除默认任务应清空内容，不应报错：%v", err)
 	}
-	if hist := histDefault(a, "h1"); len(hist) != 2 {
-		t.Fatalf("报错时不该真的删掉内容，实得 %d 条", len(hist))
+	if hist := histDefault(a, "h1"); len(hist) != 0 {
+		t.Fatalf("内容应被清空，实得 %d 条", len(hist))
 	}
-	if len(a.ListSessions("h1")) != 1 {
-		t.Error("列表里仍应只有那条默认会话")
+	list := a.ListSessions("h1")
+	if len(list) != 1 || !list[0].IsDefault {
+		t.Fatalf("默认槽位仍应在，实得 %+v", list)
+	}
+	if list[0].Turns != 0 {
+		t.Errorf("turns 应归零，实得 %d", list[0].Turns)
 	}
 }
 
 // 传空会话 ID 与传默认会话 ID 是一回事。
-//
-// 前端不必知道默认会话的 ID 叫什么，也就不会出现
-// 「前端写死了一个 ID、后端改了常量」这种静默错位。
 func TestDeleteSessionEmptyIDMeansDefault(t *testing.T) {
 	a := New(nil, nil, noEmit)
-	if err := a.DeleteSession("h1", ""); err == nil {
-		t.Fatal("空 ID 应被当成默认会话，因而同样删不掉")
+	rememberDefault(a, "h1", simpleTurn("问", "答"), defaultLimits())
+	if err := a.DeleteSession("h1", ""); err != nil {
+		t.Fatalf("空 ID 应当成默认会话并清空：%v", err)
+	}
+	if hist := histDefault(a, "h1"); len(hist) != 0 {
+		t.Fatalf("应已清空，实得 %d 条", len(hist))
 	}
 }
 

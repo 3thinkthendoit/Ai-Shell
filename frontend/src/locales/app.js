@@ -2,7 +2,7 @@
 export const app = {
   zh: {
     'app.brand.sub': 'Linux 智能运维台',
-    'app.nav.console': '控制台',
+    'app.nav.console': '新建任务',
     'app.nav.hosts': '主机管理',
     'app.fatal': '初始化失败',
     'app.auditWarn.title': '审计日志异常',
@@ -12,7 +12,7 @@ export const app = {
   },
   en: {
     'app.brand.sub': 'Linux AI Ops Console',
-    'app.nav.console': 'Console',
+    'app.nav.console': 'New task',
     'app.nav.hosts': 'Hosts',
     'app.fatal': 'Initialization failed',
     'app.auditWarn.title': 'Audit log error',

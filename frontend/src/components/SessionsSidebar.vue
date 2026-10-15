@@ -10,7 +10,13 @@ import { t } from '../i18n'
 // 会话属于当前选中的主机 —— 切了主机，这里的列表会跟着换。
 const emit = defineEmits(['open'])
 
-const sessions = computed(() => store.currentSessions || [])
+// 侧栏：隐藏从未聊过的默认会话；有 turns 的默认会话仍展示（否则首页对话会「失踪」）。
+// 具名任务一律展示。
+function visibleTasks(list) {
+  return (list || []).filter(s => !s.isDefault || s.turns > 0)
+}
+
+const sessions = computed(() => visibleTasks(store.currentSessions))
 
 // ---- 按主机分组的任务视图（未选主机时的欢迎态） ----
 //
@@ -20,14 +26,13 @@ const sessions = computed(() => store.currentSessions || [])
 const groups = computed(() =>
   store.hosts.map(h => ({
     host: h,
-    list: store.sessions[h.id] || []
+    list: visibleTasks(store.sessions[h.id])
   }))
 )
 
-// 分组里的任务名用短名：组头已经标明主机，默认任务不必再拼一遍
-// 「主机名 (user@addr)」，否则窄侧栏里全是重复信息。
+// 分组里的任务名用短名：组头已经标明主机；有内容的默认会话用「未命名任务」。
 function shortLabel(s) {
-  const base = s.name || (s.isDefault ? t('ss.defaultTask') : t('console.unnamed'))
+  const base = s.name || (s.isDefault ? t('ss.unnamedTask') : t('console.unnamed'))
   return s.turns > 0 ? base + t('ss.turns', { n: s.turns }) : base
 }
 
@@ -51,20 +56,8 @@ watch(
   { immediate: true }
 )
 
-// 默认任务没有自己的名字：用「主机名 (user@addr)」顶替，
-// 不同节点的默认任务在列表里一眼可分（否则每台机器都叫「默认任务」）。
-const hostOf = hostId => store.hosts.find(h => h.id === hostId)
-
 function label(s) {
-  let base
-  if (s.name) {
-    base = s.name
-  } else if (s.isDefault) {
-    const h = hostOf(store.currentHostId)
-    base = h ? `${h.name} (${h.user}@${h.addr})` : t('ss.defaultTask')
-  } else {
-    base = t('console.unnamed')
-  }
+  const base = s.name || (s.isDefault ? t('ss.unnamedTask') : t('console.unnamed'))
   return s.turns > 0 ? base + t('ss.turns', { n: s.turns }) : base
 }
 
@@ -196,9 +189,8 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocMousedown))
       >
         <span class="ssb-name" :title="label(s)">{{ label(s) }}</span>
         <span class="ssb-time" :title="s.updatedAt">{{ timeAgo(s.updatedAt) }}</span>
-        <!-- 默认任务没有可用操作（不可删、不可改名），「⋯」干脆不给 -->
+        <!-- 默认任务可删（后端清空内容）；改名仍只给具名任务 -->
         <button
-          v-if="!s.isDefault"
           class="ssb-more"
           :aria-expanded="menuFor === s.id"
           :title="t('ss.more')"
@@ -206,7 +198,7 @@ onBeforeUnmount(() => document.removeEventListener('mousedown', onDocMousedown))
         >⋯</button>
 
         <div v-if="menuFor === s.id" class="ssb-menu" @click.stop>
-          <button @click="startRename(s)">{{ t('ss.rename') }}</button>
+          <button v-if="!s.isDefault" @click="startRename(s)">{{ t('ss.rename') }}</button>
           <button
             class="ssb-menu-danger"
             @click="askDelete(s)"

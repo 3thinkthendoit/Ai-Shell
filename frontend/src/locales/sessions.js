@@ -3,6 +3,7 @@
 export const sessions = {
   zh: {
     'ss.defaultTask': '默认任务',
+    'ss.unnamedTask': '未命名任务',
     'ss.turns': '（{n} 轮）',
     'ss.head': '任务 ({n})',
     'ss.time.justNow': '刚刚',
@@ -27,6 +28,7 @@ export const sessions = {
   },
   en: {
     'ss.defaultTask': 'Default task',
+    'ss.unnamedTask': 'Untitled task',
     'ss.turns': ' ({n} turns)',
     'ss.head': 'Tasks ({n})',
     'ss.time.justNow': 'just now',

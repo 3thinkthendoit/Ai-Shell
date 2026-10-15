@@ -95,13 +95,29 @@ describe('SessionsSidebar 会话列表', () => {
     return item
   }
 
-  it('把该主机的任务列出来，默认任务用主机名顶替并排第一', () => {
+  it('隐藏零轮默认任务；具名任务照常列出', () => {
     mountWithHost()
     const list = items()
-    expect(list).toHaveLength(3)
-    // 默认任务没有自己的名字，显示「主机名 (user@addr)」以区分不同节点。
-    expect(list[0].text()).toContain('web (root@10.0.0.1)')
-    expect(list[1].text()).toContain('nginx 排查')
+    // copy()[0] 是 turns:0 的默认会话，应被隐藏
+    expect(list).toHaveLength(2)
+    expect(list[0].text()).toContain('nginx 排查')
+    expect(list[1].text()).toContain('磁盘排查')
+    expect(wrapper.text()).not.toContain('默认任务')
+  })
+
+  it('有轮次的默认会话仍展示为「未命名任务」', async () => {
+    mountWithHost()
+    store.sessions = {
+      h1: [
+        { id: 'default', name: '', turns: 3, archivedTurns: 0, isDefault: true },
+        { id: 's1', name: 'nginx 排查', turns: 4, archivedTurns: 0, isDefault: false }
+      ]
+    }
+    await nextTick()
+    const list = items()
+    expect(list).toHaveLength(2)
+    expect(list[0].text()).toContain('未命名任务')
+    expect(list[0].text()).toContain('3 轮')
   })
 
   // 轮数必须显示出来：用户需要一眼看出哪条会话有上下文 ——
@@ -109,13 +125,13 @@ describe('SessionsSidebar 会话列表', () => {
   it('条目里带上轮数，让用户看出哪条有上下文', () => {
     mountWithHost()
     const list = items()
-    expect(list[1].text()).toContain('4 轮')
-    expect(list[2].text(), '0 轮的会话不必显示轮数，免得噪声').not.toContain('轮')
+    expect(list[0].text()).toContain('4 轮')
+    expect(list[1].text(), '0 轮的会话不必显示轮数，免得噪声').not.toContain('轮')
   })
 
   it('点击条目切换当前会话', async () => {
     mountWithHost()
-    await items()[2].trigger('click')
+    await items()[1].trigger('click')
     expect(store.currentSessionId).toBe('s2')
   })
 
@@ -205,13 +221,55 @@ describe('SessionsSidebar 会话列表', () => {
     expect(calls.filter(x => x.name === 'DeleteSession')).toHaveLength(0)
   })
 
-  // 默认任务删不掉、也不允许重命名 —— 它的名字就是节点标识
-  //（主机名 (user@addr)），所以连「…」按钮都不给，列表更干净。
-  it('默认任务不显示「…」按钮，具名任务显示', () => {
+  it('具名任务与有轮次的默认任务都显示「…」', async () => {
     mountWithHost()
+    store.sessions = {
+      h1: [
+        { id: 'default', name: '', turns: 3, archivedTurns: 0, isDefault: true },
+        { id: 's1', name: 'nginx 排查', turns: 4, archivedTurns: 0, isDefault: false }
+      ]
+    }
+    await nextTick()
     const list = items()
-    expect(list[0].find('.ssb-more').exists()).toBe(false)
+    expect(list[0].find('.ssb-more').exists()).toBe(true)
     expect(list[1].find('.ssb-more').exists()).toBe(true)
+  })
+
+  it('默认任务菜单只有删除、没有重命名', async () => {
+    mountWithHost()
+    store.sessions = {
+      h1: [
+        { id: 'default', name: '', turns: 4, archivedTurns: 0, isDefault: true }
+      ]
+    }
+    await nextTick()
+    const item = await openMenu('未命名任务')
+    const labels = item.findAll('.ssb-menu button').map(b => b.text())
+    expect(labels).toEqual(['删除'])
+  })
+
+  it('删除默认任务会调 DeleteSession 并清本地时间线', async () => {
+    mountWithHost({
+      ListSessions: async () => [
+        { id: 'default', name: '', turns: 0, archivedTurns: 0, isDefault: true }
+      ]
+    })
+    store.sessions = {
+      h1: [{ id: 'default', name: '', turns: 4, archivedTurns: 0, isDefault: true }]
+    }
+    store.bySession = { ['h1\u0000default']: [{ id: 1, kind: 'user', content: 'hi' }] }
+    store.currentSessionId = 'default'
+    await nextTick()
+    const item = await openMenu('未命名任务')
+    await item.find('.ssb-menu-danger').trigger('click')
+    await nextTick()
+    await wrapper.findAll('.modal button').find(b => b.text() === '确认删除').trigger('click')
+    await flushPromises()
+    const c = calls.filter(x => x.name === 'DeleteSession')
+    expect(c).toHaveLength(1)
+    expect(c[0].args).toEqual(['h1', 'default'])
+    const timeline = store.bySession['h1\u0000default'] || []
+    expect(timeline.filter(e => e.kind === 'user')).toHaveLength(0)
   })
 
   // 新建入口在控制台顶栏（ConsolePanel.test.js 覆盖），
@@ -244,20 +302,20 @@ describe('SessionsSidebar 会话列表', () => {
       return mountSidebar({})
     }
 
-    it('按主机分组列出全部任务，组头带地址与数量', () => {
+    it('按主机分组隐藏零轮默认任务，组头数量不含它们', () => {
       mountGroups()
       const heads = wrapper.findAll('.ssb-group-head')
       expect(heads).toHaveLength(2)
       expect(heads[0].text()).toContain('web')
       expect(heads[0].text()).toContain('root@10.0.0.1')
-      expect(heads[0].text()).toContain('3')
+      expect(heads[0].text()).toContain('2')
       expect(heads[1].text()).toContain('db')
       expect(heads[1].text()).toContain('1')
-      // 组内任务用短名：默认任务不再拼「主机名 (user@addr)」（组头已有）。
       const nested = wrapper.findAll('.ssb-item-nested')
-      expect(nested).toHaveLength(4)
-      expect(nested[0].text()).toContain('默认任务')
-      expect(nested[3].text()).toContain('备份迁移')
+      expect(nested).toHaveLength(3)
+      expect(wrapper.text()).not.toContain('默认任务')
+      expect(nested[0].text()).toContain('nginx 排查')
+      expect(nested[2].text()).toContain('备份迁移')
     })
 
     it('点组头进入该主机', async () => {
@@ -269,7 +327,7 @@ describe('SessionsSidebar 会话列表', () => {
 
     it('点组内任务直达那条会话：先记意图再切主机', async () => {
       mountGroups()
-      const target = wrapper.findAll('.ssb-item-nested')[3]
+      const target = wrapper.findAll('.ssb-item-nested')[2]
       await target.trigger('click')
       expect(store.currentHostId).toBe('h2')
       expect(store.pendingSessionId).toBe('g9')

@@ -1,13 +1,13 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   store, approve, stop, clearLog, clearSession, compactSession, push,
   createSession, refreshSessions, switchProfile, syncWindowTitle,
   closeTerminal, reportActiveSession,
   openFileManager, closeFileManager,
-  bucketKey
+  bucketKey, noteConversationActivity, onFocusSessionChanged, shouldShowSessionChrome
 } from '../store'
-import { providerBadge, providerTermBadge } from '../providerLogos'
+import { providerBadge } from '../providerLogos'
 
 // 未选主机的欢迎页按钮会向上切页签（App.vue 接住后改 tab），script 里也要
 // 主动调（新建任务引导去主机管理），所以提成常量而不是模板里用 $emit。
@@ -20,6 +20,7 @@ import { onTermData, paintInputPromptIfNeeded } from '../terminal/termInput'
 import { t } from '../i18n'
 import UiSelect from './UiSelect.vue'
 import FileManagerModal from './FileManagerModal.vue'
+import ChatPanel from './ChatPanel.vue'
 
 // 控制台 = 一块整幅 xterm，附着当前主机的常驻 shell PTY（阿里云 Workbench 同款）。
 // 人可以直接在表面里敲（原始按键进 PTY，不过策略）；底部 composer 走分流：
@@ -39,40 +40,17 @@ const rootEl = ref(null)          // ResizeObserver 的观察目标（.surface�
 let attachedKey = ''              // 当前附着的那块表面键（切任务时据此关闭旧的）
 let ro = null
 
-// 对话归档：只读时间线开关。false = 活表面，true = 归档视图。
-const showArchive = ref(false)
+// 顶栏视图：false = 终端表面（仍支持 Agent+Shell 分流），true = 对话页（对话框首页）。
+// 默认进对话页：打开软件即见对话框；需要敲命令时切回「终端」。
+const showArchive = ref(true)
 
-// 归档时间线：把连续的「工具调用 / 结果」折成一个可展开的组（`N 次工具调用`），
-// 其余条目原样。这样一段对话不会被一串命令 / 退出码刷屏。
-const timeline = computed(() => {
-  const out = []
-  let group = null
-  for (const e of store.entries) {
-    if (e.kind === 'tool' || e.kind === 'result') {
-      if (!group) {
-        group = { kind: 'toolGroup', id: 'tg-' + e.id, calls: [] }
-        out.push(group)
-      }
-      if (e.kind === 'tool') {
-        group.calls.push({ key: 'c-' + e.id, tool: e, result: null })
-      } else {
-        const hit = group.calls.find(c => c.tool && c.tool.toolId === e.toolId)
-        if (hit) hit.result = e
-        else group.calls.push({ key: 'r-' + e.id, tool: null, result: e })
-      }
-      continue
-    }
-    group = null
-    out.push(e)
-  }
-  return out
-})
-
-// 工具组的展开态（默认收起：只显示一行 `N 次工具调用`）。
-const openGroups = reactive({})
-function toggleGroup(id) { openGroups[id] = !openGroups[id] }
-
-const logEl = ref(null)
+// 空对话框首页藏顶栏；见过对话后清空记录仍保留。终端视图始终保留顶栏。
+// 不能单靠 turns：空首页选主机时旧会话 turns>0 会把顶栏突然顶出来。
+const showTopBar = computed(() =>
+  !showArchive.value || shouldShowSessionChrome()
+)
+watch(() => store.entries.length, noteConversationActivity, { immediate: true })
+watch(() => [store.currentHostId, store.currentSessionId], onFocusSessionChanged)
 
 const currentHost = computed(() => store.hosts.find(h => h.id === store.currentHostId))
 // 当前聚焦任务的表面键：未选主机时无表面。
@@ -209,10 +187,7 @@ function onRetry() {
 // 此刻提示「这里能说人话」正是有效时机（whyHintShown 的「每次回来都提示」
 // 语义就落在这一句上）。
 watch(showArchive, async on => {
-  if (on) {
-    scrollLog()
-    return
-  }
+  if (on) return
   await nextTick()
   doFit(currentKey.value)
   paintWelcomeHintIfNeeded(currentKey.value, true)
@@ -243,17 +218,6 @@ watch(statusLine, async () => {
   await nextTick()
   doFit(currentKey.value)
 })
-
-// ---- 归档视图派生 ----
-
-// 决策徽章复用 timeline 域的 tl.decision.*（终端画面与归档视图同一套语义）。
-const decisionLabel = d => ({ allow: t('tl.decision.allow'), confirm: t('tl.decision.confirm'), deny: t('tl.decision.deny') }[d] || d)
-const decisionClass = d => ({ allow: 'ok', confirm: 'warn', deny: 'danger' }[d] || '')
-const statusLabel = s => ({
-  pending: t('console.toolStatus.pending'), running: t('console.toolStatus.running'),
-  done: t('console.toolStatus.done'), denied: t('console.toolStatus.denied'),
-  error: t('console.toolStatus.error')
-}[s] || s)
 
 const streamingNow = computed(() => store.entries.some(e => e.streaming))
 
@@ -290,20 +254,6 @@ function fmtTokens(n) {
     return (k >= 100 ? Math.round(k) : Math.round(k * 10) / 10) + 'K'
   }
   return String(n)
-}
-
-// archiveBadge 给归档里每条 assistant 消息算一个「模型图标 + 名字」的展示对象。
-//
-// **只认这条消息自己的信息**（e.badge 由 store 在推入时算好、或退一步用 e.model）——
-// 刻意不做「回退到当前选中方案」：归档是历史，历史消息该显示它当时用的模型，
-// 用此刻选中的方案去补历史消息会张冠李戴（也更容易与「这条回复是什么模型给的」
-// 的语义冲突）。拿不到就返回 null，模板退化成角色名。
-function archiveBadge(e) {
-  if (e && e.badge) return e.badge
-  if (e && e.model) {
-    try { return providerTermBadge({ model: e.model, name: e.model }) } catch { return null }
-  }
-  return null
 }
 
 // ---- 审批倒计时 ----
@@ -354,20 +304,6 @@ watch(
   }
 )
 
-function scrollLog() {
-  nextTick(() => {
-    if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight
-  })
-}
-
-const scrollKey = computed(() => {
-  const n = store.entries.length
-  if (!n) return '0'
-  const last = store.entries[n - 1]
-  return `${n}:${last.content ? last.content.length : 0}:${last.pending ? 1 : 0}`
-})
-watch(scrollKey, () => scrollLog())
-
 // ---- 主机 / 任务切换：只留当前任务的 shell（切走关闭、回来重开）----
 
 let hostSwitching = false
@@ -409,7 +345,6 @@ watch(() => store.currentHostId, async id => {
       store.currentSessionId = want
     }
     if (id) await attachSurface(id, store.currentSessionId)
-    scrollLog()
   } finally {
     hostSwitching = false
   }
@@ -423,7 +358,6 @@ watch(() => store.currentSessionId, async () => {
   const hostId = store.currentHostId
   if (!hostId) return
   await attachSurface(hostId, store.currentSessionId)
-  scrollLog()
 })
 
 // ---- 顶栏：任务名 / 窗口标题 / 模型 ----
@@ -452,20 +386,6 @@ const activeProfileId = computed(() =>
   store.selectedProfileId || (store.llmProfiles.find(p => p.active) || {}).id || ''
 )
 
-// 欢迎页「新建任务」的前置条件：模型已配置。主机未配置/未选择时按钮仍可点，
-// 但引导去主机管理 —— 那里同时承担「添加」与「选择」。
-const llmReady = computed(() => !!activeProfileId.value)
-
-// 欢迎页新建任务：唯一主机直接选中（bootstrap 的单机自动选是同一规则），
-// 连接随选中立即建立；多台主机去主机管理挑。
-function welcomeNewTask() {
-  if (!llmReady.value) return
-  if (store.hosts.length === 1) {
-    store.currentHostId = store.hosts[0].id
-    return
-  }
-  emit('page', 'hosts')
-}
 const modelOptions = computed(() =>
   store.llmProfiles.map(p => ({
     value: p.id,
@@ -516,10 +436,17 @@ function startNewSession() {
     push({ kind: 'error', content: t('msg.pickHost') })
     return
   }
+  showArchive.value = true
   newName.value = ''
   showNewModal.value = true
   nextTick(() => { if (newEl.value) newEl.value.focus() })
 }
+
+// 侧栏「新建任务」入口：切到对话页并弹出命名框（无主机时给出提示）。
+watch(() => store.newTaskIntent, () => {
+  if (!store.newTaskIntent) return
+  startNewSession()
+})
 
 async function commitNewSession() {
   const name = newName.value.trim()
@@ -697,8 +624,8 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="console">
-    <!-- 未选主机时只显示欢迎页：工具条与切换按钮都无意义，整体隐藏。 -->
-    <header v-if="store.currentHostId" class="bar">
+    <!-- 有对话（或已在终端）才显示顶栏：空对话框首页只留中央 composer。 -->
+    <header v-if="showTopBar" class="bar">
       <div class="row grow">
         <label class="inline-label">{{ t('console.bar.host') }}</label>
         <UiSelect
@@ -724,8 +651,8 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="seg">
+        <button :class="{ on: showArchive }" @click="showArchive = true">{{ t('console.view.chat') }}</button>
         <button :class="{ on: !showArchive }" @click="showArchive = false">{{ t('console.view.term') }}</button>
-        <button :class="{ on: showArchive }" @click="showArchive = true">{{ t('console.view.archive') }}</button>
       </div>
 
       <!-- 新建任务弹窗（应用内，WKWebView 上原生 prompt 不弹） -->
@@ -747,61 +674,16 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
-    <!-- 关闭终端入口：能力/风险说明已移至欢迎页（未选主机时），不再常驻重复。 -->
-    <div v-if="canClose" class="sess-banner">
+    <!-- 关闭终端入口：只在终端视图占布局。对话页选主机也会后台开 PTY，
+         若这里仍插入横幅，居中首页会上下抖一下。 -->
+    <div v-if="canClose && !showArchive" class="sess-banner">
       <button class="sm" @click="onClose">{{ t('console.term.close') }}</button>
     </div>
 
-    <!-- 活表面：整幅 xterm，附着当前主机的常驻 shell PTY -->
+    <!-- 活表面：整幅 xterm，附着当前主机的常驻 shell PTY（终端内仍可 Agent+Shell 分流） -->
     <div class="surface" ref="rootEl" v-show="!showArchive">
-      <!-- 未选主机的默认界面：功能介绍 + 引导。有主机提示上方选择；无主机给跳转按钮。 -->
-      <div v-if="!store.currentHostId" class="surface-empty welcome">
-        <h2 class="welcome-title">{{ t('console.welcome.title') }}</h2>
-        <p class="welcome-sub">{{ t('console.welcome.sub') }}</p>
-        <div class="welcome-feats">
-          <div class="welcome-feat">
-            <b>{{ t('console.welcome.f1t') }}</b>
-            <span>{{ t('console.welcome.f1d') }}</span>
-          </div>
-          <div class="welcome-feat">
-            <b>{{ t('console.welcome.f2t') }}</b>
-            <span>{{ t('console.welcome.f2d') }}</span>
-          </div>
-          <div class="welcome-feat">
-            <b>{{ t('console.welcome.f3t') }}</b>
-            <span>{{ t('console.welcome.f3d') }}</span>
-          </div>
-        </div>
-        <!-- 快捷入口：配置三步（模型 → 主机 → 新建任务）按使用顺序横排。
-             新建任务缺前置时禁用并用 title 说明缺什么，可点时单机直选、多机引导去主机管理。 -->
-        <div class="welcome-actions">
-          <button class="welcome-btn" @click="emit('page', 'settings')">
-            <svg width="17" height="17" viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7z M12 3v2.5 M12 18.5V21 M4.2 7.5l2.2 1.3 M17.6 15.2l2.2 1.3 M4.2 16.5l2.2-1.3 M17.6 8.8l2.2-1.3"
-                    fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
-            </svg>
-            <span>{{ t('menu.page.settings') }}</span>
-          </button>
-          <button class="welcome-btn" @click="emit('page', 'hosts')">
-            <svg width="17" height="17" viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M4 4h16v6H4z M4 14h16v6H4z M7 7h.01 M7 17h.01"
-                    fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
-            </svg>
-            <span>{{ t('app.nav.hosts') }}</span>
-          </button>
-          <button
-            class="welcome-btn primary"
-            :disabled="!llmReady || !store.hosts.length"
-            :title="!llmReady ? t('console.welcome.needLlm') : t('console.welcome.needHost')"
-            @click="welcomeNewTask"
-          >
-            <svg width="17" height="17" viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M12 5v14 M5 12h14" fill="none" stroke="currentColor" stroke-width="1.7"
-                    stroke-linecap="round" stroke-linejoin="round" />
-            </svg>
-            <span>{{ t('console.new.label') }}</span>
-          </button>
-        </div>
+      <div v-if="!store.currentHostId" class="surface-empty">
+        <p class="term-empty">{{ t('msg.pickHost') }}</p>
       </div>
       <template v-else>
         <div v-if="statusLine" class="surface-status" :class="{ bad: st && st.status === 'error' }">
@@ -820,119 +702,18 @@ onBeforeUnmount(() => {
       </template>
     </div>
 
-    <!-- 对话归档：只读时间线（复用 store.entries 渲染，不接活事件、无交互按钮） -->
-    <div class="log archive" ref="logEl" v-show="showArchive">
-      <div v-for="it in timeline" :key="it.id" class="entry" :class="'entry-' + it.kind">
-        <!-- 工具调用组：连续的「调用 / 结果」折成一行 `N 次工具调用`，点开看详情 -->
-        <div v-if="it.kind === 'toolGroup'" class="tool-group">
-          <div class="tool-group-head" role="button" tabindex="0" @click="toggleGroup(it.id)">
-            <span class="tg-arrow">{{ openGroups[it.id] ? '▾' : '▸' }}</span>
-            <span class="tg-label">{{ t('console.toolGroup', { n: it.calls.length }) }}</span>
-          </div>
-          <div v-show="openGroups[it.id]" class="tool-group-body">
-            <div v-for="c in it.calls" :key="c.key" class="tool-call">
-              <div v-if="c.tool" class="tool">
-                <div class="tool-head">
-                  <span class="tool-name mono">{{ c.tool.tool.name }}</span>
-                  <span class="badge" :class="decisionClass(c.tool.tool.decision)">
-                    {{ decisionLabel(c.tool.tool.decision) }}
-                  </span>
-                  <span class="badge neutral">{{ statusLabel(c.tool.tool.status) }}</span>
-                  <span class="muted" v-if="c.tool.tool.hostName">@{{ c.tool.tool.hostName }}</span>
-                  <span class="muted right" v-if="c.tool.tool.durationMs">{{ c.tool.tool.durationMs }}ms</span>
-                </div>
-                <pre v-if="c.tool.tool.command" class="tool-cmd">{{ c.tool.tool.command }}</pre>
-                <div v-if="c.tool.tool.reason" class="tool-reason">{{ c.tool.tool.reason }}</div>
-              </div>
-              <div v-if="c.result" class="result">
-                <div class="result-head">
-                  <span class="muted">{{ t('console.exitCode', { n: c.result.exitCode }) }}</span>
-                  <span v-if="c.result.redacted" class="badge warn">{{ t('console.redacted', { n: c.result.redacted }) }}</span>
-                  <span class="muted tiny">{{ t('console.rawOutput') }}</span>
-                </div>
-                <pre>{{ c.result.content }}</pre>
-              </div>
-            </div>
-          </div>
-        </div>
+    <!-- 对话页：对话框首页 + 气泡时间线（思考 / 工具调用）；与终端共用 store.entries -->
+    <ChatPanel
+      v-show="showArchive"
+      @page="emit('page', $event)"
+      @term="showArchive = false"
+      @cmd-detail="showCmdDetail = true"
+    />
 
-        <!-- 屏幕快照：模型读的那份净化文本，人看同一份，审计才对得上 -->
-        <div v-else-if="it.kind === 'snapshot'" class="result">
-          <div class="result-head">
-            <span v-if="it.final" class="badge warn">{{ t('console.snapshot.final') }}</span>
-            <span v-else class="badge warn">{{ t('console.snapshot.live') }}</span>
-            <span v-if="it.redacted" class="badge warn">{{ t('console.redacted', { n: it.redacted }) }}</span>
-            <span class="muted tiny">{{ it.final ? t('console.snapshot.finalHint') : t('console.snapshot.liveHint') }}</span>
-          </div>
-          <pre>{{ it.text }}</pre>
-          <div v-if="it.injection && it.injection.length" class="tool-reason">
-            {{ t('console.injection.found', { findings: it.injection.join('、') }) }}
-          </div>
-        </div>
-
-        <div v-else-if="it.kind === 'user'" class="msg user">
-          <div class="msg-role msg-logo" title="Ai-Shell">Ai-Shell &gt;</div>
-          <div class="msg-body">{{ it.content }}</div>
-        </div>
-
-        <div v-else-if="it.kind === 'assistant'" class="msg assistant">
-          <div class="msg-role">
-            <!-- 与终端表面同一套语法：`厂商 >` 表示「这是模型在回答」 -->
-            <span
-              v-if="archiveBadge(it)"
-              class="model-badge"
-              :style="{ color: archiveBadge(it).color }"
-              :title="archiveBadge(it).name"
-            >{{ archiveBadge(it).mark }}</span>
-            <span v-else class="model-mark-fallback">LLM</span>
-            <span class="model-chevron">&gt;</span>
-          </div>
-          <div class="msg-body">
-            <div v-if="archiveBadge(it) && archiveBadge(it).name" class="msg-model" :title="t('console.model.used')">
-              {{ archiveBadge(it).name }}<span v-if="it.model && archiveBadge(it).name !== it.model" class="msg-model-id"> · {{ it.model }}</span>
-            </div>
-            <div v-else-if="it.model" class="msg-model" :title="t('console.model.used')">{{ it.model }}</div>
-            <div v-if="it.reasoning" class="reasoning">
-              <div class="reasoning-head" @click="it.reasoningOpen = !it.reasoningOpen">
-                {{ it.streaming && !it.content ? t('console.reasoning.thinking') : t('console.reasoning.label') }}
-                <span class="reasoning-arrow">{{ it.reasoningOpen ? '▾' : '▸' }}</span>
-              </div>
-              <div v-show="it.reasoningOpen" class="reasoning-body">{{ it.reasoning }}</div>
-            </div>
-            {{ it.content }}<span v-if="it.streaming" class="caret"></span><span v-if="!it.content && !it.reasoning && !it.streaming" class="muted tiny">{{ t('console.emptyReply') }}</span>
-          </div>
-        </div>
-
-        <div v-else-if="it.kind === 'injection'" class="injection">
-          <div class="injection-title">{{ t('console.injection.title') }}</div>
-          <div class="injection-body">{{ t('console.injection.hits', { findings: it.findings.join('、') }) }}</div>
-          <pre v-if="it.command" class="injection-cmd">{{ it.command }}</pre>
-          <div class="injection-hint">
-            {{ t('console.injection.p1') }}<span class="mono">{{ it.hostName }}</span>{{ t('console.injection.p2') }}{{ t('console.injection.p3') }}
-          </div>
-        </div>
-
-        <div v-else-if="it.kind === 'error'" class="msg error">
-          <div class="msg-role">{{ t('console.role.error') }}</div>
-          <div class="msg-body">{{ it.content }}</div>
-        </div>
-
-        <div v-else class="msg system">
-          <div class="msg-body">{{ it.content }}</div>
-        </div>
-      </div>
-
-      <div v-if="!store.entries.length" class="archive-empty">
-        {{ t('console.archiveEmpty') }}
-      </div>
-    </div>
-
-    <!-- 底部 composer：审批浮层 + 工具条（未选主机时与工具条一起隐藏）。 -->
-    <div v-if="store.currentHostId" class="composer-bar">
-      <!-- 审批条：必须是**浮层**（绝对定位、不占布局）。
-           一旦它占布局，出现/消失就会改变 .surface 的高度 → 触发终端 resize →
-           远端 shell 收到 SIGWINCH 重绘提示符 → 看起来像「agent 干活干到一半
-           突然回到了命令行」。实测：审批出现与消失各触发一次重绘。 -->
+    <!-- 底部 composer：仅终端视图。对话页的审批卡在 ChatPanel 消息区。
+         终端视图审批仍必须是浮层（绝对定位、不占布局），否则出现/消失会
+         resize 终端 → SIGWINCH → 远端重绘提示符。 -->
+    <div v-if="store.currentHostId && !showArchive" class="composer-bar">
       <div v-if="store.pending" class="approval">
         <div class="approval-head">
           <span class="badge warn">{{ t('console.approval.title') }}</span>
@@ -959,7 +740,7 @@ onBeforeUnmount(() => {
           <button class="sm" @click="approve(false)">{{ t('console.approval.skip') }}</button>
         </div>
       </div>
-      <div class="composer-tools">
+      <div v-if="!showArchive" class="composer-tools">
         <span
           v-if="store.running && !store.pending && !streamingNow"
           class="thinking-inline"
@@ -1435,6 +1216,21 @@ onBeforeUnmount(() => {
 .approval-countdown { font-size: 12px; white-space: nowrap; }
 .approval-countdown.urgent { color: var(--warn); font-weight: 600; }
 
+.term-empty {
+  margin: 0;
+  padding: 48px 24px;
+  text-align: center;
+  color: var(--text-3);
+  font-size: 14px;
+}
+.composer-bar.approval-only {
+  border-top: 0;
+  background: transparent;
+  pointer-events: none;
+}
+.composer-bar.approval-only .approval {
+  pointer-events: auto;
+}
 .composer-bar {
   flex-shrink: 0;
   position: relative; /* 审批浮层的锚：bottom:100% 即浮在工具条正上方 */

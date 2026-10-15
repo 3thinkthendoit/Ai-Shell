@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -269,19 +268,16 @@ func TestSessionCrudBindings(t *testing.T) {
 	}
 }
 
-// 默认会话删不掉，且原因要说清楚。
-//
-// 这里**不**在 App 层再判一次 —— 规则只在 agent 那一处实现。
-// 但错误必须原样透传，否则用户点了「删除」只看到一句没头没尾的报错。
-func TestDeleteSessionBindingRefusesDefault(t *testing.T) {
+// 删除默认会话经 App 绑定后应成功（语义=清空内容，槽位保留）。
+func TestDeleteSessionBindingResetsDefault(t *testing.T) {
 	a := newSessionTestApp(t, newFakeLLM(t))
 
-	err := a.DeleteSession("h1", agent.DefaultSessionID)
-	if err == nil {
-		t.Fatal("默认会话不该被删掉")
+	if err := a.DeleteSession("h1", agent.DefaultSessionID); err != nil {
+		t.Fatalf("删除默认任务应成功：%v", err)
 	}
-	if !strings.Contains(err.Error(), "默认会话不能删除") {
-		t.Errorf("错误里应说清原因，实得 %q", err.Error())
+	list := a.ListSessions("h1")
+	if len(list) != 1 || !list[0].IsDefault || list[0].Turns != 0 {
+		t.Fatalf("应仍有空的默认会话，实得 %+v", list)
 	}
 }
 

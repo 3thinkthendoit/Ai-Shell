@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
-import { store, bootstrap, bindEvents, dismissAuditError, initTheme } from './store'
+import { store, bootstrap, bindEvents, dismissAuditError, initTheme, requestNewTask } from './store'
 import { t } from './i18n'
 import ConsolePanel from './components/ConsolePanel.vue'
 import HostsPanel from './components/HostsPanel.vue'
@@ -22,8 +22,15 @@ const tabs = computed(() => [
 
 // 导航图标：内联 SVG（线性风格，stroke 跟随文字颜色），不引第三方图标库。
 const icons = {
-  console: 'M4 5h16v11H4z M8 20h8 M12 16v4',            // 终端窗口
+  // 新建任务：对话气泡 + 加号（对齐 WorkBuddy 主入口）
+  console: 'M4 6h11a3 3 0 0 1 3 3v5a3 3 0 0 1-3 3H9l-4 3v-3H7a3 3 0 0 1-3-3V9a3 3 0 0 1 3-3z M19 4v6 M16 7h6',
   hosts: 'M6 4h12v7H6z M6 13h12v7H6z M9 7.5h.01 M9 16.5h.01' // 服务器两台叠放
+}
+
+function onNav(key) {
+  tab.value = key
+  // 「新建任务」主入口：切到对话页并弹出命名框（与 WorkBuddy 语义对齐）。
+  if (key === 'console') requestNewTask()
 }
 
 onMounted(async () => {
@@ -46,17 +53,17 @@ onMounted(async () => {
 
       <nav>
         <button
-          v-for="t in tabs"
-          :key="t.key"
+          v-for="item in tabs"
+          :key="item.key"
           class="nav-btn"
-          :class="{ active: tab === t.key }"
-          @click="tab = t.key"
+          :class="{ active: tab === item.key }"
+          @click="onNav(item.key)"
         >
           <svg class="nav-icon" width="15" height="15" viewBox="0 0 24 24" aria-hidden="true">
-            <path :d="icons[t.key]" fill="none" stroke="currentColor"
+            <path :d="icons[item.key]" fill="none" stroke="currentColor"
                   stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
           </svg>
-          {{ t.label }}
+          {{ item.label }}
         </button>
       </nav>
 
@@ -153,9 +160,11 @@ nav {
 }
 
 .nav-btn {
+  /* 跟全局 button 一样居中：图标+文案在胶囊里水平居中（「新建任务」CTA） */
   gap: 9px;
-  text-align: left;
-  justify-content: flex-start;
+  justify-content: center;
+  text-align: center;
+  width: 100%;
   border: none;
   background: transparent;
   padding: 0 10px;

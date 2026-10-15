@@ -44,7 +44,7 @@ async function ClearSession() {
 // ---- 会话列表的模拟 ----
 //
 // 只为实现「选择器有内容、新建/改名/删除有反馈」这条链路 ——
-// 会话的**真实规则**（默认会话不能删、上限 20 条、名字清洗）都在后端，
+// 会话的**真实规则**（默认会话删除=清空、上限 20 条、名字清洗）都在后端，
 // 这里不重复实现：预览脚手架不是交付物，把规则抄一遍只会误导读者
 // 以为它们是前端的事。
 const DEFAULT_SESSION = 'default'
@@ -70,7 +70,16 @@ async function RenameSession(hostId, sessionId, name) {
   if (s) s.name = String(name).trim()
 }
 async function DeleteSession(hostId, sessionId) {
-  if (sessionId === DEFAULT_SESSION) throw new Error('默认会话不能删除，用「清空上下文」把它清空即可')
+  // 与后端一致：默认会话删除 = 清空内容，槽位保留。
+  if (sessionId === DEFAULT_SESSION || !sessionId) {
+    const s = previewSessions.find(x => x.id === DEFAULT_SESSION)
+    if (s) {
+      s.turns = 0
+      s.archivedTurns = 0
+      s.name = ''
+    }
+    return
+  }
   previewSessions = previewSessions.filter(x => x.id !== sessionId)
 }
 async function CompactSession() {

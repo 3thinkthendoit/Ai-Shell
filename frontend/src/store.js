@@ -187,6 +187,10 @@ export const store = reactive({
   activeHostId: '',
   activeSessionId: '',
 
+  // newTaskIntent：侧栏「新建任务」点一下就 +1。ConsolePanel 监听后弹出命名框。
+  // 用计数而不是布尔：连续点两次也要各触发一次。
+  newTaskIntent: 0,
+
   pending: null,
   running: false,
   busy: false,
@@ -536,17 +540,29 @@ export function freezeStreams() {
   }
 }
 
+// ask 返回是否已成功发起本轮（true）—— 调用方据此决定要不要清草稿。
+// 校验失败 / busy / 后端同步拒绝一律 false，避免「输入丢了但没发出去」。
 export async function ask(prompt) {
   if (!store.currentHostId) {
     push({ kind: 'error', content: t('msg.needHost') })
-    return
+    return false
   }
+  // 对话页发送前已用弹层拦过；终端分流仍可能直接 ask —— 这里再守一道：
+  // 没有当前选中的 LLM 方案就不要开跑，避免跑到一半才 agent:error。
+  const profileId = store.selectedProfileId ||
+    (store.llmProfiles.find(p => p.active) || {}).id || ''
+  if (!profileId) {
+    push({ kind: 'error', content: t('msg.needModel') })
+    return false
+  }
+  // 若界面尚未写 selectedProfileId（仅后端 active），对齐一下，避免下拉与请求不一致。
+  if (!store.selectedProfileId) store.selectedProfileId = profileId
   // 防重入：这个不变量由 store 自己守住，不指望每个调用方都记得先查 running。
   // 否则第二次调用会被后端以「已有会话正在运行」拒绝，给用户弹一个莫名其妙的报错。
   // 不能静默 return：那会让用户以为「发出去没反应」，必须给出可见提示。
   if (store.running || store.busy) {
     push({ kind: 'system', content: t('msg.busyRound') })
-    return
+    return false
   }
   // 记下这一轮属于哪条时间线。后续所有事件都按它归档 ——
   // 用户中途切了主机或会话也不会把输出写错地方。
@@ -561,10 +577,12 @@ export async function ask(prompt) {
   store.running = true
   try {
     // 带上「这一轮用哪套方案」：切换随请求即时生效，不再依赖全局激活指针。
-    await api().Ask(store.currentHostId, store.currentSessionId, prompt, store.selectedProfileId)
+    await api().Ask(store.currentHostId, store.currentSessionId, prompt, profileId)
+    return true
   } catch (e) {
     store.running = false
     push({ kind: 'error', content: String(e) })
+    return false
   }
 }
 
@@ -655,6 +673,41 @@ export function selectSession(sessionId) {
   reportActiveSession(store.currentHostId, store.currentSessionId)
 }
 
+// requestNewTask 供侧栏主入口调用：切到对话页并由 ConsolePanel 弹出「新建任务」命名框。
+export function requestNewTask() {
+  store.newTaskIntent++
+}
+
+// currentSessionHasTurns：当前会话是否已有对话轮次（后端元信息）。
+// 清空屏幕记录后 entries 为空，但 turns 仍可能 >0 —— 顶栏/工具条应继续显示。
+export function currentSessionHasTurns() {
+  const list = store.currentSessions || []
+  const cur = list.find(s => s.id === store.currentSessionId) || list.find(s => s.isDefault)
+  return !!(cur && cur.turns > 0)
+}
+
+// 本机 UI 是否已经在「当前焦点会话」里见过对话气泡。
+// 不能单靠后端 turns：空首页点「选择主机」会 refreshSessions，
+// 旧会话 turns>0 会把压缩/清空工具条和顶栏突然顶出来，但屏幕仍是空首页。
+let sawConversation = false
+
+export function noteConversationActivity() {
+  if (store.entries.length > 0) sawConversation = true
+}
+
+export function onFocusSessionChanged() {
+  sawConversation = store.entries.length > 0
+}
+
+export function resetSessionChromeSeen() {
+  sawConversation = false
+}
+
+// 顶栏 / 对话工具条：有气泡，或本页见过对话且清空记录后 turns 仍在。
+export function shouldShowSessionChrome() {
+  return store.entries.length > 0 || (sawConversation && currentSessionHasTurns())
+}
+
 // createSession 在当前主机下新建一条会话，并立刻切过去。
 //
 // 新建后必须切过去：用户的意图就是「开一段新对话」，
@@ -699,9 +752,8 @@ export async function renameSession(sessionId, name) {
 
 // deleteSession 删掉一条会话。
 //
-// 后端会拒绝删除默认会话（它是「不带会话 ID 跑一轮」的落点），
-// 这里不预先判一遍 —— 让后端说那句话，前端只管把原因显示出来。
-// 两处各判一次的话，规则迟早会分叉成「界面允许删、后端拒绝」。
+// 默认会话：后端清空内容但保留槽位（侧栏 turns>0 才显示）。本地时间线
+// 也要清掉，否则列表没了、屏幕上还挂着旧气泡。
 export async function deleteSession(sessionId) {
   const hostId = store.currentHostId
   if (!hostId) {
@@ -710,6 +762,7 @@ export async function deleteSession(sessionId) {
   }
   try {
     await api().DeleteSession(hostId, sessionId)
+    store.bySession[bucketKey(hostId, sessionId)] = []
     // 删掉的正好是当前选中的那条：先切回默认会话，再刷新列表。
     // 顺序不能反 —— 先刷新的话，refreshSessions 里的兜底也会把它置空，
     // 结果相同但意图看不出来。

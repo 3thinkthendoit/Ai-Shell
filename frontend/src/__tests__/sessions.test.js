@@ -71,6 +71,8 @@ function resetStore() {
   store.pending = null
   store.running = false
   store.compacting = false
+  store.llmProfiles = [{ id: 'p1', name: 'default', model: 'm', active: true }]
+  store.selectedProfileId = 'p1'
 }
 
 let rt
@@ -401,20 +403,21 @@ describe('会话的增删改', () => {
     expect(store.currentSessionId).toBe('s1')
   })
 
-  // 后端会拒绝删除默认会话。前端不预判，但必须把原因显示出来 ——
-  // 否则用户点了「删除」什么都没发生。
-  it('后端拒绝删除默认会话时，原因要显示出来', async () => {
-    const { app } = makeApp({
-      DeleteSession: async () => { throw new Error('默认会话不能删除，用「清空上下文」把它清空即可') }
+  it('删除默认会话会清掉对话气泡并提示已删除', async () => {
+    const { app, calls } = makeApp({
+      ListSessions: async () => [defaultSession()]
     })
     install(app)
     store.currentHostId = 'h1'
     store.currentSessionId = 'default'
+    push({ kind: 'user', content: 'hi' })
 
     await deleteSession('default')
 
-    expect(store.entries.at(-1).kind).toBe('error')
-    expect(store.entries.at(-1).content).toContain('默认会话不能删除')
+    expect(calls.filter(c => c.name === 'DeleteSession')).toHaveLength(1)
+    expect(store.entries.filter(e => e.kind === 'user')).toHaveLength(0)
+    expect(store.entries.at(-1).kind).toBe('system')
+    expect(store.entries.at(-1).content).toContain('已删除')
   })
 
   it('没有选中主机时增删改都不打后端', async () => {
