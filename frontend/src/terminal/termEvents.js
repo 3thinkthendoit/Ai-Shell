@@ -13,7 +13,9 @@ import {
   textToBase64,
   base64ToBytes,
   bucketKey,
-  termState
+  termState,
+  takeStagedUserImages,
+  clearStagedUserImages
 } from '../store.js'
 import { estimateTokens } from '../tokenEstimate.js'
 
@@ -211,7 +213,14 @@ export function bindTerminalEvents(runtime) {
       return
     }
     const badge = currentModelBadge()
-    push({ kind: 'assistant', content: d.text, stream: d.step, streaming: true, badge })
+    push({
+      kind: 'assistant',
+      content: d.text,
+      stream: d.step,
+      streaming: true,
+      badge,
+      model: store.contextUsage.model || ''
+    })
     paint.paintAssistantHeader(w, badge)
     paint.paintAssistantDelta(w, d.text)
   })
@@ -223,7 +232,16 @@ export function bindTerminalEvents(runtime) {
     let live = liveAssistant(d.step)
     if (!live) {
       const badge = currentModelBadge()
-      push({ kind: 'assistant', content: '', stream: d.step, streaming: true, reasoning: '', reasoningOpen: true, badge })
+      push({
+        kind: 'assistant',
+        content: '',
+        stream: d.step,
+        streaming: true,
+        reasoning: '',
+        reasoningOpen: true,
+        badge,
+        model: store.contextUsage.model || ''
+      })
       live = liveAssistant(d.step)
       paint.paintAssistantHeader(w, badge)
     }
@@ -237,7 +255,12 @@ export function bindTerminalEvents(runtime) {
     const host = paintHost()
     const w = surfaceWrite(host)
     if (m.role !== 'assistant') {
-      push({ kind: 'user', content: m.content })
+      const images = takeStagedUserImages()
+      push({
+        kind: 'user',
+        content: m.content,
+        ...(images.length ? { images } : {})
+      })
       paint.paintUser(w, m.content)
       return
     }
@@ -296,9 +319,13 @@ export function bindTerminalEvents(runtime) {
     store.contextUsage.tokens = d.tokens || 0
     store.contextUsage.window = d.window || 0
     store.contextUsage.messages = d.messages || 0
-    // 挂到当前流式助手气泡，定稿后底栏可显示「上下文 / 输出」。
+    if (d.model) store.contextUsage.model = d.model
+    // 挂到当前流式助手气泡：用量 + 本轮真实 model（切方案后立刻可见）。
     const live = targetEntries().find(e => e.kind === 'assistant' && e.streaming)
-    if (live) live.tokensIn = d.tokens || 0
+    if (live) {
+      live.tokensIn = d.tokens || 0
+      if (d.model) live.model = d.model
+    }
   })
 
   runtime.EventsOn('agent:injection', e => {
@@ -334,6 +361,7 @@ export function bindTerminalEvents(runtime) {
     store.running = false
     stopThinking(paintHost())
     store.pending = null
+    clearStagedUserImages()
     freezeStreams()
     push({ kind: 'error', content: e.message })
     paint.paintError(surfaceWrite(paintHost()), e.message)
@@ -348,6 +376,8 @@ export function bindTerminalEvents(runtime) {
     store.running = false
     stopThinking(paintHost())
     store.pending = null
+    // 正常路径已在 user message 消费；此处兜底避免异常时芯片挂到下一轮。
+    clearStagedUserImages()
     freezeStreams()
   })
 

@@ -20,6 +20,9 @@ const form = reactive({
   name: profiles.value.find(p => p.id === editingId.value)?.name || t('settings.defaultName'),
   baseUrl: store.llm.baseUrl,
   model: store.llm.model,
+  // 空串 = 自动按模型名推断；数字 = 用户指定的上下文窗口（token）。
+  contextWindow: '',
+  supportsVision: false,
   apiKey: '',
   clearKey: false
 })
@@ -37,6 +40,8 @@ function loadEditing() {
   form.name = p ? p.name : ''
   form.baseUrl = p ? p.baseUrl : ''
   form.model = p ? p.model : ''
+  form.contextWindow = p && p.contextWindow > 0 ? String(p.contextWindow) : ''
+  form.supportsVision = !!(p && p.supportsVision)
   form.apiKey = ''
   form.clearKey = false
   testRes.value = null
@@ -49,10 +54,20 @@ function newProfile() {
   form.name = ''
   form.baseUrl = ''
   form.model = ''
+  form.contextWindow = ''
+  form.supportsVision = false
   form.apiKey = ''
   form.clearKey = false
   testRes.value = null
   corrected.value = ''
+}
+
+function parseContextWindow(raw) {
+  const s = String(raw || '').trim().replace(/[,_\s]/g, '')
+  if (!s) return 0
+  const n = Number(s)
+  if (!Number.isFinite(n) || n < 0) return 0
+  return Math.floor(n)
 }
 
 // 保存/切换/删除后统一重拉状态。顺带把表单对齐到「当前编辑的方案」——
@@ -133,6 +148,8 @@ async function save() {
       name: form.name || t('settings.defaultName'),
       baseUrl: form.baseUrl,
       model: form.model,
+      contextWindow: parseContextWindow(form.contextWindow),
+      supportsVision: !!form.supportsVision,
       apiKey: form.apiKey,
       clearKey: form.clearKey
     })
@@ -252,6 +269,21 @@ const isLocal = () => /localhost|127\.0\.0\.1|0\.0\.0\.0/.test(form.baseUrl)
           <input v-model="form.model" class="model-name" placeholder="gpt-4o-mini" />
         </div>
         <div class="field">
+          <label>{{ t('settings.conn.ctxWindow') }}</label>
+          <input
+            v-model="form.contextWindow"
+            class="ctx-window"
+            inputmode="numeric"
+            :placeholder="t('settings.conn.ctxWindowPh')"
+          />
+          <div class="field-hint muted">{{ t('settings.conn.ctxWindowHint') }}</div>
+          <label class="check-row">
+            <input type="checkbox" v-model="form.supportsVision" />
+            {{ t('settings.conn.vision') }}
+          </label>
+          <div class="field-hint muted">{{ t('settings.conn.visionHint') }}</div>
+        </div>
+        <div class="field">
           <label>
             API Key
             <span v-if="editingId && editingProfile()?.hasApiKey" class="muted">{{ t('settings.key.saved') }}</span>
@@ -333,7 +365,8 @@ const isLocal = () => /localhost|127\.0\.0\.1|0\.0\.0\.0/.test(form.baseUrl)
 .profile-hint { margin-top: 10px; font-size: 12px; }
 
 /* 长文本输入给个上限：不随窗口无限拉长 */
-.base-url, .model-name, .api-key, .profile-name { max-width: 620px; }
+.base-url, .model-name, .api-key, .profile-name, .ctx-window { max-width: 620px; }
+.field-hint { margin-top: 6px; font-size: 12px; line-height: 1.45; }
 
 .notice {
   margin-top: 14px;
@@ -384,6 +417,7 @@ const isLocal = () => /localhost|127\.0\.0\.1|0\.0\.0\.0/.test(form.baseUrl)
 .tr-line .mono { font-size: 11.5px; }
 
 .chk { display: flex; align-items: center; gap: 8px; margin-top: 12px; color: var(--danger); font-size: 12px; }
+.check-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 13px; color: var(--text); }
 
 .local-hint {
   margin-top: 12px;

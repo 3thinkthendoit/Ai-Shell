@@ -50,4 +50,15 @@ describe('installExternalLinkGuard', () => {
     a.dispatchEvent(ev)
     expect(window.runtime.BrowserOpenURL).not.toHaveBeenCalled()
   })
+
+  it('Ctrl/Meta 点击外链同样拦下并外开（避免 WebView 整页跳走）', () => {
+    document.body.innerHTML = '<a id="a" href="https://example.com/x">外链</a>'
+    const a = document.getElementById('a')
+    const ev = new MouseEvent('click', {
+      bubbles: true, cancelable: true, button: 0, ctrlKey: true
+    })
+    a.dispatchEvent(ev)
+    expect(ev.defaultPrevented).toBe(true)
+    expect(window.runtime.BrowserOpenURL).toHaveBeenCalled()
+  })
 })

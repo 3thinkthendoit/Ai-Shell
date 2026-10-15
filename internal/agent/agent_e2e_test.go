@@ -926,6 +926,21 @@ func TestAgentRequiresAPIKeyForRemoteLLM(t *testing.T) {
 	}
 }
 
+// 切模型后历史里可能仍写着旧自称；每轮系统提示必须点名本轮真实 API 模型。
+func TestAgentInjectsCurrentModelIdentity(t *testing.T) {
+	h := newHarness(t, []string{respContent("我是 test-model。")}, policy.ModeWhitelist, true)
+	if err := runDefault(h.ag, context.Background(), h.hostID, "你是什么模型"); err != nil {
+		t.Fatalf("运行失败: %v", err)
+	}
+	msgs := h.fake.messagesAt(0)
+	if len(msgs) == 0 || msgs[0].Role != "system" {
+		t.Fatalf("首条应为 system，实得: %s", brief(msgs))
+	}
+	if !strings.Contains(msgs[0].Content, "本轮模型") || !strings.Contains(msgs[0].Content, "test-model") {
+		t.Fatalf("系统提示应声明本轮 API 模型 test-model，实得:\n%s", msgs[0].Content)
+	}
+}
+
 // ---- 流式输出 ----
 
 // 界面靠增量拼接逐字显示，因此「增量之和」必须与最终回答完全一致 ——
@@ -1636,7 +1651,7 @@ func TestAgentNoSessionHostDeniesAllTools(t *testing.T) {
 		respContent("没有归属主机，我不执行。"),
 	}, policy.ModeWhitelist, true)
 
-	if err := h.ag.Run(context.Background(), "", DefaultSessionID, "随便看看", ""); err != nil {
+	if err := h.ag.Run(context.Background(), "", DefaultSessionID, "随便看看", "", nil); err != nil {
 		t.Fatal(err)
 	}
 	if h.hasEvent(EvApproval) {

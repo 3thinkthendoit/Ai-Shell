@@ -385,12 +385,14 @@ func (v *Vault) LLMProfiles() []LLMProfileView {
 	out := make([]LLMProfileView, 0, len(v.st.LLMProfiles))
 	for _, p := range v.st.LLMProfiles {
 		out = append(out, LLMProfileView{
-			ID:        p.ID,
-			Name:      p.Name,
-			BaseURL:   p.BaseURL,
-			Model:     p.Model,
-			HasAPIKey: v.st.LLMAPIKeys[p.ID] != "",
-			Active:    p.ID == active,
+			ID:             p.ID,
+			Name:           p.Name,
+			BaseURL:        p.BaseURL,
+			Model:          p.Model,
+			ContextWindow:  p.ContextWindow,
+			SupportsVision: p.SupportsVision,
+			HasAPIKey:      v.st.LLMAPIKeys[p.ID] != "",
+			Active:         p.ID == active,
 		})
 	}
 	return out
@@ -432,19 +434,35 @@ func (v *Vault) SaveLLMProfile(p LLMProfile, apiKey *string) error {
 	}
 
 	p.Name = strings.TrimSpace(p.Name)
+	// 回填前先记下「调用方有没有带地址/模型」：零值字段与「未传」无法区分，
+	// 只有两者都留空时才把 ContextWindow / SupportsVision 的零值当成保留。
+	// App 完整保存总会带上 BaseURL+Model，此时 0 / false 仍表示「改回默认 / 关掉」。
+	incomingBase := strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
+	incomingModel := strings.TrimSpace(p.Model)
+	partial := incomingBase == "" && incomingModel == ""
+
 	// 与 SetLLM 相同的规范化语义：非空才更新（编辑时留空 = 保留原值）。
-	if nb := strings.TrimRight(strings.TrimSpace(p.BaseURL), "/"); nb != "" {
-		p.BaseURL = nb
+	if incomingBase != "" {
+		p.BaseURL = incomingBase
 	} else if i := v.indexOfProfileLocked(p.ID); i >= 0 {
 		p.BaseURL = v.st.LLMProfiles[i].BaseURL
 	}
-	if m := strings.TrimSpace(p.Model); m != "" {
-		p.Model = m
+	if incomingModel != "" {
+		p.Model = incomingModel
 	} else if i := v.indexOfProfileLocked(p.ID); i >= 0 {
 		p.Model = v.st.LLMProfiles[i].Model
 	}
 
 	if i := v.indexOfProfileLocked(p.ID); i >= 0 {
+		old := v.st.LLMProfiles[i]
+		if partial {
+			if p.ContextWindow == 0 {
+				p.ContextWindow = old.ContextWindow
+			}
+			if !p.SupportsVision {
+				p.SupportsVision = old.SupportsVision
+			}
+		}
 		v.st.LLMProfiles[i] = p
 	} else {
 		v.st.LLMProfiles = append(v.st.LLMProfiles, p)
@@ -597,13 +615,13 @@ func (v *Vault) LLMFor(id string) (LLMSettings, string, bool) {
 		for i := range v.st.LLMProfiles {
 			if v.st.LLMProfiles[i].ID == id {
 				p := &v.st.LLMProfiles[i]
-				return LLMSettings{BaseURL: p.BaseURL, Model: p.Model}, v.st.LLMAPIKeys[p.ID], true
+				return LLMSettings{BaseURL: p.BaseURL, Model: p.Model, SupportsVision: p.SupportsVision}, v.st.LLMAPIKeys[p.ID], true
 			}
 		}
 		return LLMSettings{}, "", false
 	}
 	if p := v.activeProfileLocked(); p != nil {
-		return LLMSettings{BaseURL: p.BaseURL, Model: p.Model}, v.st.LLMAPIKeys[p.ID], true
+		return LLMSettings{BaseURL: p.BaseURL, Model: p.Model, SupportsVision: p.SupportsVision}, v.st.LLMAPIKeys[p.ID], true
 	}
 	return v.st.LLM, v.st.LLMAPIKey, true
 }

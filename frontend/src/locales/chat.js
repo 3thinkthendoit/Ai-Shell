@@ -25,6 +25,11 @@ export const chat = {
     'chat.prompt.diff': '对比两份配置的差异，标出可能影响线上的改动。',
     'chat.prompt.summary': '对当前主机做一次巡检，并生成摘要报告。',
     'chat.send': '发送',
+    'chat.image.remove': '移除图片',
+    'chat.image.notImage': '只能粘贴或拖入 PNG / JPEG / WebP / GIF 图片',
+    'chat.image.tooLarge': '单张图片不能超过 4MB',
+    'chat.image.tooMany': '一次最多附 3 张图片',
+    'chat.image.readFail': '读取图片失败',
     'chat.workspace': '选择主机',
     'chat.workspace.current': '主机',
     'chat.policy': '默认权限',
@@ -55,7 +60,7 @@ export const chat = {
     'chat.msg.edit': '编辑到输入框',
     'chat.msg.resend': '再次发送',
     'chat.msg.tokensOut': '输出约 {n} tokens',
-    'chat.msg.tokensIO': '上下文 {in} · 输出约 {out} tokens'
+    'chat.msg.tokensIO': '输入约 {in} · 输出约 {out} tokens'
   },
   en: {
     'chat.title': 'Ai-Shell',
@@ -82,6 +87,11 @@ export const chat = {
     'chat.prompt.diff': 'Diff two configs and flag changes that may affect production.',
     'chat.prompt.summary': 'Run an inspection on this host and produce a summary report.',
     'chat.send': 'Send',
+    'chat.image.remove': 'Remove image',
+    'chat.image.notImage': 'Only PNG / JPEG / WebP / GIF images can be pasted or dropped',
+    'chat.image.tooLarge': 'Each image must be ≤ 4MB',
+    'chat.image.tooMany': 'At most 3 images per message',
+    'chat.image.readFail': 'Failed to read image',
     'chat.workspace': 'Select host',
     'chat.workspace.current': 'Host',
     'chat.policy': 'Default permissions',
@@ -112,6 +122,6 @@ export const chat = {
     'chat.msg.edit': 'Edit in composer',
     'chat.msg.resend': 'Send again',
     'chat.msg.tokensOut': '~{n} tokens out',
-    'chat.msg.tokensIO': 'ctx {in} · ~{out} tokens out'
+    'chat.msg.tokensIO': '~{in} in · ~{out} out'
   }
 }

@@ -6,6 +6,7 @@ import (
 	"unicode/utf8"
 
 	"ai-shell/internal/llm"
+	"ai-shell/internal/vault"
 )
 
 // token 估算与上下文窗口预算。
@@ -59,7 +60,23 @@ func EstimateTokens(s string) int {
 func estimateRequestTokens(msgs []llm.Message) int {
 	total := requestOverhead
 	for _, m := range msgs {
-		total += perMessageOverhead + EstimateTokens(m.Content)
+		total += perMessageOverhead
+		if len(m.Parts) > 0 {
+			for _, p := range m.Parts {
+				switch p.Type {
+				case "text":
+					total += EstimateTokens(p.Text)
+				case "image_url":
+					// vision 计费因模型而异；给一个偏高的保守估，避免圆环严重低估。
+					total += 800
+					if p.ImageURL != nil {
+						total += len(p.ImageURL.URL) / 100
+					}
+				}
+			}
+		} else {
+			total += EstimateTokens(m.Content)
+		}
 		// 工具调用的名字与参数也是 token —— 一轮排查里它往往是最大的一块，
 		// 漏掉等于上限失效。
 		for _, tc := range m.ToolCalls {
@@ -85,6 +102,25 @@ func contextWindowFor(model string) int {
 		return 0
 	}
 	return lookupWindow(low)
+}
+
+// contextWindowOf 优先用方案里用户配置的窗口；未配置（0）再按模型名内置表推断。
+func contextWindowOf(v *vault.Vault, profileID, model string) int {
+	if v != nil {
+		id := strings.TrimSpace(profileID)
+		if id != "" {
+			if p, ok := v.LLMProfile(id); ok && p.ContextWindow > 0 {
+				return p.ContextWindow
+			}
+		} else {
+			for _, p := range v.LLMProfiles() {
+				if p.Active && p.ContextWindow > 0 {
+					return p.ContextWindow
+				}
+			}
+		}
+	}
+	return contextWindowFor(model)
 }
 
 // tier 是「模型名关键字 → 上下文窗口」的决策表，按窗口大小分档。

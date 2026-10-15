@@ -554,9 +554,65 @@ describe('ask 发送一轮对话', () => {
       h1: [{ id: 's9', name: '已有名字', turns: 1, archivedTurns: 0, isDefault: false }]
     }
     await ask('看看磁盘')
-    // 第 4 参是「这一轮用哪套 LLM 方案」：切换随请求即时生效（见 store.ask）。
-    expect(calls[0].args).toEqual(['h1', 's9', '看看磁盘', store.selectedProfileId])
+    // 第 4 参：本轮 LLM 方案；第 5 参：imagesJSON（无图为空串）。
+    expect(calls[0].args).toEqual(['h1', 's9', '看看磁盘', store.selectedProfileId, ''])
     expect(store.running).toBe(true)
+  })
+
+  it('附图但方案未声明 vision：拦截且不打后端', async () => {
+    const { app, calls } = makeApp({ Ask: async () => undefined })
+    install({ runtime: rt, app })
+    store.currentHostId = 'h1'
+    store.llmProfiles = [{ id: 'p1', name: 'default', model: 'm', active: true, supportsVision: false }]
+    const ok = await ask('看图', [{ mime: 'image/png', data: 'AAAA' }])
+    expect(ok).toBe(false)
+    expect(calls.filter(c => c.name === 'Ask')).toHaveLength(0)
+    expect(store.entries.at(-1).content).toMatch(/视觉|vision/i)
+  })
+
+  it('附图且方案支持 vision：Ask 带上 imagesJSON，允许空文案', async () => {
+    const { app, calls } = makeApp({ Ask: async () => undefined })
+    install({ runtime: rt, app })
+    store.currentHostId = 'h1'
+    store.currentSessionId = 's9'
+    store.sessions = {
+      h1: [{ id: 's9', name: '图', turns: 1, archivedTurns: 0, isDefault: false }]
+    }
+    store.llmProfiles = [{ id: 'p1', name: 'vision', model: 'm', active: true, supportsVision: true }]
+    const imgs = [{ mime: 'image/png', data: 'AAAA', name: 'Clipboard_Screenshot.png', preview: 'data:image/png;base64,AAAA' }]
+    const ok = await ask('', imgs)
+    expect(ok).toBe(true)
+    expect(calls[0].name).toBe('Ask')
+    expect(calls[0].args[0]).toBe('h1')
+    expect(calls[0].args[1]).toBe('s9')
+    expect(calls[0].args[2]).toBe('')
+    expect(calls[0].args[3]).toBe('p1')
+    // 出站只带 mime+data，name/preview 留给气泡芯片。
+    expect(JSON.parse(calls[0].args[4])).toEqual([{ mime: 'image/png', data: 'AAAA' }])
+  })
+
+  it('附图发送后 agent:message 用户气泡挂上芯片字段', async () => {
+    const { app } = makeApp({ Ask: async () => undefined })
+    install({ runtime: rt, app })
+    bindEvents()
+    store.currentHostId = 'h1'
+    store.currentSessionId = 's9'
+    store.sessions = {
+      h1: [{ id: 's9', name: '图', turns: 1, archivedTurns: 0, isDefault: false }]
+    }
+    store.llmProfiles = [{ id: 'p1', name: 'vision', model: 'm', active: true, supportsVision: true }]
+    await ask('看图', [{
+      mime: 'image/png',
+      data: 'AAAA',
+      name: 'Clipboard_Screenshot.png',
+      preview: 'data:image/png;base64,AAAA'
+    }])
+    rt.emit('agent:message', { role: 'user', content: '看图' })
+    const user = store.entries.find(e => e.kind === 'user')
+    expect(user).toBeTruthy()
+    expect(user.images).toHaveLength(1)
+    expect(user.images[0].name).toBe('Clipboard_Screenshot.png')
+    expect(user.images[0].preview).toContain('data:image/png')
   })
 
   it('未命名空会话首次发送：用首条消息起名，且不灌系统气泡', async () => {
@@ -639,6 +695,16 @@ describe('stop 中断', () => {
     expect(sys.kind).toBe('system')
     expect(sys.content).toBe('已中断本轮任务。')
     expect(calls.filter(c => c.name === 'Stop')).toHaveLength(1)
+  })
+
+  it('silent 中断不落「已中断」回执（换模型停轮用）', async () => {
+    const { app, calls } = makeApp()
+    install({ runtime: rt, app })
+    store.running = true
+    await stop({ silent: true })
+    expect(calls.filter(c => c.name === 'Stop')).toHaveLength(1)
+    expect(store.running).toBe(false)
+    expect(store.entries).toHaveLength(0)
   })
 
   // 后端 Stop() 对「本来就没在跑」是静默空操作：回合可能恰好在点击前一瞬

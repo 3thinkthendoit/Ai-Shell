@@ -240,7 +240,10 @@ const streamingNow = computed(() => store.entries.some(e => e.streaming))
 // 界面只能显示一条看不懂的 400。有了它，用户能提前看到「已经 87% 了」。
 const ctxUsage = computed(() => {
   const { tokens, window: win, messages } = store.contextUsage
-  if (!tokens) return { text: '', level: '', title: '' }
+  // 与对话页一致：无用量时也占位常显，有上一轮数据则保持到下一轮覆盖。
+  if (!tokens) {
+    return { text: t('console.ctx.idle'), level: 'idle', title: t('console.ctx.idleTitle') }
+  }
   const text = t('console.ctx.about', { n: fmtTokens(tokens) })
   if (!win) {
     return { text, level: 'unknown', title: t('console.ctx.unknown') }
@@ -437,7 +440,7 @@ async function onSwitchModel(id) {
   if (!id || id === activeProfileId.value) return
   // 任务中途换模型：先中断本轮，避免 lane 占着导致下一轮发不出去。
   if (store.running || store.busy) {
-    await stop()
+    await stop({ silent: true })
   }
   const prev = store.selectedProfileId
   store.selectedProfileId = id
@@ -1361,7 +1364,8 @@ onBeforeUnmount(() => {
 .ctx-usage.mid { color: var(--warn); background: var(--warn-bg); }
 .ctx-usage.warn { color: var(--warn); background: var(--warn-bg); font-weight: 600; }
 .ctx-usage.danger { color: var(--danger); background: var(--danger-bg); font-weight: 600; }
-.ctx-usage.unknown { color: var(--text-3); }
+.ctx-usage.unknown,
+.ctx-usage.idle { color: var(--text-3); }
 .composer-sep { width: 1px; height: 18px; background: var(--border); margin: 0 4px; flex-shrink: 0; }
 .grow-hint { margin-left: auto; }
 </style>

@@ -475,7 +475,7 @@ describe('ChatPanel 模型菜单', () => {
     expect(input.element.value).toBe('')
   })
 
-  it('运行中换模型 → 先 Stop 再切换，之后可发送', async () => {
+  it('运行中换模型 → 先 Stop 再切换，之后可发送；不灌「已中断」', async () => {
     store.hosts = [{ id: 'h1', name: 'web', user: 'root', addr: '10.0.0.1' }]
     store.currentHostId = 'h1'
     store.currentSessionId = 'default'
@@ -497,6 +497,7 @@ describe('ChatPanel 模型菜单', () => {
     expect(calls.some(c => c.name === 'Stop')).toBe(true)
     expect(store.running).toBe(false)
     expect(store.selectedProfileId).toBe('p2')
+    expect(store.entries.some(e => e.kind === 'system' && /中断/.test(e.content || ''))).toBe(false)
     const input = wrapper.find('.composer-input')
     await input.setValue('换模型后续跑')
     await wrapper.find('.send-btn').trigger('click')
@@ -504,6 +505,36 @@ describe('ChatPanel 模型菜单', () => {
     const asks = calls.filter(c => c.name === 'Ask')
     expect(asks).toHaveLength(1)
     expect(asks[0].args[3]).toBe('p2')
+  })
+
+  it('缺模型打开菜单后关掉 → 之后中途换模型不自动发送', async () => {
+    store.hosts = [{ id: 'h1', name: 'web', user: 'root', addr: '10.0.0.1' }]
+    store.currentHostId = 'h1'
+    store.currentSessionId = 'default'
+    store.llmProfiles = []
+    store.selectedProfileId = ''
+    mountChat()
+    const input = wrapper.find('.composer-input')
+    await input.setValue('继续任务')
+    await wrapper.find('.send-btn').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('.model-menu').exists()).toBe(true)
+    document.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+    await nextTick()
+    expect(wrapper.find('.model-menu').exists()).toBe(false)
+    store.llmProfiles = [
+      { id: 'p1', name: 'deepseek', model: 'v4', active: true },
+      { id: 'p2', name: '国外', model: 'flash', active: false }
+    ]
+    store.selectedProfileId = 'p1'
+    await nextTick()
+    await wrapper.find('.model-pill').trigger('click')
+    await nextTick()
+    await wrapper.findAll('.model-menu-item')[1].trigger('click')
+    await flushPromises()
+    expect(store.selectedProfileId).toBe('p2')
+    expect(calls.filter(c => c.name === 'Ask')).toHaveLength(0)
+    expect(input.element.value).toBe('继续任务')
   })
 
   it('无模型被拦住后选模型 → 自动续发', async () => {
@@ -616,6 +647,38 @@ describe('ChatPanel 运行态（发送钮变中断）', () => {
   })
 })
 
+describe('ChatPanel 上下文圆环', () => {
+  it('无消息时空闲态；有时间线时按本地估算显示，不必等发送', async () => {
+    store.hosts = [{ id: 'h1', name: 'web', user: 'root', addr: '10.0.0.1' }]
+    store.currentHostId = 'h1'
+    store.currentSessionId = 'default'
+    store.llmProfiles = [{ id: 'p1', name: '国外', model: 'deepseek-v4.1-flash', active: true }]
+    store.selectedProfileId = 'p1'
+    store.contextUsage = { tokens: 0, window: 0, messages: 0, model: '' }
+    mountChat()
+    expect(wrapper.find('.ctx-ring-wrap').exists()).toBe(true)
+    expect(wrapper.find('.ctx-ring-btn.idle').exists()).toBe(true)
+    push({ kind: 'user', content: '看看磁盘占用情况并给出建议' })
+    push({ kind: 'assistant', content: '磁盘检查结果：根分区已使用 72%。' })
+    await nextTick()
+    expect(wrapper.find('.ctx-ring-btn.idle').exists()).toBe(false)
+    expect(wrapper.find('.ctx-ring-wrap').exists()).toBe(true)
+    // deepseek → 128K 窗口，本地估算应画出占比环
+    expect(wrapper.find('.ctx-ring-btn.ok, .ctx-ring-btn.mid, .ctx-ring-btn.unknown').exists()).toBe(true)
+  })
+
+  it('有本轮 agent:context 时优先用服务端估算', async () => {
+    store.hosts = [{ id: 'h1', name: 'web', user: 'root', addr: '10.0.0.1' }]
+    store.currentHostId = 'h1'
+    store.currentSessionId = 'default'
+    mountChat()
+    push({ kind: 'user', content: 'hi' })
+    store.contextUsage = { tokens: 8500, window: 128000, messages: 12, model: 'm' }
+    await nextTick()
+    expect(wrapper.find('.ctx-ring-btn.ok').exists()).toBe(true)
+  })
+})
+
 describe('ChatPanel 消息操作', () => {
   it('用户气泡显示时间与复制/编辑/重发；编辑写入输入框', async () => {
     store.hosts = [{ id: 'h1', name: 'web', user: 'root', addr: '10.0.0.1' }]
@@ -662,7 +725,8 @@ describe('ChatPanel 消息操作', () => {
     const tokens = wrapper.find('.msg-tokens')
     expect(tokens.exists()).toBe(true)
     expect(tokens.text()).toContain('tokens')
-    expect(tokens.text()).toMatch(/12K|上下文/)
+    expect(tokens.text()).toMatch(/输入约.*12K/)
+    expect(tokens.text()).toMatch(/输出约/)
   })
 })
 

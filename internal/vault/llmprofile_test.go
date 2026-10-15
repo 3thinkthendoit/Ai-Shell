@@ -90,16 +90,30 @@ func TestSaveAndActivateProfile(t *testing.T) {
 func TestSaveProfileKeepsEmptyFieldsOnEdit(t *testing.T) {
 	v := newTestVault(t)
 
-	if err := v.SaveLLMProfile(LLMProfile{ID: "p1", Name: "a", BaseURL: "https://x/v1", Model: "m1"}, nil); err != nil {
+	if err := v.SaveLLMProfile(LLMProfile{ID: "p1", Name: "a", BaseURL: "https://x/v1", Model: "m1", ContextWindow: 128000}, nil); err != nil {
 		t.Fatal(err)
 	}
 	// 编辑时 Base URL / 模型名留空 = 保留原值（与 SetLLM 的语义一致）。
-	if err := v.SaveLLMProfile(LLMProfile{ID: "p1", Name: "a2"}, nil); err != nil {
+	if err := v.SaveLLMProfile(LLMProfile{ID: "p1", Name: "a2", ContextWindow: 128000}, nil); err != nil {
 		t.Fatal(err)
 	}
 	p, _ := v.LLMProfile("p1")
 	if p.BaseURL != "https://x/v1" || p.Model != "m1" || p.Name != "a2" {
 		t.Fatalf("编辑留空的字段应保留原值，实得 %+v", p)
+	}
+	if p.ContextWindow != 128000 {
+		t.Fatalf("上下文窗口应保留，实得 %d", p.ContextWindow)
+	}
+	views := v.LLMProfiles()
+	var view LLMProfileView
+	for _, x := range views {
+		if x.ID == "p1" {
+			view = x
+			break
+		}
+	}
+	if view.ContextWindow != 128000 {
+		t.Fatalf("下发视图应带上 ContextWindow，实得 %+v", view)
 	}
 
 	// 校验：名称与 ID 必填。
@@ -108,6 +122,35 @@ func TestSaveProfileKeepsEmptyFieldsOnEdit(t *testing.T) {
 	}
 	if err := v.SaveLLMProfile(LLMProfile{ID: "p9", Name: "  "}, nil); err == nil {
 		t.Fatal("空名称应被拒绝")
+	}
+}
+
+func TestSaveProfilePartialKeepsWindowAndVision(t *testing.T) {
+	v := newTestVault(t)
+	if err := v.SaveLLMProfile(LLMProfile{
+		ID: "p1", Name: "a", BaseURL: "https://x/v1", Model: "m1",
+		ContextWindow: 128000, SupportsVision: true,
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	// 只改名、不带地址/模型：窗口与 vision 不得被零值清掉。
+	if err := v.SaveLLMProfile(LLMProfile{ID: "p1", Name: "renamed"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := v.LLMProfile("p1")
+	if p.Name != "renamed" || p.ContextWindow != 128000 || !p.SupportsVision {
+		t.Fatalf("部分更新应保留窗口与 vision，实得 %+v", p)
+	}
+	// 完整保存（带地址）时 0 / false 仍表示显式关掉。
+	if err := v.SaveLLMProfile(LLMProfile{
+		ID: "p1", Name: "renamed", BaseURL: "https://x/v1", Model: "m1",
+		ContextWindow: 0, SupportsVision: false,
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	p, _ = v.LLMProfile("p1")
+	if p.ContextWindow != 0 || p.SupportsVision {
+		t.Fatalf("完整保存应能清掉窗口与 vision，实得 %+v", p)
 	}
 }
 

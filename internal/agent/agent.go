@@ -363,6 +363,9 @@ func (a *Agent) remember(hostID, sessionID string, turn []llm.Message, l session
 	stored := make([]llm.Message, len(turn))
 	copy(stored, turn)
 	for i := range stored {
+		// 附图永不落盘：Parts 若被误带进 turn，Marshal 成数组后再 Unmarshal
+		// 进 Content string 会直接弄坏会话加载。
+		stored[i].Parts = nil
 		if stored[i].Role == "tool" {
 			stored[i].Content = clipForHistory(stored[i].Content, l.toolByte)
 		}
@@ -768,7 +771,7 @@ var approvalTimeout = 5 * time.Minute
 // 非空时按 ID 解析（见 Vault.LLMFor）—— 这样「用哪个模型」可以**随请求下发**，
 // 用户在下拉框里选了哪套，这一轮就用哪套，而不是只能依赖全局的激活指针。
 // 整轮固定这一套：同一轮里不会中途换模型。
-func (a *Agent) Run(parent context.Context, hostID, sessionID, prompt, profileID string) error {
+func (a *Agent) Run(parent context.Context, hostID, sessionID, prompt, profileID string, images []ImageIn) error {
 	sessionID = normalizeSessionID(sessionID)
 
 	a.mu.Lock()
@@ -800,6 +803,10 @@ func (a *Agent) Run(parent context.Context, hostID, sessionID, prompt, profileID
 		a.emit(EvError, map[string]string{"message": "所选服务商已不存在（可能已被删除），请刷新后重试。"})
 		return fmt.Errorf("LLM 服务商不存在: %s", profileID)
 	}
+	if len(images) > 0 && !settings.SupportsVision {
+		a.emit(EvError, map[string]string{"message": "当前方案未声明支持视觉（vision），请先在设置中开启"})
+		return fmt.Errorf("方案未声明 vision")
+	}
 	if apiKey == "" && !isLocalEndpoint(settings.BaseURL) {
 		a.emit(EvError, map[string]string{"message": "尚未配置 LLM API Key，请先到「设置」里填写"})
 		return fmt.Errorf("未配置 LLM API Key")
@@ -813,12 +820,19 @@ func (a *Agent) Run(parent context.Context, hostID, sessionID, prompt, profileID
 	// 且按**本机**取 —— 别的机器设了独立上限不影响这一轮。
 	limits := limitsFrom(pol, hostID)
 
+	// 方案显示名：写入本轮身份说明，避免切模型后历史里的旧自称盖过真实 API 模型。
+	profileName := profileDisplayName(a.v, profileID)
+
 	// 该会话的历史上下文。系统提示每轮重建（主机列表是实时的），
 	// 所以它不存进历史，只作为第一条。
 	hist := a.historyFor(hostID, sessionID)
 	summary := a.sessionSummaryFor(hostID, sessionID)
 	msgs := make([]llm.Message, 0, len(hist)+3)
-	msgs = append(msgs, llm.Message{Role: "system", Content: systemPrompt(a.v, pol.AllowCrossHost, hostID)})
+	// 身份说明并进首条 system（不另开一条，以免破坏「system ≤ 2」的约定）：
+	// 用户切到 DeepSeek 后仍问「你是什么模型」时，历史里「我是商量」会强烈污染，
+	// 必须每轮用本轮真实 model 盖掉。
+	sys := systemPrompt(a.v, pol.AllowCrossHost, hostID) + "\n\n" + modelIdentityNote(settings.Model, profileName)
+	msgs = append(msgs, llm.Message{Role: "system", Content: sys})
 	// 摘要作为**第二条 system 消息**，排在历史之前。
 	//
 	// 为什么单独一条而不并进系统提示：系统提示是从 vault 实时重建的，
@@ -830,21 +844,37 @@ func (a *Agent) Run(parent context.Context, hostID, sessionID, prompt, profileID
 	if summary != "" {
 		msgs = append(msgs, llm.Message{Role: "system", Content: summary})
 	}
+	// 历史只含文本（附图从不落盘）；当前用户轮才可能带 Parts。
 	msgs = append(msgs, hist...)
-	msgs = append(msgs, llm.Message{Role: "user", Content: prompt})
+	userMsg := UserMessageWithImages(prompt, images)
+	msgs = append(msgs, userMsg)
 
 	// 本轮完整消息链（含提问）。跑出终局回答后整轮记入会话历史。
-	turn := []llm.Message{{Role: "user", Content: prompt}}
+	// 历史只存纯文本 Content，不存 Parts —— 「当前轮」约束。
+	turn := []llm.Message{{Role: "user", Content: userMsg.Content}}
 
-	a.emit(EvMessage, map[string]string{"role": "user", "content": prompt})
+	a.emit(EvMessage, map[string]string{"role": "user", "content": userMsg.Content})
+	// 尽早把本轮真实 model 推给界面（思考占位 / 流式气泡），别等终局 message。
+	ctxWindow := contextWindowOf(a.v, profileID, settings.Model)
+	a.emit(EvContext, map[string]any{
+		"tokens":   estimateRequestTokens(msgs),
+		"window":   ctxWindow,
+		"model":    settings.Model,
+		"messages": len(msgs),
+		"profile":  profileName,
+	})
 
+	auditNote := "模型 " + settings.Model + "，方案「" + profileName + "」，策略模式 " + string(pol.Mode) +
+		fmt.Sprintf("，本轮上下文 %d 条历史消息%s", len(hist), summaryNote(summary))
+	if n := len(images); n > 0 {
+		auditNote += fmt.Sprintf("，附图 %d 张", n)
+	}
 	a.log(audit.Entry{
 		Kind:     audit.KindAgentRun,
 		HostID:   hostID,
 		HostName: hostNameOf(a.v, hostID),
-		Command:  clipText(prompt, 500),
-		Note: "模型 " + settings.Model + "，策略模式 " + string(pol.Mode) +
-			fmt.Sprintf("，本轮上下文 %d 条历史消息%s", len(hist), summaryNote(summary)),
+		Command:  clipText(userMsg.Content, 500),
+		Note:     auditNote,
 	})
 
 	for step := 0; step < pol.MaxSteps; step++ {
@@ -870,7 +900,7 @@ func (a *Agent) Run(parent context.Context, hostID, sessionID, prompt, profileID
 		// 任何 usage 可读；而流式响应多数服务端也不带 usage。见 tokenbudget.go。
 		a.emit(EvContext, map[string]any{
 			"tokens":   estimateRequestTokens(msgs),
-			"window":   contextWindowFor(settings.Model),
+			"window":   ctxWindow,
 			"model":    settings.Model,
 			"messages": len(msgs),
 		})
@@ -1256,6 +1286,44 @@ func formatResult(r sshclient.Result) string {
 func isLocalEndpoint(baseURL string) bool {
 	l := strings.ToLower(baseURL)
 	return strings.Contains(l, "localhost") || strings.Contains(l, "127.0.0.1") || strings.Contains(l, "0.0.0.0")
+}
+
+// profileDisplayName 解析本轮方案的显示名（空 profileID → 当前激活方案）。
+func profileDisplayName(v *vault.Vault, profileID string) string {
+	id := strings.TrimSpace(profileID)
+	if id != "" {
+		if p, ok := v.LLMProfile(id); ok {
+			return strings.TrimSpace(p.Name)
+		}
+		return id
+	}
+	for _, p := range v.LLMProfiles() {
+		if p.Active {
+			return strings.TrimSpace(p.Name)
+		}
+	}
+	return ""
+}
+
+// modelIdentityNote 写入本轮真实 API 模型，压过历史对话里的旧自称。
+func modelIdentityNote(model, profileName string) string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return "【本轮模型】未能解析 API 模型名；若用户询问身份，请说明当前配置未知。"
+	}
+	profileName = strings.TrimSpace(profileName)
+	if profileName != "" {
+		return fmt.Sprintf(
+			"【本轮模型】当前 LLM 方案「%s」，实际调用的 API 模型是「%s」。"+
+				"若用户询问你是什么模型/哪个服务商，必须按本条回答；历史对话中过时的自称一律忽略。",
+			profileName, model,
+		)
+	}
+	return fmt.Sprintf(
+		"【本轮模型】实际调用的 API 模型是「%s」。"+
+			"若用户询问你是什么模型/哪个服务商，必须按本条回答；历史对话中过时的自称一律忽略。",
+		model,
+	)
 }
 
 func systemPrompt(v *vault.Vault, allowCrossHost bool, hostID string) string {

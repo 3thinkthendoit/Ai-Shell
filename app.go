@@ -381,12 +381,14 @@ func (a *App) ForgetHostKey(id string) error {
 // SaveLLMProfileRequest 是新增/编辑一套 LLM 方案的入参。
 // ID 为空表示新增（后端生成 ID）；API Key 为空表示保持原值。
 type SaveLLMProfileRequest struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	BaseURL  string `json:"baseUrl"`
-	Model    string `json:"model"`
-	APIKey   string `json:"apiKey"`
-	ClearKey bool   `json:"clearKey"`
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	BaseURL        string `json:"baseUrl"`
+	Model          string `json:"model"`
+	ContextWindow  int    `json:"contextWindow"` // 0 = 自动按模型名推断
+	SupportsVision bool   `json:"supportsVision"`
+	APIKey         string `json:"apiKey"`
+	ClearKey       bool   `json:"clearKey"`
 }
 
 // SaveLLMProfile 新增或更新一套 LLM 配置方案，返回保存后的视图
@@ -420,7 +422,14 @@ func (a *App) SaveLLMProfile(req SaveLLMProfileRequest) (vault.LLMProfileView, e
 		key = &k
 	}
 
-	p := vault.LLMProfile{ID: id, Name: req.Name, BaseURL: base, Model: req.Model}
+	win := req.ContextWindow
+	if win < 0 {
+		win = 0
+	}
+	p := vault.LLMProfile{
+		ID: id, Name: req.Name, BaseURL: base, Model: req.Model,
+		ContextWindow: win, SupportsVision: req.SupportsVision,
+	}
 	if err := a.v.SaveLLMProfile(p, key); err != nil {
 		return vault.LLMProfileView{}, err
 	}
@@ -1251,11 +1260,18 @@ func (a *App) DeleteSession(hostID, sessionID string) error {
 // 非空时必须是**已存在**的方案，否则直接报错 —— 静默回落到激活方案会让
 // 用户以为自己选的那套在跑，实际却是另一套，和 TestLLMProfile 同一个理由。
 // 有了它，「选哪套就用哪套」是随请求下发的，不依赖「先切全局、下一轮生效」。
-func (a *App) Ask(hostID, sessionID, prompt, profileID string) error {
+//
+// imagesJSON 是可选附图（[{mime,data}] 的 JSON）；空串表示无图。
+// 图片只进入当前轮 LLM 请求，不写审计、不进会话历史。
+func (a *App) Ask(hostID, sessionID, prompt, profileID, imagesJSON string) error {
 	if err := a.ready(); err != nil {
 		return err
 	}
-	if strings.TrimSpace(prompt) == "" {
+	imgs, err := agent.ParseImagesJSON(imagesJSON)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(prompt) == "" && len(imgs) == 0 {
 		return fmt.Errorf("请输入内容")
 	}
 	if a.ag == nil {
@@ -1265,6 +1281,15 @@ func (a *App) Ask(hostID, sessionID, prompt, profileID string) error {
 	if pid != "" {
 		if _, ok := a.v.LLMProfile(pid); !ok {
 			return fmt.Errorf("所选服务商已不存在（可能已被删除），请刷新后重试。")
+		}
+	}
+	if len(imgs) > 0 {
+		settings, _, ok := a.v.LLMFor(pid)
+		if !ok {
+			return fmt.Errorf("所选服务商已不存在（可能已被删除），请刷新后重试。")
+		}
+		if !settings.SupportsVision {
+			return fmt.Errorf("当前方案未声明支持视觉（vision）。请到「设置 → LLM」勾选「支持视觉 / 图片输入」后再发送图片。")
 		}
 	}
 	// 先占 lane，再查 Running：避免「查 Running 通过 → shell 插入 → 再占 lane」的窗口，
@@ -1290,7 +1315,7 @@ func (a *App) Ask(hostID, sessionID, prompt, profileID string) error {
 		// Run 的错误路径自身会 emit EvError（见 agent.go），这里不需要再发。
 		// 转发的是已 TrimSpace 的 pid：校验用的值与 Run 实际拿到的是同一个，
 		// 空白串一律按「未指定」处理，不会出现「校验跳过、字面转发」的错位。
-		_ = a.ag.Run(a.ctx, hostID, sessionID, prompt, pid)
+		_ = a.ag.Run(a.ctx, hostID, sessionID, prompt, pid, imgs)
 	}()
 	return nil
 }

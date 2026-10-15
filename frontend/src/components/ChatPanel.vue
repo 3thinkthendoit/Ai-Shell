@@ -9,9 +9,10 @@ import {
 import { providerBadge } from '../providerLogos'
 import { formatHostLabel, maskHostAddr } from '../hostDisplay'
 import { renderMarkdown } from '../markdown'
-import { assistantTokenStats, formatTokenCount } from '../tokenEstimate'
+import { assistantTokenStats, formatTokenCount, estimateSessionContext, resolveContextWindow } from '../tokenEstimate'
 import { i18n, t } from '../i18n'
 import logoSrc from '../assets/logo.svg'
+import ImageChip from './ImageChip.vue'
 
 // Agent 对话页：首页对话框 + 气泡时间线（思考过程 / 工具调用）。
 // 终端页仍保留原有 Agent+Shell 分流；本组件是对话优先的第二条入口。
@@ -19,6 +20,9 @@ import logoSrc from '../assets/logo.svg'
 const emit = defineEmits(['page', 'term', 'cmd-detail'])
 
 const draft = ref('')
+/** @type {import('vue').Ref<Array<{id:string,mime:string,data:string,preview:string,name:string}>>} */
+const pendingImages = ref([])
+const dragOver = ref(false)
 const inputEl = ref(null)
 const logEl = ref(null)
 const showHostPicker = ref(false)
@@ -131,10 +135,19 @@ const viewingActiveRun = computed(() => {
 const showThinkingPlaceholder = computed(() =>
   viewingActiveRun.value && !store.pending && !streamingNow.value
 )
-// 审批卡也只出现在「正在看的那一轮」，避免新建页被其它任务的批准条撑开。
-const showApprovalHere = computed(() =>
-  !!store.pending && viewingActiveRun.value
-)
+// 审批卡：跟「当前焦点是否就是这条待批所属会话」对齐，不依赖 running。
+// running 在审批等待期可能已非 thinking，绑 running 会把批准条整段藏掉。
+const showApprovalHere = computed(() => {
+  if (!store.pending || store.freshTaskPending) return false
+  if (!store.currentHostId) return false
+  if (store.activeHostId) {
+    if (store.currentHostId !== store.activeHostId) return false
+    const cur = store.currentSessionId || 'default'
+    const act = store.activeSessionId || 'default'
+    if (cur !== act) return false
+  }
+  return true
+})
 
 const decisionLabel = d => ({ allow: t('tl.decision.allow'), confirm: t('tl.decision.confirm'), deny: t('tl.decision.deny') }[d] || d)
 const decisionClass = d => ({ allow: 'ok', confirm: 'warn', deny: 'danger' }[d] || '')
@@ -183,12 +196,13 @@ function closeMetaMenus() {
   showModelPicker.value = false
   showHostPicker.value = false
   showPolicyPicker.value = false
+  // 关掉模型菜单 = 放弃「缺模型后续发」；否则之后中途换模型会误触发自动发送。
+  sendAfterModelPick.value = false
 }
 
 function toggleModelMenu() {
   // 运行中也允许换模型（选中后会先中断本轮），任务内切换下一轮即用新模型。
   const next = !showModelPicker.value
-  if (next) sendAfterModelPick.value = false
   closeMetaMenus()
   showModelPicker.value = next
 }
@@ -210,6 +224,7 @@ function togglePolicyMenu() {
 function onDocMousedown(e) {
   if (showModelPicker.value && modelMenuRoot.value && !modelMenuRoot.value.contains(e.target)) {
     showModelPicker.value = false
+    sendAfterModelPick.value = false
   }
   if (showHostPicker.value && hostMenuRoot.value && !hostMenuRoot.value.contains(e.target)) {
     showHostPicker.value = false
@@ -267,14 +282,33 @@ const CTX_RING_R = 9
 const CTX_RING_C = 2 * Math.PI * CTX_RING_R
 
 const ctxUsage = computed(() => {
-  const { tokens, window: win, messages } = store.contextUsage
-  if (!tokens) return { tip: '', level: '', title: '', pct: 0, show: false }
+  // 优先用本轮 agent:context；空闲/重开会话时用本地时间线估一版，不必等发送。
+  let { tokens, window: win, messages } = store.contextUsage
+  let fromLocal = false
+  if (!tokens) {
+    const est = estimateSessionContext(store.entries, pendingImages.value)
+    tokens = est.tokens
+    messages = est.messages
+    fromLocal = tokens > 0
+    if (!win && fromLocal) {
+      win = resolveContextWindow(activeProfile.value || { model: store.contextUsage.model })
+    }
+  }
+  if (!tokens) {
+    return {
+      tip: t('console.ctx.idle'),
+      level: 'idle',
+      title: t('console.ctx.idleTitle'),
+      pct: 0,
+      show: true
+    }
+  }
   const used = fmtTokens(tokens)
   if (!win) {
     return {
-      tip: t('console.ctx.tipNoWin', { used }),
+      tip: fromLocal ? t('console.ctx.tipLocal', { used }) : t('console.ctx.tipNoWin', { used }),
       level: 'unknown',
-      title: t('console.ctx.unknown'),
+      title: fromLocal ? t('console.ctx.localTitle') : t('console.ctx.unknown'),
       pct: 0,
       show: true
     }
@@ -329,13 +363,17 @@ watch(scrollKey, () => scrollLog())
 async function onSwitchModel(id) {
   if (!id || id === activeProfileId.value) return
   // 本轮还在跑 / busy 时先中断，否则 lane 占着，切换后点发送会一直「上一轮仍在执行」。
+  // silent：换模型本身不是用户点的「中断」，不要再灌一条「已中断」系统提示。
   if (store.running || store.busy) {
-    await stop()
+    await stop({ silent: true })
   }
   const prev = store.selectedProfileId
   store.selectedProfileId = id
   try {
     await switchProfile(id)
+    // 切到无 vision 的方案时丢掉待发图，避免缩略图还在却发不出去。
+    const p = store.llmProfiles.find(x => x.id === id)
+    if (!p || !p.supportsVision) pendingImages.value = []
   } catch {
     store.selectedProfileId = prev
   }
@@ -386,13 +424,166 @@ async function ensureReadyToSend() {
   return true
 }
 
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024
+const MAX_PENDING_IMAGES = 3
+// 与后端 canonicalizeImageMIME 对齐；拒绝 svg 等可携带脚本的类型。
+const ALLOWED_IMAGE_MIMES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/jpg',
+  'image/webp',
+  'image/gif'
+])
+
+function isAllowedImageMime(mime) {
+  const m = String(mime || '').toLowerCase().split(';')[0].trim()
+  return ALLOWED_IMAGE_MIMES.has(m)
+}
+
+function extForImageMime(mime) {
+  const m = String(mime || '').toLowerCase()
+  if (m.includes('jpeg') || m.includes('jpg')) return 'jpg'
+  if (m.includes('webp')) return 'webp'
+  if (m.includes('gif')) return 'gif'
+  return 'png'
+}
+
+function defaultImageName(file, mime, fromClipboard) {
+  const raw = String(file && file.name ? file.name : '').trim()
+  if (raw && raw !== 'image' && raw !== 'image.png') return raw
+  const ext = extForImageMime(mime)
+  return fromClipboard ? `Clipboard_Screenshot.${ext}` : `Screenshot.${ext}`
+}
+
+function fileToPendingImage(file, { fromClipboard = false } = {}) {
+  return new Promise((resolve, reject) => {
+    if (!file || !isAllowedImageMime(file.type)) {
+      reject(new Error(t('chat.image.notImage')))
+      return
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      reject(new Error(t('chat.image.tooLarge')))
+      return
+    }
+    const reader = new FileReader()
+    reader.onload = () => {
+      const preview = String(reader.result || '')
+      const comma = preview.indexOf(',')
+      const data = comma >= 0 ? preview.slice(comma + 1) : preview
+      let mime = String(file.type || '').toLowerCase().split(';')[0].trim()
+      if (mime === 'image/jpg') mime = 'image/jpeg'
+      resolve({
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        mime,
+        data,
+        preview,
+        name: defaultImageName(file, mime, fromClipboard)
+      })
+    }
+    reader.onerror = () => reject(new Error(t('chat.image.readFail')))
+    reader.readAsDataURL(file)
+  })
+}
+
+async function addImageFiles(fileList, { fromClipboard = false } = {}) {
+  const files = Array.from(fileList || []).filter(f => f && isAllowedImageMime(f.type))
+  if (!files.length) return
+  // 与 store.ask 同口径：未声明 vision 时别先进作曲箱，避免堆了芯片发送才报错。
+  const profile = activeProfile.value
+  if (!profile || !profile.supportsVision) {
+    push({ kind: 'error', content: t('msg.needVision') })
+    return
+  }
+  const room = MAX_PENDING_IMAGES - pendingImages.value.length
+  if (room <= 0) {
+    push({ kind: 'error', content: t('chat.image.tooMany') })
+    return
+  }
+  try {
+    const added = []
+    for (const f of files.slice(0, room)) {
+      added.push(await fileToPendingImage(f, { fromClipboard }))
+    }
+    pendingImages.value = [...pendingImages.value, ...added]
+    if (files.length > room) {
+      push({ kind: 'system', content: t('chat.image.tooMany') })
+    }
+  } catch (e) {
+    push({ kind: 'error', content: e && e.message ? e.message : String(e) })
+  }
+}
+
+function removePendingImage(id) {
+  pendingImages.value = pendingImages.value.filter(x => x.id !== id)
+}
+
+function onComposerPaste(e) {
+  const items = e.clipboardData && e.clipboardData.items
+  if (!items) return
+  const files = []
+  for (const it of items) {
+    if (it.kind === 'file' && isAllowedImageMime(it.type)) {
+      const f = it.getAsFile()
+      if (f) files.push(f)
+    }
+  }
+  if (!files.length) return
+  e.preventDefault()
+  void addImageFiles(files, { fromClipboard: true })
+}
+
+/** 后端空文案附图时的占位句，消息气泡有芯片时不再重复显示。 */
+function isImageOnlyPlaceholder(content) {
+  const c = String(content || '').trim()
+  return c === '（见附图）' || c === '(see attached)' || c === '(see attached image)'
+}
+
+function userBubbleText(it) {
+  const c = String(it?.content || '')
+  if (it?.images?.length && isImageOnlyPlaceholder(c)) return ''
+  return c
+}
+
+function restoreImagesFromEntry(it) {
+  const imgs = Array.isArray(it?.images) ? it.images.filter(Boolean) : []
+  pendingImages.value = imgs.map((img, i) => ({
+    id: `restore-${Date.now()}-${i}`,
+    mime: img.mime || 'image/png',
+    data: img.data || '',
+    preview: img.preview || '',
+    name: img.name || `Screenshot.${extForImageMime(img.mime)}`
+  }))
+}
+
+function onComposerDragOver(e) {
+  e.preventDefault()
+  dragOver.value = true
+}
+
+function onComposerDragLeave() {
+  dragOver.value = false
+}
+
+function onComposerDrop(e) {
+  e.preventDefault()
+  dragOver.value = false
+  const files = e.dataTransfer && e.dataTransfer.files
+  void addImageFiles(files)
+}
+
 async function doSend() {
   const text = draft.value.trim()
-  if (!text) return
+  const imgs = pendingImages.value.map(({ mime, data, preview, name }) => ({
+    mime, data, preview, name
+  }))
+  if (!text && !imgs.length) return
   if (!(await ensureReadyToSend())) return
   // 仅在 ask 真正发起成功后清草稿；busy / 校验失败 / 同步拒绝都保留输入。
-  const ok = await ask(text)
-  if (ok) draft.value = ''
+  const ok = await ask(text, imgs)
+  if (ok) {
+    draft.value = ''
+    pendingImages.value = []
+  }
   scrollLog()
 }
 
@@ -453,23 +644,27 @@ async function copyMessage(it) {
 }
 
 function editMessage(it) {
-  const text = String(it?.content || '')
-  if (!text) return
-  draft.value = text
+  const text = userBubbleText(it) || String(it?.content || '')
+  if (!text && !(it?.images && it.images.length)) return
+  draft.value = isImageOnlyPlaceholder(text) ? '' : text
+  restoreImagesFromEntry(it)
   nextTick(() => {
     inputEl.value?.focus()
     const el = inputEl.value
     if (el && typeof el.setSelectionRange === 'function') {
-      const n = text.length
+      const n = draft.value.length
       el.setSelectionRange(n, n)
     }
   })
 }
 
 async function resendMessage(it) {
-  const text = String(it?.content || '').trim()
-  if (!text || store.running || store.busy) return
+  if (store.running || store.busy) return
+  const text = userBubbleText(it)
+  const hasImgs = !!(it?.images && it.images.length)
+  if (!text && !hasImgs) return
   draft.value = text
+  restoreImagesFromEntry(it)
   await doSend()
 }
 
@@ -516,12 +711,13 @@ async function onGotoTerm() {
 }
 
 function pickModel(id) {
-  showModelPicker.value = false
   const autoSend = sendAfterModelPick.value
+  // 先取出再关菜单：closeMetaMenus 会清掉 flag。
+  showModelPicker.value = false
   sendAfterModelPick.value = false
   void onSwitchModel(id).then(() => {
     // 只有「点发送时因缺模型被拦住」才自动续发；任务中途换模型保留草稿，由用户再发。
-    if (autoSend && draft.value.trim() && (store.currentHostId || store.draftHostId)) {
+    if (autoSend && (draft.value.trim() || pendingImages.value.length) && (store.currentHostId || store.draftHostId)) {
       void doSend()
     }
   })
@@ -534,6 +730,7 @@ function goHosts() {
 
 function goSettings() {
   showModelPicker.value = false
+  sendAfterModelPick.value = false
   emit('page', 'settings')
 }
 
@@ -668,7 +865,18 @@ watch(showThinkingPlaceholder, v => {
 
         <div v-else-if="it.kind === 'user'" class="msg user">
           <div class="msg-col">
-            <div class="bubble">{{ it.content }}</div>
+            <div class="bubble">
+              <div v-if="it.images && it.images.length" class="msg-images">
+                <ImageChip
+                  v-for="(img, idx) in it.images"
+                  :key="(img.name || 'img') + '-' + idx"
+                  class="preview-end"
+                  :name="img.name"
+                  :preview="img.preview"
+                />
+              </div>
+              <div v-if="userBubbleText(it)" class="msg-text">{{ userBubbleText(it) }}</div>
+            </div>
             <div class="msg-actions" :class="{ revealed: copiedMsgId === it.id }">
               <span v-if="it.ts" class="msg-time">{{ formatMsgTime(it.ts) }}</span>
               <button
@@ -708,8 +916,9 @@ watch(showThinkingPlaceholder, v => {
             <img class="asst-avatar" :src="logoSrc" alt="Ai-Shell" title="Ai-Shell" />
             <div class="asst-meta">
               <span class="asst-name">Ai-Shell</span>
-              <span v-if="it.streaming && it.content" class="asst-status">{{ t('console.reasoning.writing') }}</span>
-              <span v-else-if="it.model" class="asst-status">{{ it.model }}</span>
+              <!-- 优先显示本轮真实 API 模型（切方案后立刻可核对），写作中次之。 -->
+              <span v-if="it.model" class="asst-status">{{ it.model }}</span>
+              <span v-else-if="it.streaming && it.content" class="asst-status">{{ t('console.reasoning.writing') }}</span>
             </div>
           </div>
           <div class="asst-body">
@@ -798,6 +1007,7 @@ watch(showThinkingPlaceholder, v => {
           <img class="asst-avatar" :src="logoSrc" alt="Ai-Shell" title="Ai-Shell" />
           <div class="asst-meta">
             <span class="asst-name">Ai-Shell</span>
+            <span v-if="store.contextUsage.model" class="asst-status">{{ store.contextUsage.model }}</span>
           </div>
         </div>
         <div class="asst-body">
@@ -855,7 +1065,24 @@ watch(showThinkingPlaceholder, v => {
 
       <!-- WorkBuddy 风：单卡片 = 输入区 + 底栏（+ / 主机 / 权限 | 模型 / 发送） -->
       <div class="composer-shell">
-        <div class="composer-card">
+        <div
+          class="composer-card"
+          :class="{ 'drag-over': dragOver }"
+          @dragover="onComposerDragOver"
+          @dragleave="onComposerDragLeave"
+          @drop="onComposerDrop"
+        >
+          <div v-if="pendingImages.length" class="image-pending">
+            <ImageChip
+              v-for="img in pendingImages"
+              :key="img.id"
+              :name="img.name"
+              :preview="img.preview"
+              removable
+              :disabled="store.running || store.busy"
+              @remove="removePendingImage(img.id)"
+            />
+          </div>
           <textarea
             ref="inputEl"
             v-model="draft"
@@ -864,6 +1091,7 @@ watch(showThinkingPlaceholder, v => {
             :placeholder="t('chat.placeholder')"
             :disabled="store.running || store.busy"
             @keydown="onComposerKeydown"
+            @paste="onComposerPaste"
           />
           <div class="composer-toolbar">
             <div class="composer-left">
@@ -1081,7 +1309,7 @@ watch(showThinkingPlaceholder, v => {
                 v-else
                 type="button"
                 class="send-btn"
-                :disabled="!draft.trim()"
+                :disabled="!draft.trim() && !pendingImages.length"
                 :title="t('chat.send')"
                 @click="onSendClick"
               >
@@ -1260,6 +1488,28 @@ watch(showThinkingPlaceholder, v => {
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.04);
   padding: 16px 16px 12px;
 }
+.composer-card.drag-over {
+  border-color: var(--accent, #2563eb);
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.15);
+}
+.image-pending {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.msg-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+}
+.msg-images + .msg-text {
+  margin-top: 8px;
+}
+.msg.user .bubble:has(.msg-images):not(:has(.msg-text)) {
+  padding: 8px 10px;
+}
 /* 盖掉全局 textarea 的边框/内边距/聚焦描边，只留外层 composer-card 一圈。 */
 .composer-input {
   width: 100%;
@@ -1384,7 +1634,8 @@ watch(showThinkingPlaceholder, v => {
 .ctx-ring-btn.mid { color: #ca8a04; }
 .ctx-ring-btn.warn { color: #b45309; }
 .ctx-ring-btn.danger { color: #b91c1c; }
-.ctx-ring-btn.unknown { color: var(--text-3); }
+.ctx-ring-btn.unknown,
+.ctx-ring-btn.idle { color: var(--text-3); }
 .ctx-tip {
   position: absolute;
   left: 50%;
@@ -1788,12 +2039,14 @@ watch(showThinkingPlaceholder, v => {
 @media (hover: hover) and (pointer: fine) {
   .msg-actions {
     opacity: 0;
+    pointer-events: none;
   }
   .msg.user:hover .msg-actions,
   .msg.assistant:hover .msg-actions,
   .msg-actions:focus-within,
   .msg-actions.revealed {
     opacity: 1;
+    pointer-events: auto;
   }
 }
 .msg-time {

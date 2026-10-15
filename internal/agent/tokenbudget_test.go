@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"ai-shell/internal/llm"
+	"ai-shell/internal/vault"
 )
 
 // 中文必须比「字符数 / 4」估得高。
@@ -84,6 +85,26 @@ func TestContextWindowFor(t *testing.T) {
 		if got := contextWindowFor(c.model); got != c.want {
 			t.Errorf("contextWindowFor(%q) = %d, want %d", c.model, got, c.want)
 		}
+	}
+}
+
+func TestContextWindowOfPrefersProfileConfig(t *testing.T) {
+	t.Setenv("AISHELL_KEYFILE", "1")
+	v := vault.New(t.TempDir())
+	if err := v.Open(); err != nil {
+		t.Fatal(err)
+	}
+	key := "k"
+	if err := v.SaveLLMProfile(vault.LLMProfile{
+		ID: "p-ds", Name: "国外", BaseURL: "https://x/v1", Model: "deepseek-chat", ContextWindow: 128000,
+	}, &key); err != nil {
+		t.Fatal(err)
+	}
+	if got := contextWindowOf(v, "p-ds", "deepseek-chat"); got != 128000 {
+		t.Fatalf("应优先用方案配置 128K，实得 %d", got)
+	}
+	if got := contextWindowOf(v, "nosuch", "deepseek-chat"); got != 65536 {
+		t.Fatalf("无方案配置时应回落到模型名推断 64K，实得 %d", got)
 	}
 }
 

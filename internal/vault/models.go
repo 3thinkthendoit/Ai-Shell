@@ -144,8 +144,9 @@ func (s SessionLimits) Empty() bool {
 
 // LLMSettings 是 LLM 配置的非密钥部分。
 type LLMSettings struct {
-	BaseURL string `json:"baseUrl"` // 兼容 OpenAI 的 endpoint
-	Model   string `json:"model"`
+	BaseURL        string `json:"baseUrl"` // 兼容 OpenAI 的 endpoint
+	Model          string `json:"model"`
+	SupportsVision bool   `json:"supportsVision,omitempty"`
 }
 
 // LLMProfile 是一套可切换的 LLM 配置方案。
@@ -157,16 +158,24 @@ type LLMProfile struct {
 	Name    string `json:"name"`
 	BaseURL string `json:"baseUrl"`
 	Model   string `json:"model"`
+	// ContextWindow 是该方案宣称的上下文窗口（token）。0 = 按模型名内置表推断。
+	// 圆环占比、预警都靠它；服务商真实窗口可能不同，但必须能被用户改对。
+	ContextWindow int `json:"contextWindow,omitempty"`
+	// SupportsVision 为真时允许用户在 Agent 对话中附图（粘贴/拖拽）。
+	// 未声明则拒绝发图，避免把大图打到纯文本模型上。
+	SupportsVision bool `json:"supportsVision,omitempty"`
 }
 
 // LLMProfileView 是下发给前端的方案视图（密钥只回传「是否已配置」）。
 type LLMProfileView struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	BaseURL   string `json:"baseUrl"`
-	Model     string `json:"model"`
-	HasAPIKey bool   `json:"hasApiKey"`
-	Active    bool   `json:"active"` // 是否为当前使用的方案
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	BaseURL        string `json:"baseUrl"`
+	Model          string `json:"model"`
+	ContextWindow  int    `json:"contextWindow,omitempty"`
+	SupportsVision bool   `json:"supportsVision,omitempty"`
+	HasAPIKey      bool   `json:"hasApiKey"`
+	Active         bool   `json:"active"` // 是否为当前使用的方案
 }
 
 // LLMSettingsView 是当前激活方案的视图（密钥只回传「是否已配置」）。

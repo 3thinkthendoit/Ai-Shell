@@ -13,16 +13,20 @@ Built with [Wails v2](https://wails.io/) (Go + Vue 3).
 - **Agent session** — Dual input in one console:
   - Natural language (or a `?` prefix) → LLM agent with tools
   - Shell-like lines → written into the resident terminal after a hard-deny check (no LLM)
+- **Ops toolkit** — Beyond one-shot `run_command` / file tools, the agent can gather structured diagnostics (`collect_diagnostics`, `journal_query`, `systemd_status`, `net_listen`), take remote state snapshots and diffs (`snapshot_state` / `diff_state`), run post-change checks (`verify_checks`: service, port, file, localhost HTTP), and roll back edits via file backups (`list_file_backups` / `restore_file_backup`).
+- **Vision attachments** — When an LLM profile enables **Supports vision / image input**, paste or drop screenshots into the chat (PNG / JPEG / WebP / GIF; up to 3 images, ≤ 4 MiB each). Images go out on the current turn only — they are not written to session history or the audit trail. The composer and message bubbles show a filename chip; hover to preview.
+- **File manager** — Browse a remote host and upload / download files from the UI (32 MiB per transfer; progress + cancel).
 - **Policy engine**
   - Hard deny: login/credential paths, app credential files (`.env`, `credentials.json`), full environment dumps, destructive ops (`mkfs`, `dd of=/dev/*`, `rm -rf /`, `shutdown`, …)
   - High-risk confirm (agent-proposed commands only): delete/create/chmod, package changes, service restarts, process kills, Docker/Kubernetes mutations, …
   - LLM modes: manual (approve every tool) or read-only command whitelist
+  - Optional agent web tools (`fetch_webpage` / `search_web`) behind an explicit `allowWeb` opt-in
 - **Interactive terminal** — Full PTY for `top`, `vim`, `htop`, and other TTY programs (bypasses policy; use when you need a real terminal). Each `(host, session)` gets its own shell that is reused when you switch back, so your `cwd` and running processes stay put.
 - **Terminal snapshots into context** — A backend VT screen model tracks the PTY stream, detects when a full-screen TUI takes over, and hands the LLM the frozen final frame when the program exits. Snapshots are transient context: they never enter the session history.
 - **Sessions** — Per-host named chat sessions, encrypted on disk, with compact/clear controls. Each session keeps a three-layer memory (`turns` → deterministic `archived` summaries → optional LLM `deep` compaction).
-- **Configurable context limits** — Per-session turn count, per-tool output bytes, and total bytes are all adjustable, and each host can override any of the three individually.
+- **Configurable context limits** — Per-session turn count, per-tool output bytes, and total bytes are all adjustable, and each host can override any of the three individually. Each LLM profile can also set a `contextWindow` (or leave it auto-inferred from the model name) for the on-screen token ring.
 - **Cross-host guard** — Agent tool calls may only target the session's own host by default; cross-host execution is an explicit opt-in (defense against lateral movement).
-- **Multiple LLM profiles** — Add, edit, switch, and delete several OpenAI-compatible configurations; "Test" sends a real request and translates failures into actionable advice.
+- **Multiple LLM profiles** — Add, edit, switch, and delete several OpenAI-compatible configurations; "Test" sends a real request and translates failures into actionable advice. Vision and context-window settings are per profile.
 - **Audit log** — Encrypted, tamper-evident local trail of agent tools and human shell decisions, with a hash chain that `Verify` can check, segment rotation, and plaintext JSONL export.
 - **Output hygiene** — Redaction of secrets before LLM context (PEM keys, cloud/GitHub/Slack tokens, JWTs, connection-string passwords, `KEY=value` assignments); untrusted remote-output framing and injection heuristics.
 - **Streaming** — Token-level deltas (including reasoning content) are coalesced and pushed to the UI, with automatic fallback to non-streaming when a gateway ignores the `stream` flag.
@@ -110,27 +114,27 @@ cd frontend && npm test
 
 ```
 .
-├── app.go / app_*.go     # Wails bindings (hosts, LLM, policy, shell, PTY, sessions)
+├── app.go / app_*.go     # Wails bindings (hosts, LLM, policy, shell, PTY, sessions, files)
 ├── main.go
 ├── wails.json
 ├── frontend/             # Vue 3 + Vite UI
 └── internal/
-    ├── agent/            # LLM tool loop, session memory, compaction, persistence
+    ├── agent/            # LLM tool loop, vision images, ops tools, session memory, compaction
     ├── audit/            # Encrypted, hash-chained, rotating audit log
-    ├── llm/              # OpenAI-compatible chat client (streaming + fallback)
+    ├── llm/              # OpenAI-compatible chat client (streaming, multimodal, fallback)
     ├── policy/           # Deny / high-risk / whitelist / redaction / injection scan
-    ├── sshclient/        # SSH Exec + PTY + VT screen model & snapshotter
+    ├── sshclient/        # SSH Exec + PTY + VT screen model & snapshotter + file transfer
     ├── sshtest/          # Fake SSH server for tests
-    └── vault/            # Encrypted settings, host secrets, LLM profiles
+    └── vault/            # Encrypted settings, host secrets, LLM profiles, policy
 ```
 
 ## Configuration
 
-On first launch the app creates a config directory (platform-specific) for the vault, sessions, and audit log. Configure:
+On first launch the app creates a config directory (platform-specific) for the vault, sessions, and audit log — typically `{UserConfigDir}/Ai-Shell` (e.g. `%AppData%\Ai-Shell` on Windows), with fallbacks to `~/.ai-shell` or a directory next to the executable. The UI shows the active path and key-protection level. Configure:
 
-1. **LLM** — Base URL, model, API key (OpenAI-compatible endpoints). You can keep several profiles and switch the active one at any time; the change takes effect on the next turn without a restart.
+1. **LLM** — Base URL, model, API key (OpenAI-compatible endpoints). Optional per-profile **context window** and **Supports vision / image input**. You can keep several profiles and switch the active one at any time; the change takes effect on the next turn without a restart.
 2. **Hosts** — Address, user, auth method, tags, and notes.
-3. **Policy** — Manual vs whitelist mode; edit the read-only command library used by the agent.
+3. **Policy** — Manual vs whitelist mode; edit the read-only command library used by the agent; optionally enable `allowWeb` for webpage fetch / web search tools.
 4. **Context limits** — Session turns, stored tool-output bytes, and total bytes. Each host can override any of the three individually; leaving a field empty inherits the global value.
 
 All state (vault, sessions, audit log) is encrypted with the same master key. Set `AISHELL_KEYFILE=1` to force the key-file fallback when no keychain daemon is available (headless Linux, CI).
@@ -142,6 +146,7 @@ All state (vault, sessions, audit log) is encrypted with the same master key. Se
 - Agent/tool paths cannot read protected paths (e.g. `/etc/shadow`, `~/.ssh`, `.env`).
 - Remote output is treated as untrusted data: it is redacted, bounded, and wrapped in explicit `<<<UNTRUSTED_REMOTE_OUTPUT>>>` markers, and injection heuristics flag common manipulation phrases. The system prompt tells the model to report suspected injections rather than obey them.
 - What you see is not what the LLM sees — you get the raw output, the model gets the sanitized payload.
+- User-attached images are mime- and magic-byte validated (SVG rejected), size-capped, and never persisted to session history or audit.
 - Interactive terminal is powerful and unrestricted — treat it like a normal SSH session.
 - Soften trust in remote command output when feeding the LLM; hard denials remain the last line of defense.
 

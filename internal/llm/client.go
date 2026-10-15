@@ -19,13 +19,17 @@ import (
 )
 
 // Message 是一条对话消息。
+//
+// Content 仍是纯文本字段（历史、工具结果、助手回复）；若 Parts 非空，
+// 发往 LLM 时由 MarshalJSON 把 content 写成多模态数组（见 content.go）。
 type Message struct {
-	Role      string `json:"role"`
-	Content   string `json:"content,omitempty"`
-	Reasoning string `json:"reasoning_content,omitempty"` // 推理型模型的思考内容（仅展示用，不入上下文）
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string `json:"tool_call_id,omitempty"`
-	Name      string `json:"name,omitempty"`
+	Role       string        `json:"role"`
+	Content    string        `json:"content,omitempty"`
+	Parts      []ContentPart `json:"-"`                     // 仅出站；不参与标准反序列化
+	Reasoning  string        `json:"reasoning_content,omitempty"` // 推理型模型的思考内容（仅展示用，不入上下文）
+	ToolCalls  []ToolCall    `json:"tool_calls,omitempty"`
+	ToolCallID string        `json:"tool_call_id,omitempty"`
+	Name       string        `json:"name,omitempty"`
 }
 
 // ToolCall 是模型请求调用某个工具。

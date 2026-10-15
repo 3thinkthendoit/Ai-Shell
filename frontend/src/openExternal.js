@@ -46,8 +46,8 @@ export function installExternalLinkGuard() {
     'click',
     e => {
       if (e.defaultPrevented) return
+      // 左键（含 Ctrl/Meta/Shift/Alt 修饰）：WebView 里任何默认导航都会整页跳走难回，一律外开。
       if (e.button !== 0) return
-      if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
       const a = e.target && e.target.closest ? e.target.closest('a[href]') : null
       if (!a) return
       const href = a.getAttribute('href') || ''

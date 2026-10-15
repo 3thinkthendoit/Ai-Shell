@@ -79,7 +79,7 @@ export const store = reactive({
 
   // contextUsage 是最近一次请求的上下文用量（估算值，见 internal/agent/tokenbudget.go）。
   // window 为 0 表示后端认不出该模型的上下文窗口 —— 此时只显示 token 数，不显示占比。
-  contextUsage: { tokens: 0, window: 0, messages: 0 },
+  contextUsage: { tokens: 0, window: 0, messages: 0, model: '' },
 
   // agentTransfer 是**模型发起**的文件传输进度（download_remote_file 工具）。
   //
@@ -571,19 +571,75 @@ export function freezeStreams() {
   }
 }
 
+// 本轮待挂到用户气泡上的附图（仅 UI；后端 agent:message 不含图）。
+// ask 成功发起后暂存，等 agent:message(role=user) 消费；失败 / done / error 清掉。
+let stagedUserImages = null
+
+function imagePreviewURL(img) {
+  if (!img) return ''
+  if (img.preview) return img.preview
+  const data = String(img.data || '')
+  if (data.startsWith('data:')) return data
+  if (data && img.mime) return `data:${img.mime};base64,${data}`
+  return ''
+}
+
+function normalizeStagedImages(images) {
+  const list = Array.isArray(images) ? images.filter(Boolean) : []
+  return list.map((img, i) => {
+    const mime = String(img.mime || 'image/png')
+    const ext = mime.includes('jpeg') || mime.includes('jpg')
+      ? 'jpg'
+      : mime.includes('webp')
+        ? 'webp'
+        : mime.includes('gif')
+          ? 'gif'
+          : 'png'
+    return {
+      mime,
+      data: img.data || '',
+      preview: imagePreviewURL(img),
+      name: String(img.name || `Screenshot.${ext}`).trim() || `Screenshot.${ext}`
+    }
+  })
+}
+
+/** 取出并清空本轮暂存附图（给 agent:message 用户气泡用）。 */
+export function takeStagedUserImages() {
+  const imgs = stagedUserImages
+  stagedUserImages = null
+  return imgs && imgs.length ? imgs : []
+}
+
+export function clearStagedUserImages() {
+  stagedUserImages = null
+}
+
 // ask 返回是否已成功发起本轮（true）—— 调用方据此决定要不要清草稿。
 // 校验失败 / busy / 后端同步拒绝一律 false，避免「输入丢了但没发出去」。
-export async function ask(prompt) {
+// images: 可选 [{mime, data, preview?, name?}]；仅 mime+data 发给模型，其余只进气泡芯片。
+export async function ask(prompt, images = []) {
   if (!store.currentHostId) {
     push({ kind: 'error', content: t('msg.needHost') })
     return false
   }
   // 对话页发送前已用弹层拦过；终端分流仍可能直接 ask —— 这里再守一道：
   // 没有当前选中的 LLM 方案就不要开跑，避免跑到一半才 agent:error。
-  const profileId = store.selectedProfileId ||
+  let profileId = store.selectedProfileId ||
     (store.llmProfiles.find(p => p.active) || {}).id || ''
   if (!profileId) {
     push({ kind: 'error', content: t('msg.needModel') })
+    return false
+  }
+  const imgs = Array.isArray(images) ? images.filter(Boolean) : []
+  if (imgs.length) {
+    const profile = store.llmProfiles.find(p => p.id === profileId)
+    if (!profile || !profile.supportsVision) {
+      push({ kind: 'error', content: t('msg.needVision') })
+      return false
+    }
+  }
+  if (!String(prompt || '').trim() && !imgs.length) {
     return false
   }
   // 若界面尚未写 selectedProfileId（仅后端 active），对齐一下，避免下拉与请求不一致。
@@ -595,13 +651,13 @@ export async function ask(prompt) {
     push({ kind: 'system', content: t('msg.busyRound') })
     return false
   }
-  store.contextUsage.tokens = 0
-  store.contextUsage.window = 0
-  store.contextUsage.messages = 0
+  // 不在开跑时清零 tokens/window：圆环要一直显示上一轮用量，等本轮 agent:context 再覆盖。
+  // 只清 model，避免思考占位短暂挂着上轮模型名。
+  store.contextUsage.model = ''
   store.running = true
   try {
     // 未命名的空会话：用首条用户消息当任务标题（与欢迎首页「先聊再起名」一致）。
-    await maybeAutoTitleSession(prompt)
+    await maybeAutoTitleSession(prompt || t('msg.imageAskTitle'))
     // 会话可能刚被 createSession / 自动起名确定：在 Ask 前再钉 active*，
     // 避免事件落到旧桶。
     store.activeHostId = store.currentHostId
@@ -609,11 +665,18 @@ export async function ask(prompt) {
     // 本轮 PTY 写入标记从零计数：上一轮结束时已消费，期间的零星写入
     // （如空回车让 shell 打新提示符）不代表「本轮 shell 自己打印过提示符」。
     ptyDirty.delete(bucketKey(store.activeHostId, store.activeSessionId))
-    // 带上「这一轮用哪套方案」：切换随请求即时生效，不再依赖全局激活指针。
-    await api().Ask(store.currentHostId, store.currentSessionId, prompt, profileId)
+    // Ask 前再读一次：自动起名等待期间用户可能刚切了模型。
+    profileId = store.selectedProfileId || profileId
+    // 附图：后端只要 mime+data；name/preview 留给用户气泡芯片悬停预览。
+    stagedUserImages = imgs.length ? normalizeStagedImages(imgs) : null
+    const imagesJSON = imgs.length
+      ? JSON.stringify(imgs.map(({ mime, data }) => ({ mime, data })))
+      : ''
+    await api().Ask(store.currentHostId, store.currentSessionId, prompt || '', profileId, imagesJSON)
     return true
   } catch (e) {
     store.running = false
+    clearStagedUserImages()
     push({ kind: 'error', content: String(e) })
     return false
   }
@@ -644,11 +707,12 @@ export async function clearSession(hostId, sessionId) {
       return
     }
     const n = (res && res.cleared) || 0
-  // 上下文已清空：用量归零，否则工具条上还挂着上一轮的「87%」——
-  // 用户会以为清空没生效。
-  store.contextUsage.tokens = 0
-  store.contextUsage.window = 0
-  store.contextUsage.messages = 0
+    // 上下文已清空：用量归零，否则工具条上还挂着上一轮的「87%」——
+    // 用户会以为清空没生效。
+    store.contextUsage.tokens = 0
+    store.contextUsage.window = 0
+    store.contextUsage.messages = 0
+    store.contextUsage.model = ''
     push({
       kind: 'system',
       content: n > 0 ? t('msg.clearDone', { n }) : t('msg.clearEmpty')
@@ -1066,10 +1130,12 @@ export async function switchProfile(id) {
   store.selectedProfileId = id
 }
 
-export async function stop() {
+// stop 中断本轮。opts.silent=true 时不灌「已中断」系统条（换模型先停一轮用）。
+export async function stop(opts = {}) {
   // 只有真的有任务在跑才落回执：后端 Stop() 对「本来就没在跑」是静默空操作
   // （agent.go：a.cancel 为 nil 就什么都不做），无条件 push 会在竞态窗口
   // （回合恰好在点击前一瞬正常收场）里留下一句「已中断」的谎话。
+  const silent = !!(opts && opts.silent)
   const wasActive = store.running || store.busy
   try {
     await api().Stop()
@@ -1078,7 +1144,7 @@ export async function stop() {
     // canceled」画成红字，等于把用户自己的操作报成错误。所以这句回执由
     // 前端补：灰字系统提示，进归档时间线；表面上的可见反馈是
     // 「Working 停止 + 输入提示符回来」（ConsolePanel 的 running watch）。
-    if (wasActive) push({ kind: 'system', content: t('msg.stopped') })
+    if (wasActive && !silent) push({ kind: 'system', content: t('msg.stopped') })
   } catch (e) {
     push({ kind: 'error', content: t('msg.stopFail', { err: e && e.message ? e.message : e }) })
   } finally {
