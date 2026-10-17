@@ -7,6 +7,7 @@ import {
   targetKey,
   targetEntries,
   freezeStreams,
+  sealAssistantStreams,
   upsertTool,
   liveAssistant,
   writeTerminal,
@@ -255,6 +256,8 @@ export function bindTerminalEvents(runtime) {
     const host = paintHost()
     const w = surfaceWrite(host)
     if (m.role !== 'assistant') {
+      // 新的一问从 step 0 重新计。先封住上一问，再落用户气泡。
+      sealAssistantStreams()
       const images = takeStagedUserImages()
       push({
         kind: 'user',
@@ -269,8 +272,10 @@ export function bindTerminalEvents(runtime) {
     if (live) {
       live.content = m.content
       if (m.model) live.model = m.model
-      live.streaming = false
       live.reasoningOpen = false
+      // 定稿后清掉 step，下一问复用同一序号时不会写回这条。
+      live.streaming = false
+      live.stream = undefined
       // 定稿时记下本步上下文估算 + 本条输出估算，供气泡底栏展示。
       live.tokensIn = store.contextUsage.tokens || live.tokensIn || 0
       live.tokensOut = estimateTokens(`${live.reasoning || ''}${m.content || ''}`)

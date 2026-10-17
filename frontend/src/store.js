@@ -536,10 +536,14 @@ function pruneTimelines(hostId, list) {
   }
 }
 
-// liveAssistant 找出某一轮正在流式生成的那条 LLM 消息。
+// liveAssistant 找出本轮仍挂着 step 的那条 LLM 消息。
 //
-// 用 step（后端给的第几轮）做标识，而不是「最后一条 assistant」——
-// 多轮工具调用里会有多条 assistant 消息，认错目标就会把内容写到错误的回答上。
+// 用 step（后端给的第几步）做标识，而不是「最后一条 assistant」——
+// 同一次提问里多轮工具调用会有多条 assistant，认错目标就会把内容写到错误的回答上。
+// step 每个用户提问都从 0 重新计。气泡定稿或下一问开始时会清掉 stream
+// （见 sealAssistant），所以已结束的上一问不会再被命中。
+// 不能只认 streaming：中断会先 freezeStreams 灭掉光标，定稿事件可能还在队列里，
+// 对不上就会再插一条完整回答，终端也会再画一遍。
 // step 缺失时必须返回 undefined：否则 e.stream === undefined 会命中所有非流式消息。
 export function liveAssistant(step) {
   if (step === undefined || step === null) return undefined
@@ -548,7 +552,28 @@ export function liveAssistant(step) {
   // step 统一成 Number：Wails/JSON 偶发字符串，严格 === 会对不上、思考增量无法挂载。
   const want = Number(step)
   if (Number.isNaN(want)) return undefined
-  return targetEntries().find(e => e.kind === 'assistant' && Number(e.stream) === want)
+  const list = targetEntries()
+  for (let i = list.length - 1; i >= 0; i--) {
+    const e = list[i]
+    // stream 必须还在。清掉后不要写成 null：Number(null) === 0，会再次命中第 0 步。
+    if (e.kind !== 'assistant' || e.stream === undefined || e.stream === null) continue
+    if (Number(e.stream) === want) return e
+  }
+  return undefined
+}
+
+// sealAssistant 结束一条助手气泡的步数身份：光标灭掉，后续同号 step 不再写入它。
+function sealAssistant(entry) {
+  if (!entry || entry.kind !== 'assistant') return
+  entry.streaming = false
+  entry.stream = undefined
+}
+
+// sealAssistantStreams 在下一问的用户消息到达时封住本时间线上所有助手气泡。
+// 中断路径可能没有定稿消息，那些气泡的 stream 还在；不封的话下一问的 step 0
+// 会接着写上一问。
+export function sealAssistantStreams() {
+  for (const e of targetEntries()) sealAssistant(e)
 }
 
 // bindEvents 注册所有后端事件。必须可安全重复调用：
@@ -563,8 +588,9 @@ export function bindEvents() {
   bindTerminalEvents(r)
 }
 
-// freezeStreams 收尾所有还在「流式中」的消息。
-// 中断或出错时流不会再有定稿消息，不清掉标记就会留下一个永远闪烁的光标。
+// freezeStreams 只灭光标，不清 step。
+// 中断或出错时若立刻丢掉步数，随后到达的定稿消息就对不上原气泡，
+// 会再插一条重复回答。步数要等这条定稿落地，或下一问的用户消息，再封住。
 export function freezeStreams() {
   for (const e of targetEntries()) {
     if (e.streaming) e.streaming = false

@@ -748,6 +748,71 @@ describe('流式输出（agent:delta）', () => {
     expect(msgs[0].streaming).toBe(false)
   })
 
+  it('下一问复用 step 0 时不改写上一问已定稿的回答', () => {
+    install({ runtime: rt, app: makeApp().app })
+    bindEvents()
+    rt.emit('agent:delta', { step: 0, text: '第一问的回答' })
+    rt.emit('agent:message', { role: 'assistant', content: '第一问的回答', step: 0 })
+    rt.emit('agent:tool', { id: 't1', name: 'run_command', command: 'ls', status: 'done' })
+    rt.emit('agent:message', { role: 'user', content: '删除了么？' })
+    rt.emit('agent:delta', { step: 0, text: '还没有删除' })
+    rt.emit('agent:message', { role: 'assistant', content: '还没有删除', step: 0 })
+
+    const msgs = store.entries.filter(e => e.kind === 'assistant')
+    expect(msgs).toHaveLength(2)
+    expect(msgs[0].content).toBe('第一问的回答')
+    expect(msgs[1].content).toBe('还没有删除')
+    const user = store.entries.findIndex(e => e.kind === 'user' && e.content === '删除了么？')
+    expect(store.entries.findIndex(e => e === msgs[1])).toBeGreaterThan(user)
+  })
+
+  it('定稿晚于中断冻结时仍改在原气泡上，不另起一条', () => {
+    install({ runtime: rt, app: makeApp().app })
+    bindEvents()
+    rt.emit('agent:delta', { step: 0, text: '部分' })
+    rt.emit('agent:done', {})
+    rt.emit('agent:message', { role: 'assistant', content: '完整回答', step: 0 })
+
+    const msgs = store.entries.filter(e => e.kind === 'assistant')
+    expect(msgs).toHaveLength(1)
+    expect(msgs[0].content).toBe('完整回答')
+    expect(msgs[0].streaming).toBe(false)
+  })
+
+  it('下一问复用 step 0 时不把思考写进上一问', () => {
+    install({ runtime: rt, app: makeApp().app })
+    bindEvents()
+    rt.emit('agent:reasoning', { step: 0, text: '先想上一问' })
+    rt.emit('agent:delta', { step: 0, text: '第一问的回答' })
+    rt.emit('agent:message', { role: 'assistant', content: '第一问的回答', step: 0 })
+    rt.emit('agent:message', { role: 'user', content: '删除了么？' })
+    rt.emit('agent:reasoning', { step: 0, text: '再想这一问' })
+    rt.emit('agent:delta', { step: 0, text: '还没有删除' })
+
+    const msgs = store.entries.filter(e => e.kind === 'assistant')
+    expect(msgs).toHaveLength(2)
+    expect(msgs[0].reasoning).toBe('先想上一问')
+    expect(msgs[0].content).toBe('第一问的回答')
+    expect(msgs[1].reasoning).toBe('再想这一问')
+    expect(msgs[1].content).toBe('还没有删除')
+  })
+
+  it('中断没有定稿时，下一问的思考也不接着写上一问', () => {
+    install({ runtime: rt, app: makeApp().app })
+    bindEvents()
+    rt.emit('agent:reasoning', { step: 0, text: '说到一半' })
+    rt.emit('agent:done', {})
+    rt.emit('agent:message', { role: 'user', content: '下一问' })
+    rt.emit('agent:reasoning', { step: 0, text: '新的思考' })
+
+    const msgs = store.entries.filter(e => e.kind === 'assistant')
+    expect(msgs).toHaveLength(2)
+    expect(msgs[0].reasoning).toBe('说到一半')
+    expect(msgs[0].streaming).toBe(false)
+    expect(msgs[1].reasoning).toBe('新的思考')
+    expect(msgs[1].content).toBe('')
+  })
+
   it('不同 step 的流各自成条，不会互相污染', () => {
     install({ runtime: rt, app: makeApp().app })
     bindEvents()
