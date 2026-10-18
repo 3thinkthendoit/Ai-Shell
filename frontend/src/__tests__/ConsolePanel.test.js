@@ -577,6 +577,42 @@ describe('ConsolePanel 表面渲染', () => {
     expect(msg.content).toBe('第一行\n第二行')
   })
 
+  it('助手 Markdown 在终端表面渲染：标题无 ##、加粗无 **', async () => {
+    await setupAttached()
+    rt.emit('agent:message', {
+      role: 'assistant',
+      content: '## 结论\n\n磁盘 **充足**，见 `df -h`。\n'
+    })
+    await nextTick()
+    const t = surfaceText()
+    expect(t).toContain('结论')
+    expect(t).not.toContain('##')
+    expect(t).toContain('充足')
+    expect(t).not.toContain('**')
+    expect(t).toContain('df -h')
+    // 归档仍保留 MD 源文（对话页 / 模型上下文用）
+    const msg = store.entries.filter(e => e.kind === 'assistant').pop()
+    expect(msg.content).toContain('## 结论')
+    expect(msg.content).toContain('**充足**')
+    expect(msg.mdAnsi).toBeUndefined()
+  })
+
+  it('流式标题憋到换行；agent:done 冲出未定稿尾行', async () => {
+    await setupAttached()
+    rt.emit('agent:delta', { step: 0, text: '## 尚' })
+    await nextTick()
+    expect(surfaceText()).not.toContain('尚未完成')
+    expect(surfaceText()).not.toContain('##')
+    rt.emit('agent:delta', { step: 0, text: '未完成' })
+    await nextTick()
+    // 仍憋着，等换行或 done
+    expect(surfaceText()).not.toContain('尚未完成')
+    rt.emit('agent:done', {})
+    await nextTick()
+    expect(surfaceText()).toContain('尚未完成')
+    expect(surfaceText()).not.toContain('##')
+  })
+
   it('工具调用实时画进活表面（非 shell 风格）', async () => {
     await setupAttached()
     rt.emit('agent:tool', {

@@ -39,6 +39,46 @@ const thinkingDots = new Map()
 const THINKING_INTERVAL_MS = 400
 const THINKING_MAX_DOTS = 4
 
+// 每轮助手正文一个 MD→ANSI 流。刻意不放进 reactive 时间线条目（避免被 Vue 代理，
+// 也避免序列化/克隆夹带不可克隆对象）。键：hostSessionKey + 步号。
+const MD_SEP = '\x01'
+const mdStreams = new Map()
+
+function mdStreamKey(hostKey, step) {
+  return `${hostKey}${MD_SEP}${Number(step)}`
+}
+
+function ensureMdStream(hostKey, step) {
+  const k = mdStreamKey(hostKey, step)
+  let s = mdStreams.get(k)
+  if (!s) {
+    s = paint.createMdAnsiStream()
+    mdStreams.set(k, s)
+  }
+  return s
+}
+
+function takeMdStream(hostKey, step) {
+  const k = mdStreamKey(hostKey, step)
+  const s = mdStreams.get(k)
+  if (s) mdStreams.delete(k)
+  return s
+}
+
+/** @param {string|null|undefined} [hostKey] 缺省 = 当前 paintHost */
+function flushMdStreamsForHost(hostKey) {
+  const host = hostKey || paintHost()
+  if (!host && host !== '') return
+  const w = surfaceWrite(host)
+  const prefix = `${host}${MD_SEP}`
+  for (const k of [...mdStreams.keys()]) {
+    if (!k.startsWith(prefix)) continue
+    const md = mdStreams.get(k)
+    mdStreams.delete(k)
+    paint.paintAssistantEnd(w, md)
+  }
+}
+
 // 输出静默检测：某块表面输出停下来之后再执行回调。
 const TERM_QUIET_MS = 400
 const quietTimers = new Map()
@@ -210,10 +250,14 @@ export function bindTerminalEvents(runtime) {
           paint.paintAssistantHeader(w, live.badge)
         }
       }
-      paint.paintAssistantDelta(w, d.text)
+      paint.paintAssistantDelta(w, d.text, ensureMdStream(host, d.step))
       return
     }
     const badge = currentModelBadge()
+    // 同 step 可能残留「上次未定稿/未 done」的渲染器（painted/buf 脏）。
+    // 新开气泡必须换新流，否则半截散文后缀会把 `## 标题` 当原文软吐出去。
+    takeMdStream(host, d.step)
+    const mdAnsi = ensureMdStream(host, d.step)
     push({
       kind: 'assistant',
       content: d.text,
@@ -223,7 +267,7 @@ export function bindTerminalEvents(runtime) {
       model: store.contextUsage.model || ''
     })
     paint.paintAssistantHeader(w, badge)
-    paint.paintAssistantDelta(w, d.text)
+    paint.paintAssistantDelta(w, d.text, mdAnsi)
   })
 
   runtime.EventsOn('agent:reasoning', d => {
@@ -256,7 +300,8 @@ export function bindTerminalEvents(runtime) {
     const host = paintHost()
     const w = surfaceWrite(host)
     if (m.role !== 'assistant') {
-      // 新的一问从 step 0 重新计。先封住上一问，再落用户气泡。
+      // 新的一问从 step 0 重新计。先冲掉上一问未定稿 MD、封住气泡，再落用户行。
+      flushMdStreamsForHost(host)
       sealAssistantStreams()
       const images = takeStagedUserImages()
       push({
@@ -273,17 +318,20 @@ export function bindTerminalEvents(runtime) {
       live.content = m.content
       if (m.model) live.model = m.model
       live.reasoningOpen = false
-      // 定稿后清掉 step，下一问复用同一序号时不会写回这条。
+      // 定稿前先取出 MD 流（步号还在）；再清 step，下一问复用同一序号时不会写回这条。
+      const md = takeMdStream(host, m.step)
       live.streaming = false
       live.stream = undefined
       // 定稿时记下本步上下文估算 + 本条输出估算，供气泡底栏展示。
       live.tokensIn = store.contextUsage.tokens || live.tokensIn || 0
       live.tokensOut = estimateTokens(`${live.reasoning || ''}${m.content || ''}`)
-      paint.paintAssistantEnd(w)
+      paint.paintAssistantEnd(w, md)
       return
     }
     const badge = m.model ? providerTermBadge({ model: m.model, name: m.model }) : currentModelBadge()
     const tokensOut = estimateTokens(m.content || '')
+    // 无 step 的整包消息：用完即弃的临时流，不进 mdStreams 表。
+    const mdAnsi = paint.createMdAnsiStream()
     push({
       kind: 'assistant',
       content: m.content,
@@ -293,8 +341,8 @@ export function bindTerminalEvents(runtime) {
       tokensOut
     })
     paint.paintAssistantHeader(w, badge)
-    paint.paintAssistantDelta(w, m.content)
-    paint.paintAssistantEnd(w)
+    paint.paintAssistantDelta(w, m.content, mdAnsi)
+    paint.paintAssistantEnd(w, mdAnsi)
   })
 
   runtime.EventsOn('agent:tool', v => {
@@ -367,6 +415,7 @@ export function bindTerminalEvents(runtime) {
     stopThinking(paintHost())
     store.pending = null
     clearStagedUserImages()
+    flushMdStreamsForHost(paintHost())
     freezeStreams()
     push({ kind: 'error', content: e.message })
     paint.paintError(surfaceWrite(paintHost()), e.message)
@@ -383,6 +432,8 @@ export function bindTerminalEvents(runtime) {
     store.pending = null
     // 正常路径已在 user message 消费；此处兜底避免异常时芯片挂到下一轮。
     clearStagedUserImages()
+    // 中断时可能没有定稿 message：把 MD 渲染器里憋着的尾行冲掉。
+    flushMdStreamsForHost(paintHost())
     freezeStreams()
   })
 

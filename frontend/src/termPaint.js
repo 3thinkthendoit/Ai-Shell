@@ -9,6 +9,9 @@
 // 自己负责补 \r\n —— 终端不像 DOM 会自动换行。
 
 import { t } from './i18n'
+import { createMdAnsiStream } from './termMarkdown.js'
+
+export { createMdAnsiStream }
 
 const RESET = '\x1b[0m'
 const DIM = '\x1b[2m'
@@ -117,12 +120,18 @@ function trueColor(hex) {
   return `\x1b[38;2;${(n >> 16) & 255};${(n >> 8) & 255};${n & 255}m`
 }
 
-// 流式增量：原样追加，不加行尾换行（模型自己会发 \n）。
-// 但必须把裸 \n 归一成 \r\n：xterm 默认 convertEol=false，裸 LF 只「下移一行、
-// 列不变」，于是每行都从上一行的结束列开始 → 阶梯状右偏、左右错乱。终端不像
-// DOM 会自动回行，这里显式补 CR。
-export function paintAssistantDelta(write, text) {
+// 流式增量：经 MD→ANSI 渲染器再写入。md 由调用方挂在本轮助手气泡上（createMdAnsiStream），
+// 缺省时退回原文 + \r\n 归一（测试/异常路径）。
+//
+// 裸 \n 必须变成 \r\n：xterm 默认 convertEol=false，裸 LF 只「下移一行、列不变」，
+// 会阶梯状右偏。渲染器内部已按 \r\n 吐出行尾。
+export function paintAssistantDelta(write, text, md) {
   if (!write) return
+  if (md && typeof md.push === 'function') {
+    const out = md.push(text)
+    if (out) write(out)
+    return
+  }
   write(String(text == null ? '' : text).replace(/\r?\n/g, '\r\n'))
 }
 
@@ -173,9 +182,14 @@ export function clearThinking(write, width) {
   write(SHOW_CURSOR + '\r' + ' '.repeat(width) + '\r')
 }
 
-// 回复定稿：补一个换行，把光标停在新一行行首。
-export function paintAssistantEnd(write) {
+// 回复定稿：冲掉 MD 渲染器里未完成的尾行，再补一个换行把光标停到下一行行首。
+// md 可空（思考→正文切换时只换行、尚无正文流）。
+export function paintAssistantEnd(write, md) {
   if (!write) return
+  if (md && typeof md.flush === 'function') {
+    const rest = md.flush()
+    if (rest) write(rest)
+  }
   nl(write, '')
 }
 
