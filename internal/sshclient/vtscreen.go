@@ -18,6 +18,7 @@ package sshclient
 import (
 	"hash/fnv"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -52,6 +53,13 @@ type Screen struct {
 	// 解析期间挂起的触发（Feed 持锁解析，钩子要在解锁后才调，
 	// 否则钩子里读 Text() 会自锁）。
 	pendCmdEnd, pendCmdEndTUI, pendAltOff bool
+	// pendExit 是刚结束那条命令的退出码（OSC 133;D;<code>）。
+	// pendExitKnown 为假表示 D 没带码，调用方不要当成失败。
+	pendExit      int
+	pendExitKnown bool
+	// scrollback 是滚出可视区的行（非全屏重绘）。read_console 靠它看到
+	// 已经不在当前 24 行里的报错。上限 screenScrollbackLines，超出丢最旧的。
+	scrollback []string
 	// cwd 是远端 shell 上报的当前工作目录（OSC 7）。空表示还没收到过。
 	//
 	// 为什么用 OSC 7 而不是「跑一条 pwd 去问」：SSH 的 Exec 是**另开一条连接**，
@@ -60,10 +68,10 @@ type Screen struct {
 	// 不起子进程）报一次，客户端就**始终**知道当前目录，不需要任何额外往返，
 	// 也不会在用户屏幕上闪一行命令回显。
 	cwd string
-	// 定格钩子：onCmdEnd 在 OSC 133;D（命令结束）时调，参数是
-	// 「这条命令是否全屏重绘过」；onAltOff 在备用屏幕释放瞬间调。
-	// 均为 nil 安全。
-	onCmdEnd func(tui bool)
+	// 定格钩子：onCmdEnd 在 OSC 133;D（命令结束）时调。
+	// tui=这条命令是否全屏重绘过；exitCode/exitKnown 来自 133;D;<code>。
+	// onAltOff 在备用屏幕释放瞬间调。均为 nil 安全。
+	onCmdEnd func(tui bool, exitCode int, exitKnown bool)
 	onAltOff func()
 	// 解析器状态：0=ground 1=esc 2=csi 3=osc
 	state   int
@@ -129,7 +137,7 @@ func (s *Screen) AltActive() bool {
 
 // SetTriggers 登记定格钩子（常驻终端用：命令结束/备用屏幕释放时
 // 把最后一帧送进快照管线）。传 nil 即摘掉。
-func (s *Screen) SetTriggers(onCmdEnd func(tui bool), onAltOff func()) {
+func (s *Screen) SetTriggers(onCmdEnd func(tui bool, exitCode int, exitKnown bool), onAltOff func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.onCmdEnd, s.onAltOff = onCmdEnd, onAltOff
@@ -273,12 +281,14 @@ func (s *Screen) Feed(p []byte) {
 		}
 	}
 	cmdEnd, cmdEndTUI, altOff := s.pendCmdEnd, s.pendCmdEndTUI, s.pendAltOff
+	exitCode, exitKnown := s.pendExit, s.pendExitKnown
 	s.pendCmdEnd, s.pendCmdEndTUI, s.pendAltOff = false, false, false
+	s.pendExit, s.pendExitKnown = 0, false
 	cmdEndFn, altOffFn := s.onCmdEnd, s.onAltOff
 	s.mu.Unlock()
 	// 钩子在锁外调：它们会回头读 Text()（拿最后一帧），持锁调必自锁。
 	if cmdEnd && cmdEndFn != nil {
-		cmdEndFn(cmdEndTUI)
+		cmdEndFn(cmdEndTUI, exitCode, exitKnown)
 	}
 	if altOff && altOffFn != nil {
 		altOffFn()
@@ -320,8 +330,31 @@ func (s *Screen) oscFinal() {
 		if s.cmdActive {
 			s.cmdActive = false
 			s.pendCmdEnd, s.pendCmdEndTUI = true, s.cmdTUI || s.altDuringCmd
+			s.pendExit, s.pendExitKnown = parseOSC133Exit(p)
 		}
 	}
+}
+
+// parseOSC133Exit 从 `133;D` / `133;D;<code>` 取出退出码。
+// 没带码或不是整数时 known=false，调用方不要当成失败命令。
+func parseOSC133Exit(p string) (code int, known bool) {
+	// p 形如 133;D 或 133;D;2 或 133;D;2;...
+	rest := strings.TrimPrefix(p, "133;D")
+	if rest == "" {
+		return 0, false
+	}
+	if !strings.HasPrefix(rest, ";") {
+		return 0, false
+	}
+	rest = rest[1:]
+	if i := strings.IndexByte(rest, ';'); i >= 0 {
+		rest = rest[:i]
+	}
+	n, err := strconv.Atoi(rest)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // parseOSC7 从 `7;file://host/path` 里取出 path。
@@ -377,9 +410,28 @@ func (s *Screen) lineDown() {
 	}
 }
 
+// screenScrollbackLines 是滚出可视区后仍保留的行数。
+// 与 read_console 的最大行数对齐：工具声称能读到滚走的输出。
+const screenScrollbackLines = 200
+
 func (s *Screen) scrollUp() {
+	// 全屏重绘（top/vim）每帧都滚，记进回滚只会灌一堆半帧。
+	// 普通流式输出（报错、日志）才值得留下。
+	if !s.alt && !s.cmdTUI {
+		s.pushScrollback(trimRightSpaces(s.cells[0]))
+	}
 	copy(s.cells, s.cells[1:])
 	s.cells[s.rows-1] = blankLine(s.cols)
+}
+
+func (s *Screen) pushScrollback(line string) {
+	if strings.TrimSpace(line) == "" {
+		return
+	}
+	s.scrollback = append(s.scrollback, line)
+	if extra := len(s.scrollback) - screenScrollbackLines; extra > 0 {
+		s.scrollback = append([]string(nil), s.scrollback[extra:]...)
+	}
 }
 
 func (s *Screen) scrollDown() {
@@ -564,9 +616,30 @@ func (s *Screen) eraseLineTo(x int) {
 //   - 光标所在行加 "> " 前缀，其余行加两空格 —— 列对齐不被破坏，
 //     模型又能知道焦点在哪行（vim 的光标位置、top 的选中行都靠它）；
 //   - 尾部全空行裁掉（top 只占半屏时不送半屏空行）。
+// TextTail 返回回滚缓冲加上当前可视区，再从尾部截到 maxLines 行。
+// maxLines<=0 表示不截。回滚行没有光标前缀；可视区仍用 Text 的 "> " 标记。
+func (s *Screen) TextTail(maxLines int) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lines := make([]string, 0, len(s.scrollback)+s.rows)
+	lines = append(lines, s.scrollback...)
+	vis := strings.TrimRight(s.textLocked(), "\n")
+	if vis != "" {
+		lines = append(lines, strings.Split(vis, "\n")...)
+	}
+	if maxLines > 0 && len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	return strings.Join(lines, "\n")
+}
+
 func (s *Screen) Text() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.textLocked()
+}
+
+func (s *Screen) textLocked() string {
 	lines := make([]string, s.rows)
 	last := -1
 	for y := 0; y < s.rows; y++ {
@@ -604,10 +677,10 @@ func trimRightSpaces(line []rune) string {
 // 哈希去重：top 每 3 秒重绘一次但内容可能没变（空闲机器），重复进上下文
 // 是纯浪费。
 //
-// 除静止触发外还有两个「定格」入口（都不等静止，因为语义上就该立即送）：
-//   - Flush：TUI 退出备用屏幕那一刻 —— top 按了 q，最后一帧就是答案本身，
-//     多等 2 秒只会让 prompt 输出把它冲掉；
-//   - Final：PTY 退出 —— 最后机会，不送就永远迷不上了。
+// 除静止触发外还有三个立即送出的入口（不等静止）：
+//   - Capture：普通命令非 0 退出 —— 可见屏上就是报错，「解释刚才的错误」靠它衔接；
+//   - Flush：TUI 退出备用屏幕 —— top 按了 q，最后一帧就是答案本身；
+//   - Final：PTY 退出 —— 最后机会，不送就永远对不上了。
 type Snapshotter struct {
 	screen *Screen
 	idle   time.Duration
@@ -679,6 +752,18 @@ func fnvSum(text string) uint64 {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(text))
 	return h.Sum64()
+}
+
+// Capture 把当前可见屏幕作为过程快照送出（final=false）。
+// 失败的普通命令用它：报错还在这一屏上，但终端并没有结束。
+func (sn *Snapshotter) Capture() {
+	sn.mu.Lock()
+	stopped := sn.stopped
+	sn.mu.Unlock()
+	if stopped {
+		return
+	}
+	sn.fire(false)
 }
 
 // Flush 立即定格送出当前画面（TUI 退出备用屏幕时调用）。

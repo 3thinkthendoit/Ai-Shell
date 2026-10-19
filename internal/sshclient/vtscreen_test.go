@@ -1,6 +1,7 @@
 package sshclient
 
 import (
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +25,27 @@ func TestScreenPlainTextAndCursorMarker(t *testing.T) {
 	// 尾部全空行裁掉：5 行的屏幕只该输出 2 行
 	if got := strings.Count(out, "\n"); got != 2 {
 		t.Fatalf("尾部空行应裁掉，期望 2 行实得 %d 行：%q", got, out)
+	}
+}
+
+func TestScreenScrollbackSurvivesViewport(t *testing.T) {
+	s := NewScreen(20, 3)
+	var b strings.Builder
+	for i := 1; i <= 8; i++ {
+		b.WriteString("line-" + strconv.Itoa(i) + "\r\n")
+	}
+	s.Feed([]byte(b.String()))
+	vis := s.Text()
+	if strings.Contains(vis, "line-1") {
+		t.Fatalf("可视区不应再含已滚走的 line-1：%q", vis)
+	}
+	tail := s.TextTail(20)
+	if !strings.Contains(tail, "line-1") || !strings.Contains(tail, "line-8") {
+		t.Fatalf("回滚应保留滚出可视区的行，实得 %q", tail)
+	}
+	short := s.TextTail(2)
+	if strings.Contains(short, "line-1") {
+		t.Fatalf("TextTail 应按行数截尾，实得 %q", short)
 	}
 }
 
@@ -279,9 +301,21 @@ func TestScreenCmdActive(t *testing.T) {
 	if !s.CmdActive() {
 		t.Fatal("命令期间的普通输出不该让出")
 	}
-	s.Feed([]byte("\x1b]133;D;0\x07")) // 命令结束（带退出码）
+	var gotTUI bool
+	var gotCode int
+	var gotKnown bool
+	var gotCalls int
+	s.SetTriggers(func(tui bool, code int, known bool) {
+		gotCalls++
+		gotTUI, gotCode, gotKnown = tui, code, known
+	}, nil)
+	s.Feed([]byte("syntax error near unexpected token\r\n"))
+	s.Feed([]byte("\x1b]133;D;2\x07")) // 命令结束（带退出码）
 	if s.CmdActive() {
 		t.Fatal("133;D 后应让出")
+	}
+	if gotCalls != 1 || gotTUI || !gotKnown || gotCode != 2 {
+		t.Fatalf("失败命令应回报退出码 2，实得 calls=%d tui=%v known=%v code=%d", gotCalls, gotTUI, gotKnown, gotCode)
 	}
 
 	// 无配对 133;C 的 133;D 忽略（注入期首屏可能出现）；重复 133;C 只算一次。

@@ -73,6 +73,14 @@ type toolCtx struct {
 
 	// http 是出网客户端，nil 表示该 Agent 没有配出网能力。
 	http httpDoer
+
+	// console 读常驻终端可见屏幕（read_console）；nil 表示不可用。
+	console consoleReader
+
+	// sessionHostID / sessionID 是本轮 Ask 所属的主机与任务，
+	// read_console 默认落到这块表面。
+	sessionHostID string
+	sessionID     string
 }
 
 // sshRunner 是工具用到的 sshclient 能力子集。抽成接口是为了让测试
@@ -101,6 +109,7 @@ func toolRegistry() []Tool {
 	return []Tool{
 		toolRevisePlanDef,
 		toolListHosts,
+		toolReadConsole,
 		toolSystemInfo,
 		toolCollectDiagnostics,
 		toolJournalQuery,

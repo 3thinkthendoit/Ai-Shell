@@ -29,7 +29,7 @@ const perMessageOverhead = 4
 
 // requestOverhead 是整次请求的固定开销（tools 定义、system 包裹等）。
 // 工具定义占大头：诊断/快照/验收工具加入后约 1400~1800 token。
-const requestOverhead = 1800
+const requestOverhead = 2000
 
 // EstimateTokens 估算一段文本的 token 数。
 //

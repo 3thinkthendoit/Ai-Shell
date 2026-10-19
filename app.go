@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
@@ -102,6 +103,7 @@ func (a *App) startup(ctx context.Context) {
 	}
 	a.ssh = sshclient.New(a.v)
 	a.ag = agent.New(a.v, a.ssh, a.emit)
+	a.ag.SetConsole(a)
 
 	// 审计日志复用凭证库的主密钥 —— 记录里会出现命令原文，必须与凭证同级保护。
 	if au, err := audit.New(a.v.Dir(), a.v); err == nil {
@@ -764,8 +766,9 @@ func (a *App) OpenTerminal(hostID, sessionID string, cols, rows int) error {
 	}
 
 	// 屏幕模型与定格管线每条任务一份：top/vim 退出时的最后一帧
-	// 靠它进模型上下文。触发点有三个（见 SetTriggers 与 onExit）：
-	// 命令结束且全屏重绘过、备用屏幕释放、PTY 退出。
+	// 靠它进模型上下文。触发点：
+	// 命令结束且全屏重绘过、命令非 0 退出（报错留在可见屏）、备用屏幕释放、PTY 退出。
+	// 成功的流式命令（ls）不送：结尾画面没有信息量。
 	c, r := cols, rows
 	if c < 2 || c > 512 {
 		c = 80
@@ -779,11 +782,16 @@ func (a *App) OpenTerminal(hostID, sessionID string, cols, rows int) error {
 		a.deliverSnapshot(hostID, sessionID, key, text, final)
 	})
 	screen.SetTriggers(
-		func(tui bool) {
-			// 命令结束（OSC 133;D）：只有全屏重绘过的命令才定格 ——
-			// ls 这种流式输出的结尾画面没有信息量，进上下文是纯噪音。
+		func(tui bool, exitCode int, exitKnown bool) {
+			// 全屏重绘：定格最后一帧（top 按 q 后屏上就是结论）。
 			if tui {
 				snapper.Flush()
+				return
+			}
+			// 普通命令失败：只塞短提示（辅），完整画面由模型调 read_console（主）。
+			// 退出码未知（133;D 没带码）不当失败。
+			if exitKnown && exitCode != 0 {
+				a.deliverConsoleFailureHint(hostID, sessionID, exitCode, screen.TextTail(40))
 			}
 		},
 		func() { snapper.Flush() }, // 备用屏幕释放：vim/htop 退出的那一瞬
@@ -1161,6 +1169,29 @@ func (a *App) CloseTerminal(hostID, sessionID string) bool {
 	return true
 }
 
+// ReadConsole 实现 agent.consoleReader：返回某任务常驻终端的可见屏幕纯文本。
+// maxLines 从底部向上截取；<=0 时用默认 80。
+func (a *App) ReadConsole(hostID, sessionID string, maxLines int) (string, error) {
+	if a == nil || a.ssh == nil {
+		return "", fmt.Errorf("控制台未就绪")
+	}
+	key := termKey(hostID, sessionID)
+	a.mu.Lock()
+	vt := a.termVT[key]
+	a.mu.Unlock()
+	if vt == nil || vt.screen == nil {
+		return "", fmt.Errorf("该任务的控制台未打开，请先切换到终端视图")
+	}
+	if maxLines <= 0 {
+		maxLines = 80
+	}
+	if maxLines > 200 {
+		maxLines = 200
+	}
+	// TextTail 含滚出可视区的行：报错刚被新提示符顶上去时仍能读到。
+	return vt.screen.TextTail(maxLines), nil
+}
+
 // deliverSnapshot 把一帧屏幕快照送完安全管线再交给 agent 的瞬态上下文。
 //
 // 顺序不能换：先脱敏再注入检测 —— 注入话术里嵌着机密时，
@@ -1186,19 +1217,52 @@ func (a *App) deliverSnapshot(hostID, sessionID, termID, text string, final bool
 	a.ag.InjectTerminalSnapshot(hostID, sessionID, termID, clean, n, findings, final)
 }
 
+// deliverConsoleFailureHint 在普通命令非 0 退出时只塞短提示（辅）。
+// 完整画面留给模型调 read_console（主）。
+func (a *App) deliverConsoleFailureHint(hostID, sessionID string, exitCode int, text string) {
+	tail := clipTailLines(text, 20)
+	known := a.v.SecretStrings()
+	clean, n := policy.Redact(tail, known)
+	findings := policy.DetectInjection(clean)
+	a.auditLog(audit.Entry{
+		Kind:     audit.KindTerminal,
+		HostID:   hostID,
+		HostName: hostNameOf(a.v, hostID),
+		Decision: "human",
+		Rule:     "pty",
+		Note: fmt.Sprintf("控制台失败提示进入模型上下文（exit=%d，摘要 %d 字节，脱敏 %d 处，注入告警 %d 条）",
+			exitCode, len(clean), n, len(findings)),
+	})
+	a.ag.InjectConsoleFailureHint(hostID, sessionID, exitCode, clean, findings)
+}
+
 // clipSnapshot 给快照封顶：可见屏幕通常几十行，但异常尺寸（512 行）
-// 不该把整篇文章塞进一次请求。裁尾 200 行 / 8KB。
+// 不该把整篇文章塞进一次请求。先裁行再裁字节（字节裁切按 UTF-8 边界）。
 func clipSnapshot(text string) string {
+	return clipBytes(clipTailLines(text, 200), 8*1024)
+}
+
+func clipTailLines(text string, maxLines int) string {
+	if maxLines <= 0 {
+		return text
+	}
 	lines := strings.Split(text, "\n")
-	if len(lines) > 200 {
-		lines = lines[len(lines)-200:]
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
 	}
-	out := strings.Join(lines, "\n")
-	const cap = 8 * 1024
-	if len(out) > cap {
-		out = out[len(out)-cap:]
+	return strings.Join(lines, "\n")
+}
+
+func clipBytes(text string, cap int) string {
+	if cap <= 0 || len(text) <= cap {
+		return text
 	}
-	return out
+	cut := len(text) - cap
+	// 按字节切会劈开 UTF-8，中文报错进上下文就变成乱码。
+	for cut < len(text) && !utf8.RuneStart(text[cut]) {
+		cut++
+	}
+	return text[cut:]
 }
 
 // ---- 会话（每台主机多条）----

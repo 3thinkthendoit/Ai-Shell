@@ -300,8 +300,19 @@ func strArg(args map[string]any, key string) string {
 // 按 float64 断言而不是 int。写成 int 断言会永远走默认值分支，
 // 表现为「设了 timeout_sec 完全没生效」。
 func numArg(args map[string]any, key string, def int) int {
-	if v, ok := args[key].(float64); ok && v > 0 {
-		return int(v)
+	switch v := args[key].(type) {
+	case float64:
+		if v > 0 {
+			return int(v)
+		}
+	case int:
+		if v > 0 {
+			return v
+		}
+	case int64:
+		if v > 0 {
+			return int(v)
+		}
 	}
 	return def
 }

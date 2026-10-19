@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"ai-shell/internal/agent"
 	"ai-shell/internal/audit"
@@ -510,9 +511,7 @@ func TestPersistentTerminalFinalSnapshotOnPTYExit(t *testing.T) {
 	})
 }
 
-// 流式输出命令（ls 这类，命令期间没有全屏重绘）结束时**不该**定格：
-// 它的结尾画面没有信息量，进模型上下文纯属噪音。只有全屏重绘过的
-// 命令才值得留最后一帧。
+// 成功的流式命令（ls，退出码 0）结束时不该定格，也不该塞失败提示。
 func TestPersistentTerminalNoSnapshotForPlainCommand(t *testing.T) {
 	a, hostID := newTermTestApp(t)
 	if err := a.OpenTerminal(hostID, "s1", 80, 24); err != nil {
@@ -537,7 +536,54 @@ func TestPersistentTerminalNoSnapshotForPlainCommand(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	for _, e := range a.ListAudit(0).Entries {
 		if e.Kind == audit.KindTerminal && strings.Contains(e.Note, "终端结束画面进入模型上下文") {
-			t.Errorf("流式命令结束不该定格快照，实得 %q", e.Note)
+			t.Errorf("成功的流式命令不该定格结束画面，实得 %q", e.Note)
 		}
+		if e.Kind == audit.KindTerminal && strings.Contains(e.Note, "终端屏幕快照进入模型上下文") {
+			t.Errorf("退出码 0 不该把屏幕送进上下文，实得 %q", e.Note)
+		}
+		if e.Kind == audit.KindTerminal && strings.Contains(e.Note, "控制台失败提示进入模型上下文") {
+			t.Errorf("退出码 0 不该塞失败提示，实得 %q", e.Note)
+		}
+	}
+}
+
+// 失败命令（非 0）只塞短提示进瞬态上下文（辅），完整画面靠 read_console（主）。
+func TestPersistentTerminalSnapshotOnFailedCommand(t *testing.T) {
+	a, hostID := newTermTestApp(t)
+	if err := a.OpenTerminal(hostID, "s1", 80, 24); err != nil {
+		t.Fatalf("打开失败: %v", err)
+	}
+	if err := a.ReportActiveSession(hostID, "s1"); err != nil {
+		t.Fatalf("报告会话失败: %v", err)
+	}
+	if err := a.WriteTerminal(hostID, "s1", base64.StdEncoding.EncodeToString([]byte("fail\n"))); err != nil {
+		t.Fatalf("写入命令失败: %v", err)
+	}
+	waitForTerm(t, "失败命令的控制台提示审计落盘", func() bool {
+		for _, e := range a.ListAudit(0).Entries {
+			if e.Kind == audit.KindTerminal && strings.Contains(e.Note, "控制台失败提示进入模型上下文") {
+				return true
+			}
+		}
+		return false
+	})
+	text, err := a.ReadConsole(hostID, "s1", 80)
+	if err != nil {
+		t.Fatalf("ReadConsole: %v", err)
+	}
+	if !strings.Contains(text, "boom") && !strings.Contains(text, "fail") {
+		t.Fatalf("ReadConsole 应能读到失败命令相关输出，实得 %q", text)
+	}
+}
+
+func TestClipBytesKeepsUTF8(t *testing.T) {
+	// 截断点落在多字节字符中间时，必须前进到下一个 rune 起点，不能留下半截。
+	s := "abc" + strings.Repeat("中", 10)
+	got := clipBytes(s, 10)
+	if !utf8.ValidString(got) {
+		t.Fatalf("截断后不是合法 UTF-8：%q", got)
+	}
+	if strings.ContainsRune(got, utf8.RuneError) {
+		t.Fatalf("截断后出现替换符：%q", got)
 	}
 }

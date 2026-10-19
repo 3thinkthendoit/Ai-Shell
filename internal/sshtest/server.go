@@ -958,7 +958,11 @@ func RunCommand(cmd string, ch ssh.Channel, srv *Server) int {
 	// 假远端接受但忽略：133 标记由 fakeShell 自己发，这里若报 unknown
 	// 会污染输出并让注入行带上 133;D;127 的假命令边界。
 	case strings.HasPrefix(c, "stty "), c == "stty",
-		strings.HasPrefix(c, "if [ -n \"$BASH_VERSION\""):
+		strings.HasPrefix(c, "if [ -n \"$BASH_VERSION\""),
+		strings.HasPrefix(c, "PS1="),
+		strings.HasPrefix(c, "PROMPT_COMMAND="):
+		// 客户端注入的提示符/集成行在真 bash 里退出码是 0。
+		// 若这里报 127，失败命令快照会把注入本身当成用户报错送进上下文。
 		return 0
 
 	case strings.HasPrefix(c, "command -v"):

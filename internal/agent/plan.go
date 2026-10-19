@@ -167,7 +167,7 @@ func planReadonlyWhitelist(user []string) []string {
 // snapshot/diff/verify 与变更闭环绑定，必须先有计划。
 func simpleToolWithoutPlan(name, command string, readonlyWL []string) bool {
 	switch name {
-	case "list_hosts", "system_info", "collect_diagnostics", "journal_query", "systemd_status",
+	case "list_hosts", "read_console", "system_info", "collect_diagnostics", "journal_query", "systemd_status",
 		"net_listen", "read_file", "list_dir", "list_file_backups", "json_query",
 		"fetch_webpage", "search_web":
 		return true
@@ -384,7 +384,7 @@ func classAllows(class PlanClass, name string) bool {
 	switch class {
 	case classDiagnose:
 		switch name {
-		case "list_hosts", "system_info", "collect_diagnostics", "journal_query", "systemd_status",
+		case "list_hosts", "read_console", "system_info", "collect_diagnostics", "journal_query", "systemd_status",
 			"net_listen", "snapshot_state", "diff_state", "verify_checks",
 			"read_file", "list_dir", "list_file_backups", "json_query", "run_command":
 			return true
@@ -394,21 +394,21 @@ func classAllows(class PlanClass, name string) bool {
 	case classChange:
 		switch name {
 		case "run_command", "write_file", "upload_local_file", "download_remote_file",
-			"snapshot_state", "diff_state", "verify_checks":
+			"snapshot_state", "diff_state", "verify_checks", "read_console":
 			return true
 		default:
 			return false
 		}
 	case classRollback:
 		switch name {
-		case "list_file_backups", "restore_file_backup", "diff_state", "verify_checks":
+		case "list_file_backups", "restore_file_backup", "diff_state", "verify_checks", "read_console":
 			return true
 		default:
 			return false
 		}
 	case classLookup:
 		switch name {
-		case "list_hosts", "fetch_webpage", "search_web":
+		case "list_hosts", "fetch_webpage", "search_web", "read_console":
 			return true
 		default:
 			return false
