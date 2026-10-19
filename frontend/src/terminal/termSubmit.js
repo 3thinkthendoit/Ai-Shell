@@ -26,8 +26,9 @@ async function submitLine(key, line) {
     writeTerminal(hostId, sessionId, textToBase64('\n'))
     return
   }
-  // 输入分流：agent 对话中（本会话已有 Agent 回复/工具调用）一律当回复交给 Agent，
-  // 不做命令识别/执行；要跑命令用 ! 前缀或原始终端。
+  // 输入分流：已知 Linux 命令始终走 shell。
+  // 未知词（含单个 bt）先做远端探测，存在就执行。
+  // 对话中的回复同形词（id/true）和 yes/open 当回复，不执行。
   const route = await resolveInput(text, backendAPI(), hostId, hasAgentTurn(hostId, sessionId))
   await dispatchLine(key, text, route)
 }

@@ -47,6 +47,12 @@ export function setSurfaceEl(key, el) {
   else surfaceEls.delete(key)
 }
 
+// 容器是否已有可测量尺寸。对话页用 v-show 藏表面时是 0x0；
+// 此时 open xterm 会把画布建死，之后 fit 也修不回来（切「终端」白屏）。
+function surfaceReady(el) {
+  return !!(el && el.clientWidth > 0 && el.clientHeight > 0)
+}
+
 // 终端配色跟随亮/暗主题；切换时同步所有已打开的实例。
 export function setTheme(theme) {
   const t = TERM_THEMES[theme] || TERM_THEMES.light
@@ -146,17 +152,26 @@ export async function ensureTerm(hostId, sessionId, currentTheme = 'light') {
     } else {
       await nextTick()
       doFit(key)
-      return
+      const el = surfaceEls.get(key)
+      const t = terms.get(key)
+      // 极少数：当初在 0x0 上 open 成功但行列仍是废的。容器已可见则拆本地重建
+      // （OpenTerminal 复用远端 PTY，不丢目录/进程）。
+      if (surfaceReady(el) && t && (t.term.cols < 2 || t.term.rows < 2)) {
+        disposeTerm(key)
+      } else {
+        return
+      }
     }
   }
 
   // 先把容器渲染出来再 open：xterm 在 open 那一刻就要测量容器、建渲染层。
-  // 容器不存在时量到 0x0，画布按错尺寸建，之后再 fit 也修不回来。
+  // 对话页隐藏时是 0x0 —— 只占位、不 open，等切到「终端」容器有尺寸后再建。
   if (!openedKeys.value.includes(key)) openedKeys.value.push(key)
   await nextTick()
 
   const el = surfaceEls.get(key)
   if (!el) return
+  if (!surfaceReady(el)) return
 
   const term = new Terminal({
     cursorBlink: true,

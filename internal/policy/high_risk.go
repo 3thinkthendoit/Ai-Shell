@@ -58,6 +58,112 @@ func IsHighRisk(cmd string) bool {
 	return HighRiskReason(cmd) != ""
 }
 
+// InteractiveBlockReason 判断命令会不会在「无 TTY、stdin 已关」的 Exec 上等待键盘。
+//
+// 典型是批准后的 `rm -i`：部分 rm 实现（busybox）在 EOF 上仍阻塞读确认，
+// Agent 整轮挂死，界面只能靠「中断」解开。命中后调用方应直接失败返回，不要 Exec。
+// `--interactive=never` 与不含 i 的短选项（`-fv`）不算。
+func InteractiveBlockReason(cmd string) string {
+	c := strings.TrimSpace(cmd)
+	if c == "" {
+		return ""
+	}
+	for _, cand := range normalizeForRisk(c) {
+		if why := interactiveOn(cand); why != "" {
+			return why
+		}
+	}
+	return ""
+}
+
+func interactiveOn(cmd string) string {
+	s := commandAfterWrappers(cmd)
+	word, rest := firstWord(s)
+	name := strings.ToLower(BaseName(word))
+	switch name {
+	case "rm", "cp", "mv", "ln":
+		if hasPromptFlag(rest) {
+			return name + " 的 -i/--interactive 会等待键盘确认"
+		}
+	case "apt", "apt-get", "yum", "dnf":
+		if packageChangePrompts(rest) {
+			return name + " 未带 -y/--yes，会在无终端上等待确认"
+		}
+	case "passwd":
+		if passwdPrompts(rest) {
+			return "passwd 会等待输入口令"
+		}
+	}
+	return ""
+}
+
+func packageChangePrompts(rest string) bool {
+	change, yes := false, false
+	s := rest
+	for {
+		w, r := firstWord(s)
+		if w == "" {
+			break
+		}
+		low := strings.ToLower(w)
+		switch low {
+		case "install", "remove", "erase", "purge", "upgrade", "dist-upgrade", "reinstall", "autoremove":
+			change = true
+		case "-y", "--yes", "--assumeyes":
+			yes = true
+		}
+		if strings.HasPrefix(w, "-") && !strings.HasPrefix(w, "--") && strings.ContainsAny(w, "yY") {
+			yes = true
+		}
+		s = r
+	}
+	return change && !yes
+}
+
+func passwdPrompts(rest string) bool {
+	s := rest
+	for {
+		w, r := firstWord(s)
+		if w == "" {
+			return true
+		}
+		switch strings.ToLower(w) {
+		case "-s", "--status", "-d", "--delete", "-l", "--lock", "-u", "--unlock", "-e", "--expire":
+			return false
+		}
+		if !strings.HasPrefix(w, "-") {
+			return true
+		}
+		s = r
+	}
+}
+
+func hasPromptFlag(rest string) bool {
+	s := rest
+	for {
+		w, r := firstWord(s)
+		if w == "" || w == "--" || !strings.HasPrefix(w, "-") {
+			return false
+		}
+		low := strings.ToLower(w)
+		if low == "--interactive=never" {
+			s = r
+			continue
+		}
+		if low == "--interactive" || strings.HasPrefix(low, "--interactive=") {
+			return true
+		}
+		if strings.HasPrefix(w, "--") {
+			s = r
+			continue
+		}
+		if strings.ContainsAny(w[1:], "iI") {
+			return true
+		}
+		s = r
+	}
+}
+
 // HighRiskReason 返回命中的高危规则说明；未命中返回空串。
 // 对 normalizeForRisk 展开的每条候选匹配，避免 VAR=/wrapper/路径绕过。
 //

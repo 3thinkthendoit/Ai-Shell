@@ -227,7 +227,9 @@ function resetCmdPending(hostId, sessionId) {
 
 // endCmdPending：拿到权威接管信号（term:cmd / term:tui）或终端退出时收掉窗口，
 // 交还给 cmdActive / tuiActive（或回到本地行编辑）。
-function endCmdPending(hostId, sessionId) {
+// 也供 termInput 在「乐观窗口里敲了中文」时主动关掉：中文是自然语言，
+// 不属于 vim/菜单选项，不应直灌 bash。
+export function endCmdPending(hostId, sessionId) {
   clearCmdPendingTimer(bucketKey(hostId, sessionId))
   const st = termState(hostId, sessionId)
   if (st) st.cmdPending = false

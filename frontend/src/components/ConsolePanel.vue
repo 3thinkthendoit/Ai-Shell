@@ -193,12 +193,13 @@ function onRetry() {
   ensureSurface(store.currentHostId, store.currentSessionId)
 }
 
-// 切回终端：隐藏期间容器是 0x0，需 fit；关闭后表面已卸则重建 PTY。
+// 切回终端：对话页 v-show 隐藏时容器是 0x0，ensureTerm 会推迟 open；
+// 这里等布局后再附着。若这一刻仍是 0x0，ResizeObserver 会在出尺寸时补建。
 watch(showArchive, async on => {
   if (on) return
   await nextTick()
   if (store.currentHostId) {
-    // 仍开着 → ensureTerm 只 fit；关过 → 重新 OpenTerminal。
+    // 仍开着 → ensureTerm 只 fit；关过 / 曾推迟 → 此时再 OpenTerminal。
     await attachSurface(store.currentHostId, store.currentSessionId)
   }
   doFit(currentKey.value)
@@ -613,7 +614,21 @@ onMounted(async () => {
   window.addEventListener('keydown', onWinKeydown)
   // jsdom 里没有 ResizeObserver，测试环境不该因为这一点炸掉。
   if (typeof ResizeObserver !== 'undefined' && rootEl.value) {
-    ro = new ResizeObserver(() => doFit(currentKey.value))
+    ro = new ResizeObserver(() => {
+      const key = currentKey.value
+      // 对话页曾推迟 open：容器从 0x0 变为有尺寸时补建实例（只 fit 建不起来）。
+      if (
+        !showArchive.value &&
+        store.currentHostId &&
+        key &&
+        !getTerm(key) &&
+        openedKeys.value.includes(key)
+      ) {
+        void ensureSurface(store.currentHostId, store.currentSessionId)
+        return
+      }
+      doFit(key)
+    })
     ro.observe(rootEl.value)
   }
   // 挂载时若已选中主机（App 里 ConsolePanel 常驻、bootstrap 已填好 currentHostId），

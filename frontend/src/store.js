@@ -276,8 +276,8 @@ export function targetEntries() {
 // hasAgentTurn 判断某条会话是否「已经和 Agent 对话过」：时间线里存在 assistant
 // （Agent 回复）或 tool（工具调用）条目即视为处于 agent 对话中。
 //
-// 供输入分流使用（termSubmit）：agent 对话中回车一律当「回复」交给 Agent，
-// 不再做命令识别/执行 —— 回复 Agent 的话（哪怕首词恰好像命令）绝不该被当 shell 命令跑掉。
+// 供输入分流使用（termSubmit）：对话中已知命令仍走 shell；
+// 未知词先远端探测，存在就执行（见 inputRoute.resolveInput）。
 export function hasAgentTurn(hostId, sessionId) {
   const list = store.bySession[bucketKey(hostId, sessionId)]
   if (!list) return false

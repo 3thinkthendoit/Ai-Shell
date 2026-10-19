@@ -1156,6 +1156,24 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall, sessionHostID,
 	view.Reason = verdict.Reason
 	view.Rule = verdict.Rule
 
+	// 交互确认（rm -i 等）在无 TTY 的 Exec 上会挂死整轮，批准后也解不开，只能靠中断。
+	// 在审批之前直接退回，让模型改成非交互写法再提。
+	if why := policy.InteractiveBlockReason(view.Command); view.Command != "" && why != "" {
+		view.Status = "error"
+		view.Reason = why
+		view.Decision = policy.Deny
+		view.Rule = "interactive"
+		a.emit(EvTool, view)
+		a.log(audit.Entry{
+			Kind: audit.KindTool, HostID: view.HostID, HostName: view.HostName,
+			Tool: tc.Function.Name, Command: view.Command,
+			Decision: string(policy.Deny), Rule: "interactive",
+			Note: "未执行（无终端会挂死）：" + why,
+		})
+		return "[未执行] " + why + "。本通道不分配终端，交互确认会把整轮挂死。" +
+			"请去掉 -i/--interactive，或给包管理加上 -y；删除用 rm -f -- 路径。", false
+	}
+
 	if verdict.Decision == policy.Deny {
 		view.Status = "denied"
 		a.emit(EvTool, view)
@@ -1510,8 +1528,10 @@ func systemPrompt(v *vault.Vault, allowCrossHost bool, hostID string) string {
 
 按用途分组，前面的先试：
 
-**计划（强制）**
-- revise_plan：提交或改写本轮执行计划。其它工具调用前必须有一条 active 项；证据变了就改写未完成项。
+**计划（变更/回滚才强制）**
+- revise_plan：提交或改写本轮执行计划。写文件、非只读命令、回滚、snapshot/diff/verify 之前必须有一条 active 项。
+- 单步观测（ls / df / list_dir / system_info 等）**不要**调用它；仅一条 diagnose/lookup 的计划会被运行时拒绝。
+- 多步只读排查可直接连续调工具，不必先计划。
 
 **主机与诊断**
 - list_hosts：列出已配置的主机（只含 id/名称/地址/用户名，不含任何密钥）。
@@ -1549,7 +1569,9 @@ func systemPrompt(v *vault.Vault, allowCrossHost bool, hostID string) string {
 
 ## 工作方式
 
-- **先计划再动手**：调用任何运维/主机工具之前，先用 revise_plan 提交计划，并保证恰有一条 status=active。运行时会拒绝不在活动项类别内的工具。
+- **简单查询直接做**：用户只是要看一眼（ls、df -h、读一个文件、system_info），直接调对应观测工具，**不要**先 revise_plan；仅一条 diagnose/lookup 的计划会被运行时拒绝。
+- **多步只读可直接连调**：collect_diagnostics → journal_query 等，不必先计划（运行时不强制）。
+- **变更/回滚/基线必须先计划**：写文件、非只读命令、回滚、snapshot_state / diff_state / verify_checks——先 revise_plan 并保证恰有一条 status=active。运行时会拒绝无计划的这类工具，以及不在活动项类别内的工具。
 - **类别固定映射**（不可自报工具名单）：
   - diagnose：list_hosts、只读诊断、命中只读白名单的 run_command、snapshot/diff/verify、读文件
   - change：经批准的变更类 run_command / write_file / 上传下载，以及 snapshot/diff/verify

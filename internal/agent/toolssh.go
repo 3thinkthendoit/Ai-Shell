@@ -127,7 +127,8 @@ var toolRunCommand = Tool{
 		"run_command",
 		"在目标主机上执行一条 shell 命令并返回 stdout/stderr/退出码。"+
 			"只读诊断命令可直接提出；写操作、服务重启、安装软件等变更类命令需要用户逐条批准。"+
-			"注意：读取登录凭据（/etc/shadow、~/.ssh/id_*、.aws/credentials 等）与破坏性命令会被硬拒绝。",
+			"注意：读取登录凭据（/etc/shadow、~/.ssh/id_*、.aws/credentials 等）与破坏性命令会被硬拒绝。"+
+			"不要加 -i/--interactive：本通道没有终端，交互确认会挂死整轮；删除用 rm -f -- 路径。",
 		map[string]any{
 			"host_id":     hostIDSchema(),
 			"command":     strSchema("要执行的完整 shell 命令"),

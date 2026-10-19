@@ -112,7 +112,6 @@ var destructive = []struct {
 	{regexp.MustCompile(`(?i)\bdd\b[^|;]*\bof=/dev/(?:sd|nvme|hd|vd|mmcblk)`), "向块设备写数据"},
 	{regexp.MustCompile(`(?i)>\s*/dev/(?:sd|nvme|hd|vd|mmcblk)`), "覆写块设备"},
 	{regexp.MustCompile(`(?i)\brm\b[^|;]*\s-{1,2}[a-z]*r[a-z]*f?[^|;]*\s/(?:\s|$|\*)`), "递归删除根目录"},
-	{regexp.MustCompile(`(?i)\brm\b[^|;]*\s-{1,2}[a-z]*f[a-z]*r?[^|;]*\s/(?:etc|usr|var|boot|lib|bin|sbin|home|root)(?:\s|/|\*|$)`), "递归删除系统目录"},
 	{regexp.MustCompile(`(?i)\b(?:shutdown|reboot|halt|poweroff)\b`), "关机/重启"},
 	{regexp.MustCompile(`(?i)\binit\s+[06]\b`), "切换运行级别"},
 	{regexp.MustCompile(`(?i)\bsystemctl\s+(?:poweroff|reboot|halt|kexec)\b`), "关机/重启"},
@@ -168,7 +167,96 @@ func EvaluateProtected(cmd string) Verdict {
 			return Verdict{Deny, "破坏性操作（" + d.rule + "）已被硬拒绝", "destructive"}
 		}
 	}
+	// -r 与 -f 可以拆在不同参数里（rm -r -f /root）。正则只看一个短选项会漏。
+	if recursiveSystemRm(c) {
+		return Verdict{Deny, "破坏性操作（递归删除系统目录）已被硬拒绝", "destructive"}
+	}
 	return Verdict{Allow, "未命中任何硬拒绝规则", "clean"}
+}
+
+// recursiveSystemRm：rm 同时带递归和强制，且目标落在系统目录上。
+// 单个文件的 `rm -f /root/x` 不是递归，不在此列。
+func recursiveSystemRm(cmd string) bool {
+	for _, seg := range splitSegments(cmd) {
+		if rmRecursiveForceOnSystem(commandAfterWrappers(seg)) {
+			return true
+		}
+	}
+	return false
+}
+
+func commandAfterWrappers(seg string) string {
+	s := stripLeadingNoise(seg)
+	word, rest := firstWord(s)
+	if strings.EqualFold(BaseName(word), "busybox") {
+		return strings.TrimSpace(rest)
+	}
+	return s
+}
+
+func rmRecursiveForceOnSystem(seg string) bool {
+	word, rest := firstWord(seg)
+	if !strings.EqualFold(BaseName(word), "rm") {
+		return false
+	}
+	recursive, force := false, false
+	var operands []string
+	for {
+		w, r := firstWord(rest)
+		if w == "" {
+			break
+		}
+		if w == "--" {
+			for {
+				op, nr := firstWord(r)
+				if op == "" {
+					break
+				}
+				operands = append(operands, op)
+				r = nr
+			}
+			break
+		}
+		low := strings.ToLower(w)
+		switch {
+		case low == "--recursive":
+			recursive = true
+		case low == "--force":
+			force = true
+		case strings.HasPrefix(w, "--"):
+		case strings.HasPrefix(w, "-") && len(w) > 1:
+			for _, ch := range w[1:] {
+				switch ch {
+				case 'r', 'R':
+					recursive = true
+				case 'f', 'F':
+					force = true
+				}
+			}
+		default:
+			operands = append(operands, w)
+		}
+		rest = r
+	}
+	if !recursive || !force {
+		return false
+	}
+	for _, op := range operands {
+		if systemTreePath(op) {
+			return true
+		}
+	}
+	return false
+}
+
+func systemTreePath(p string) bool {
+	p = strings.Trim(p, `"'`)
+	for _, root := range []string{"/etc", "/usr", "/var", "/boot", "/lib", "/bin", "/sbin", "/home", "/root"} {
+		if p == root || strings.HasPrefix(p, root+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // Evaluate 对 agent（LLM）提出的一条 shell 命令做裁决。

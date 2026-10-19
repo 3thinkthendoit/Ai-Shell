@@ -1,6 +1,8 @@
-import { store, writeTerminal, textToBase64, stop, isPtyDirty } from '../store.js'
+import { store, writeTerminal, textToBase64, stop, isPtyDirty, termState } from '../store.js'
 import * as paint from '../termPaint.js'
 import { enqueueSubmit } from './termSubmit.js'
+import { hasCJK } from '../inputRoute.js'
+import { endCmdPending } from './termEvents.js'
 import {
   getTerm,
   isFullscreen,
@@ -25,12 +27,26 @@ export function onTermData(key, d) {
   if (!t) return
   const send = s => writeTerminal(t.hostId, t.sessionId, s)
 
-  // 命令运行中（OSC 133;C..D 之间）：输入归命令，所有按键原样透传给 PTY。
+  // 命令运行中（OSC 133;C..D / cmdPending）：输入归前台程序，按键原样透传。
+  // 例外：乐观窗口（仅 cmdPending、非全屏）里敲到中文 → 关窗改走本地行编辑。
+  // 中文是自然语言提问，不是 vim E325 / 菜单选项；直灌 bash 会报 command not found，
+  // Agent 也收不到（`执行报错 ./start.sh` 用户截图）。真 cmdActive 仍全透传。
   if (isCmdRunning(key)) {
-    clearWelcomeHintByKey(key)
-    clearLLMHintByKey(key)
-    send(textToBase64(d))
-    return
+    const st = termState(t.hostId, t.sessionId)
+    const cjkBreaksPending = !!(st && st.cmdPending && !st.cmdActive) &&
+      !isFullscreen(key) &&
+      d.length > 0 &&
+      !/[\x00-\x1f\x7f]/.test(d) &&
+      hasCJK(d)
+    if (cjkBreaksPending) {
+      endCmdPending(t.hostId, t.sessionId)
+      // 落到下面的本地行编辑，让回车走 resolveInput → Agent。
+    } else {
+      clearWelcomeHintByKey(key)
+      clearLLMHintByKey(key)
+      send(textToBase64(d))
+      return
+    }
   }
 
   // agent 正在跑：此刻的按键不属于任何命令行，**必须丢掉**。

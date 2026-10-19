@@ -6,12 +6,29 @@
 //   2. 终端表面内直接输入按 classifyInput 分流（见 terminal.test.js），composer-bar 只剩工具条与运行指示
 //   3.「对话归档」是只读时间线，审批条/弹窗照旧可交互
 // 这一段没有测试的话，状态对了但界面没反应同样是个 bug。
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import { nextTick } from 'vue'
 import ConsolePanel from '../components/ConsolePanel.vue'
 import { store, push, textToBase64, bindEvents, writeTerminal, isPtyDirty, ask, resetSessionChromeSeen } from '../store.js'
 import { instances, resetInstances } from './stubs/xterm.js'
+
+// jsdom 没有布局：clientWidth/Height 恒为 0。ensureTerm 在 0x0 上故意不 open
+// （对话页隐藏时的真 bug），测试里装上固定尺寸，挂载即附着这条链才能跑通。
+let origCW
+let origCH
+beforeAll(() => {
+  origCW = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientWidth')
+  origCH = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientHeight')
+  Object.defineProperty(HTMLElement.prototype, 'clientWidth', { configurable: true, get: () => 800 })
+  Object.defineProperty(HTMLElement.prototype, 'clientHeight', { configurable: true, get: () => 600 })
+})
+afterAll(() => {
+  if (origCW) Object.defineProperty(HTMLElement.prototype, 'clientWidth', origCW)
+  else delete HTMLElement.prototype.clientWidth
+  if (origCH) Object.defineProperty(HTMLElement.prototype, 'clientHeight', origCH)
+  else delete HTMLElement.prototype.clientHeight
+})
 
 // ---- Wails 运行时与后端替身 ----
 

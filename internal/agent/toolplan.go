@@ -16,8 +16,9 @@ var toolRevisePlanDef = Tool{
 	Local: true,
 	Def: def(
 		toolRevisePlan,
-		"提交或改写本轮执行计划。调用其它主机/运维工具之前必须先有一条 status=active 的计划项；"+
-			"证据变化时用本工具改写未完成项（已完成/已放弃的项不可改）。"+
+		"提交或改写本轮执行计划。变更、回滚、snapshot/diff/verify 之前必须有一条 status=active 的项；"+
+			"单步观测（ls / df / list_dir / system_info）不要调用本工具——仅一条 diagnose/lookup 会被拒绝；"+
+			"多步只读可直接连调工具。证据变化时改写未完成项（已完成/已放弃不可改）。"+
 			"class 只能是 diagnose|change|rollback|lookup，运行时按类决定允许哪些工具，不能自报工具名单。",
 		map[string]any{
 			"reason": strSchema("这次提交/改写计划的原因（必填）"),

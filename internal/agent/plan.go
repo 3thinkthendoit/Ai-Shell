@@ -2,8 +2,14 @@ package agent
 
 // 本轮执行计划。
 //
-// 模型每一步本来可以临时决定下一个工具（ReAct）。这里加一层运行时状态：
-// 要动工具，必须先有一条活动项，而且工具名必须落在该项的风险类里。
+// 模型每一步本来可以临时决定下一个工具（ReAct）。这里加一层运行时状态，
+// 只约束「稍微复杂」的任务：
+//
+//   - 单步观测（ls / df / list_dir / system_info …）：无计划也能跑；
+//     仅一条 diagnose/lookup 的琐碎计划会被拒绝，避免为 ls 刷卡。
+//   - 变更 / 回滚 / 写文件 / 非只读命令 / 基线验收：必须先有 active 计划项，
+//     且工具名落在该项的风险类里。
+//
 // 类到工具名的映射写死在本文件，模型只能选择类，不能自报一份工具名单
 // —— 自报名单可以被写成「全部工具」，强制遵循就失效了。
 //
@@ -16,6 +22,7 @@ import (
 	"strings"
 
 	"ai-shell/internal/policy"
+	"ai-shell/internal/vault"
 )
 
 const (
@@ -121,23 +128,54 @@ func (p *runPlan) noteToolRan() {
 	}
 }
 
-// allows 判断这个工具能不能在当前活动项上执行。
-// whitelist 是策略里的只读命令表：诊断类的 run_command 必须命中它，且不能是高危变更。
+// allows 判断这个工具能不能执行。
+//
+// 无活动计划时：只放行观测类工具（见 simpleToolWithoutPlan）；变更/基线/回滚必须先 revise_plan。
+// 有活动计划时：工具必须落在活动项的风险类里；诊断类的 run_command 还须命中只读命令库。
 // 硬拒绝（凭据路径等）仍交给策略层，以便留下 protected_path 审计。
 func (p *runPlan) allows(name, command string, whitelist []string) (bool, string) {
+	ro := planReadonlyWhitelist(whitelist)
 	active := p.active()
 	if active == nil {
-		return false, "当前没有活动计划项。先调用 revise_plan，提交计划并标出一条 status=active 的项，然后再调用其它工具。"
+		if simpleToolWithoutPlan(name, command, ro) {
+			return true, ""
+		}
+		return false, "这项操作需要先提交执行计划。请调用 revise_plan，标出一条 status=active 的 change/rollback 项（可附带诊断步骤），然后再调用该工具。单步观测（ls、df、list_dir、system_info）不必先计划。"
 	}
 	if !classAllows(active.Class, name) {
 		return false, fmt.Sprintf("活动项 %q 的类别是 %s，不能调用 %s。若证据表明需要换一类工具，先 revise_plan 改写未完成项。", active.ID, active.Class, name)
 	}
 	if name == "run_command" && active.Class == classDiagnose {
-		if policy.HighRiskReason(command) != "" || !policy.ReadOnlyCommand(command, whitelist) {
-			return false, "诊断项只允许只读白名单里的 run_command。请改用只读诊断工具，或 revise_plan 把活动项改为 change。"
+		if policy.HighRiskReason(command) != "" || !policy.ReadOnlyCommand(command, ro) {
+			return false, "诊断项只允许只读命令库里的 run_command。请改用只读诊断工具，或 revise_plan 把活动项改为 change。"
 		}
 	}
 	return true, ""
+}
+
+// planReadonlyWhitelist：分流/计划共用的只读命令库 = 内置 DefaultWhitelist + 用户白名单扩展。
+// 不用「仅用户当前白名单」——清空策略白名单时 ls 仍须能免计划执行。
+func planReadonlyWhitelist(user []string) []string {
+	wl := vault.DefaultWhitelist()
+	if len(user) == 0 {
+		return wl
+	}
+	return append(wl, user...)
+}
+
+// simpleToolWithoutPlan：无计划时允许的观测工具（不写基线、不验收、不改系统）。
+// snapshot/diff/verify 与变更闭环绑定，必须先有计划。
+func simpleToolWithoutPlan(name, command string, readonlyWL []string) bool {
+	switch name {
+	case "list_hosts", "system_info", "collect_diagnostics", "journal_query", "systemd_status",
+		"net_listen", "read_file", "list_dir", "list_file_backups", "json_query",
+		"fetch_webpage", "search_web":
+		return true
+	case "run_command":
+		return policy.HighRiskReason(command) == "" && policy.ReadOnlyCommand(command, readonlyWL)
+	default:
+		return false
+	}
 }
 
 func (p *runPlan) active() *planItem {
@@ -185,6 +223,13 @@ func (p *runPlan) revise(raw string) (string, bool) {
 	if len(body.Items) > maxPlanItems {
 		p.failures++
 		return fmt.Sprintf("计划最多 %d 项。", maxPlanItems), false
+	}
+	// 拒绝「为 ls 开一张计划」：仅一条未完成的 diagnose/lookup。
+	// 多步只读请直接连续调工具，或提交至少两条；变更/回滚用 change/rollback。
+	if trivialReadonlyPlan(body.Items) {
+		p.failures++
+		return "单步观测不必提交执行计划。请直接调用 list_dir / run_command / system_info 等工具；" +
+			"若确需计划，至少两条步骤，或使用 change/rollback 类。", false
 	}
 
 	existing := make(map[string]planItem, len(p.items))
@@ -310,6 +355,25 @@ func validPlanClass(c PlanClass) bool {
 func validPlanStatus(s string) bool {
 	switch s {
 	case planPending, planActive, planDone, planDropped:
+		return true
+	default:
+		return false
+	}
+}
+
+// trivialReadonlyPlan：整份清单只有一条未完成的 diagnose/lookup。
+// 那就是「为一次 ls 开计划」——拒绝，逼模型直接调观测工具。
+func trivialReadonlyPlan(items []reviseItem) bool {
+	if len(items) != 1 {
+		return false
+	}
+	it := items[0]
+	status := strings.TrimSpace(it.Status)
+	if status != planActive && status != planPending {
+		return false
+	}
+	switch PlanClass(strings.TrimSpace(it.Class)) {
+	case classDiagnose, classLookup:
 		return true
 	default:
 		return false

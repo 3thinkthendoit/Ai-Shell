@@ -61,9 +61,65 @@ func TestDestructiveCommandsAreDenied(t *testing.T) {
 		"iptables -F",
 		"truncate -s 0 /etc/passwd",
 		"userdel -r alice",
+		"rm -rf /root",
+		"rm -fr /root/.test.txt.swp",
+		"rm -r -f /root",
+		"rm -f -r /etc",
+		"sudo rm -r -f /var/log",
+		"command rm --recursive --force /boot",
+		"busybox rm -rf /root/x",
 	}
 	for _, c := range cases {
 		mustDeny(t, c)
+	}
+}
+
+func TestRmForceSingleFileIsNotDestructive(t *testing.T) {
+	// 删单个文件（即使在 /root 下、带 -f/-v）不是「递归删系统目录」，不应硬拒绝。
+	// 它仍是高危，走人工确认。
+	for _, c := range []string{
+		"rm -fv /root/.test.txt.swp",
+		"rm -f /root/.test.txt.swp",
+		"rm -- /root/.test.txt.swp",
+	} {
+		v := Evaluate(c, ModeWhitelist, []string{"ls"})
+		if v.Decision == Deny {
+			t.Fatalf("%q 不应硬拒绝，实得 %s (%s)", c, v.Decision, v.Reason)
+		}
+		if v.Decision != Confirm {
+			t.Fatalf("%q 应需确认，实得 %s", c, v.Decision)
+		}
+	}
+}
+
+func TestInteractiveFlagsAreDetected(t *testing.T) {
+	for _, c := range []string{
+		"rm -i /root/.test.txt.swp",
+		"rm -fi /tmp/x",
+		"cp -i a b",
+		"mv --interactive a b",
+		"busybox rm -i /tmp/x",
+		"command rm -i /tmp/x",
+		"apt-get install nginx",
+		"passwd",
+		"passwd alice",
+	} {
+		if InteractiveBlockReason(c) == "" {
+			t.Fatalf("%q 应识别为交互确认", c)
+		}
+	}
+	for _, c := range []string{
+		"rm -fv /root/.test.txt.swp",
+		"rm -f /tmp/x",
+		"rm --interactive=never /tmp/x",
+		"grep -i foo log",
+		"apt-get install -y nginx",
+		"apt-get -y install nginx",
+		"passwd -S root",
+	} {
+		if got := InteractiveBlockReason(c); got != "" {
+			t.Fatalf("%q 不应算交互确认，实得 %s", c, got)
+		}
 	}
 }
 

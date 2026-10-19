@@ -7,6 +7,7 @@
 // xterm 仍走 vitest.config.js 挂上的替身（__tests__/stubs/xterm.js）：本地回显
 // 落在 instance.written，退格/擦除是转义序列，都能逐字节断言。
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { flushPromises } from '@vue/test-utils'
 import { store, bucketKey, base64ToBytes } from '../store.js'
 import {
   openedKeys,
@@ -38,6 +39,7 @@ function makeApp(impl = {}) {
     RunShellInTerminal: async () => ({ status: 'done', decision: 'allow', reason: '', rule: 'auto_safe', risk: 'low' }),
     ClassifyShellInput: async text => {
       const first = String(text || '').trim().split(/\s+/)[0] || ''
+      if (first.includes('/')) return true
       const binary = first.replace(/^.*\//, '')
       return ['ls', 'echo', 'df', 'pwd'].includes(binary)
     },
@@ -153,6 +155,22 @@ describe('termSession · 纯计算工具', () => {
 })
 
 describe('termSession · 实例生命周期', () => {
+  it('容器 0x0（对话页隐藏）时 ensureTerm 不 open，有尺寸后再建', async () => {
+    withHost()
+    const key = bucketKey('h1', 'default')
+    setSurfaceEl(key, { clientWidth: 0, clientHeight: 0 })
+    await ensureTerm('h1', 'default', 'light')
+    expect(instances).toHaveLength(0)
+    expect(callsOf('OpenTerminal')).toHaveLength(0)
+    // 占位键已登记，切回终端时 v-for 能挂上容器。
+    expect(openedKeys.value).toContain(key)
+
+    setSurfaceEl(key, { clientWidth: 800, clientHeight: 600 })
+    await ensureTerm('h1', 'default', 'light')
+    expect(instances).toHaveLength(1)
+    expect(callsOf('OpenTerminal')).toHaveLength(1)
+  })
+
   it('ensureTerm 建一个 xterm 实例、登记落点，surfaceWrite 返回可写落点', async () => {
     withHost()
     const key = await createSurface()
@@ -299,12 +317,21 @@ describe('termSubmit · enqueueSubmit 分流', () => {
     expect(toBytes(base64ToBytes(wt[0].args[2]))).toEqual(toBytes(new TextEncoder().encode('\n')))
   })
 
-  it('agent 对话中回车：像命令的回复也交给 Agent，不碰 PTY', async () => {
+  it('agent 对话中回车：已知命令仍写进 PTY', async () => {
     withHost()
-    // 本会话已有 Agent 回复 → 进入 agent 模式：即便 `ls -la` 是已知命令也当回复交给 Agent。
+    // 本会话已有 Agent 回复 → agent 模式只锁「非命令」回复；`ls -la` 必须仍执行。
     store.bySession[bucketKey('h1', 'default')] = [{ kind: 'assistant', content: '先确认来源 IP。' }]
     const key = await createSurface()
     await enqueueSubmit(key, 'ls -la')
+    expect(callsOf('RunShellInTerminal').length).toBe(1)
+    expect(callsOf('Ask')).toEqual([])
+  })
+
+  it('agent 对话中回车：非命令回复交给 Agent，不碰 PTY', async () => {
+    withHost()
+    store.bySession[bucketKey('h1', 'default')] = [{ kind: 'assistant', content: '先确认来源 IP。' }]
+    const key = await createSurface()
+    await enqueueSubmit(key, '好的')
     expect(callsOf('Ask').length).toBe(1)
     expect(callsOf('RunShellInTerminal')).toEqual([])
   })
@@ -358,6 +385,27 @@ describe('cmdPending · 提交命令后的乐观透传窗口', () => {
     expect(toBytes(base64ToBytes(wt[1].args[2]))).toEqual(toBytes(new TextEncoder().encode('\r')))
     // 回车走的是透传分支，没再触发一次提交。
     expect(callsOf('RunShellInTerminal').length).toBe(0)
+  })
+
+  it('乐观窗口里敲中文：关窗改走本地行编辑，回车交给 Agent', async () => {
+    withHost()
+    const key = await createSurface()
+    await enqueueSubmit(key, 'ls')
+    expect(isCmdRunning(key)).toBe(true)
+    calls.length = 0
+    onTermData(key, '执')
+    onTermData(key, '行')
+    onTermData(key, '报')
+    onTermData(key, '错')
+    // 中文不应直灌 PTY
+    expect(callsOf('WriteTerminal')).toEqual([])
+    expect(getTerm(key).line).toBe('执行报错')
+    expect(isCmdRunning(key)).toBe(false)
+    onTermData(key, '\r')
+    await flushPromises()
+    expect(callsOf('Ask').length).toBe(1)
+    expect(callsOf('Ask')[0].args[2]).toBe('执行报错')
+    expect(callsOf('RunShellInTerminal')).toEqual([])
   })
 })
 

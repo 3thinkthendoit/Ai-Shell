@@ -9,6 +9,7 @@ import (
 	"ai-shell/internal/audit"
 	"ai-shell/internal/policy"
 	"ai-shell/internal/sshclient"
+	"ai-shell/internal/vault"
 )
 
 // cwd 哨兵：与 frontend/src/term.js 的 CWD_MARKER 保持一致。
@@ -291,9 +292,13 @@ func (a *App) probeMissingBinary(hostID, cmd string, whitelist []string) *missin
 // ClassifyShellInput 判断一行输入**像不像** shell 命令，供前端做输入分流。
 //
 // 为什么把这个判断放在后端：命令识别需要「Linux 命令库」这份知识，
-// 而它已经在 policy 包里（PrimaryBinary / IsKnownBinary / shellBuiltins
-// + vault 的只读白名单）。前端再养一份必然漂移 —— 实测里前端手抄的清单
-// 把 `nginx 起不来了` 判成了命令（nginx 确实在清单里），而它是句中文提问。
+// 而它已经在 policy 包里（PrimaryBinary / IsKnownBinary / shellBuiltins）
+// 加上 vault.DefaultWhitelist（内置只读诊断清单）。前端再养一份必然漂移。
+//
+// 分流用的命令库**不等于**用户当前策略白名单：
+// 用户把白名单清空（一切走确认）时，`ls` 仍是 Linux 命令，必须走 shell，
+// 不能因为「不在白名单」就被当成自然语言交给 Agent。
+// 用户白名单只作为扩展（自定义只读前缀也算命令意图）。
 //
 // 只做**本地**判断，不发远端探测：分流发生在用户敲回车的那一刻，
 // 不能因为查远端而卡住输入。未知第三方（可能是自定义脚本）一律返回 false，
@@ -312,9 +317,9 @@ func (a *App) ClassifyShellInput(text string) bool {
 	if strings.Contains(bin, "/") {
 		return true
 	}
-	var wl []string
+	wl := vault.DefaultWhitelist()
 	if a.v != nil {
-		wl = a.v.Policy().Whitelist
+		wl = append(wl, a.v.Policy().Whitelist...)
 	}
 	return policy.IsKnownBinary(bin, wl)
 }

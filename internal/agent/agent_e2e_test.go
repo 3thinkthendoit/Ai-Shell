@@ -236,27 +236,36 @@ func respToolCall(id, name, args string) string {
 	return string(b)
 }
 
-// respPlanDiagnose 提交一条 diagnose/active 计划，供后续只读工具调用。
+// respPlanDiagnose 提交至少两条 diagnose（避免被「单条 diagnose 琐碎计划」闸门拒绝）。
 func respPlanDiagnose(id string) string {
 	return respToolCall(id, toolRevisePlan, `{
 		"reason":"开始诊断",
-		"items":[{"id":"p1","intent":"诊断当前主机","class":"diagnose","status":"active"}]
+		"items":[
+			{"id":"p1","intent":"诊断当前主机","class":"diagnose","status":"active"},
+			{"id":"p2","intent":"汇总证据并收尾","class":"diagnose","status":"pending"}
+		]
 	}`)
 }
 
-// respPlanDone 把 p1 标为 done（该项上必须已经真正跑过工具）。
+// respPlanDone 把 p1 标为 done（该项上必须已经真正跑过工具），并放弃收尾项。
 func respPlanDone(id string) string {
 	return respToolCall(id, toolRevisePlan, `{
 		"reason":"诊断完成",
-		"items":[{"id":"p1","intent":"诊断当前主机","class":"diagnose","status":"done"}]
+		"items":[
+			{"id":"p1","intent":"诊断当前主机","class":"diagnose","status":"done"},
+			{"id":"p2","intent":"汇总证据并收尾","class":"diagnose","status":"dropped","reason":"结论已在回答中给出"}
+		]
 	}`)
 }
 
-// respPlanDrop 放弃 p1（工具被拒/用户拒绝后用，该项未必跑过）。
+// respPlanDrop 放弃全部诊断项（工具被拒/用户拒绝后用，该项未必跑过）。
 func respPlanDrop(id string) string {
 	return respToolCall(id, toolRevisePlan, `{
 		"reason":"无法继续",
-		"items":[{"id":"p1","intent":"诊断当前主机","class":"diagnose","status":"dropped","reason":"操作未执行"}]
+		"items":[
+			{"id":"p1","intent":"诊断当前主机","class":"diagnose","status":"dropped","reason":"操作未执行"},
+			{"id":"p2","intent":"汇总证据并收尾","class":"diagnose","status":"dropped","reason":"操作未执行"}
+		]
 	}`)
 }
 

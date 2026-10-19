@@ -49,20 +49,118 @@ describe('classifyInput', () => {
   })
 })
 
-// agent 模式：本会话已在和 Agent 对话时，输入一律当「回复」交给 Agent，
-// 不做命令识别/远端探测（api 传 undefined 也应命中，证明没去问后端）。
+// agent 模式：对话中「非命令」当回复；已知 Linux 命令仍走 shell。
 describe('resolveInput · agent 模式', () => {
-  it('agent 对话中：像命令的回复也交给 Agent', async () => {
-    expect(await resolveInput('ls -la', undefined, 'h1', true)).toEqual({ kind: 'agent', text: 'ls -la' })
-    expect(await resolveInput('yes', undefined, 'h1', true)).toEqual({ kind: 'agent', text: 'yes' })
+  const known = ['ls', 'df', 'echo', 'pwd', 'id', 'true', 'date', 'file', 'nginx', 'grep']
+  function makeApi(resolveImpl) {
+    const calls = []
+    const api = {
+      ClassifyShellInput: async text => {
+        const first = String(text || '').trim().split(/\s+/)[0] || ''
+        // 与后端一致：路径形（./x）算命令意图。
+        if (first.includes('/')) return true
+        return known.includes(first.replace(/^.*\//, ''))
+      },
+      ResolveUnknownInput: async (...args) => {
+        calls.push(args)
+        return resolveImpl ? resolveImpl(...args) : { kind: 'shell' }
+      }
+    }
+    return { api, calls }
+  }
+
+  it('agent 对话中：已知命令仍走 shell', async () => {
+    const { api } = makeApi()
+    expect(await resolveInput('ls -la', api, 'h1', true)).toEqual({ kind: 'shell', text: 'ls -la' })
+    expect(await resolveInput('df -h', api, 'h1', true)).toEqual({ kind: 'shell', text: 'df -h' })
+    expect(await resolveInput('ls', api, 'h1', true)).toEqual({ kind: 'shell', text: 'ls' })
+  })
+  it('agent 对话中：含中文参数的文本类命令走 shell', async () => {
+    const { api } = makeApi()
+    expect(await resolveInput('echo 你好', api, 'h1', true)).toEqual({ kind: 'shell', text: 'echo 你好' })
+    expect(await resolveInput('grep 错误 app.log', api, 'h1', true)).toEqual({ kind: 'shell', text: 'grep 错误 app.log' })
+  })
+  it('命令/路径 + 中文自然语言 → Agent（让模型自己分析）', async () => {
+    const { api, calls } = makeApi()
+    expect(await resolveInput('nginx 起不来了', api, 'h1', false)).toEqual({ kind: 'agent', text: 'nginx 起不来了' })
+    expect(await resolveInput('./start.sh 执行报错', api, 'h1', false)).toEqual({ kind: 'agent', text: './start.sh 执行报错' })
+    expect(await resolveInput('执行报错 ./start.sh', api, 'h1', false)).toEqual({ kind: 'agent', text: '执行报错 ./start.sh' })
+    expect(calls).toEqual([])
+  })
+  it('! 前缀仍可强制把「命令+中文」当 shell 跑', async () => {
+    const { api } = makeApi()
+    expect(await resolveInput('!./start.sh 执行报错', api, 'h1', false)).toEqual({ kind: 'shell', text: './start.sh 执行报错' })
+  })
+  it('agent 对话中：回复同形的单词交给 Agent，带参数仍执行', async () => {
+    const { api, calls } = makeApi()
+    expect(await resolveInput('id', api, 'h1', true)).toEqual({ kind: 'agent', text: 'id' })
+    expect(await resolveInput('true', api, 'h1', true)).toEqual({ kind: 'agent', text: 'true' })
+    expect(await resolveInput('date', api, 'h1', true)).toEqual({ kind: 'agent', text: 'date' })
+    expect(await resolveInput('date -u', api, 'h1', true)).toEqual({ kind: 'shell', text: 'date -u' })
+    expect(await resolveInput('id root', api, 'h1', true)).toEqual({ kind: 'shell', text: 'id root' })
+    expect(calls).toEqual([])
+  })
+  it('非 agent 对话：同形单词仍当命令执行', async () => {
+    const { api } = makeApi()
+    expect(await resolveInput('id', api, 'h1', false)).toEqual({ kind: 'shell', text: 'id' })
+    expect(await resolveInput('date', api, 'h1', false)).toEqual({ kind: 'shell', text: 'date' })
+  })
+  it('agent 对话中：中文回复不探测', async () => {
+    const { api, calls } = makeApi()
+    expect(await resolveInput('好的', api, 'h1', true)).toEqual({ kind: 'agent', text: '好的' })
+    expect(calls).toEqual([])
+  })
+  it('agent 对话中：yes / open 不探测、不执行', async () => {
+    const { api, calls } = makeApi(() => ({ kind: 'shell', binary: 'yes' }))
+    expect(await resolveInput('yes', api, 'h1', true)).toEqual({ kind: 'agent', text: 'yes' })
+    expect(await resolveInput('open 3306', api, 'h1', true)).toEqual({ kind: 'agent', text: 'open 3306' })
+    expect(calls).toEqual([])
+  })
+  it('非 agent 对话：yes 仍探测，存在就执行', async () => {
+    const { api, calls } = makeApi(() => ({ kind: 'shell', binary: 'yes' }))
+    expect(await resolveInput('yes', api, 'h1', false)).toEqual({ kind: 'shell', text: 'yes' })
+    expect(calls).toHaveLength(1)
+  })
+  it('agent 对话中：!yes 仍强制 shell', async () => {
+    const { api, calls } = makeApi()
+    expect(await resolveInput('!yes', api, 'h1', true)).toEqual({ kind: 'shell', text: 'yes' })
+    expect(calls).toEqual([])
+  })
+  it('agent 对话中：单个未知词也探测，远端存在就执行', async () => {
+    const { api, calls } = makeApi(() => ({ kind: 'shell', binary: 'bt' }))
+    expect(await resolveInput('bt', api, 'h1', true)).toEqual({ kind: 'shell', text: 'bt' })
+    expect(await resolveInput('ceshi --flag', api, 'h1', true)).toEqual({ kind: 'shell', text: 'ceshi --flag' })
+    expect(calls).toHaveLength(2)
+  })
+  it('agent 对话中：探测证明不存在才交给 Agent', async () => {
+    const { api, calls } = makeApi(() => ({ kind: 'agent', binary: 'nosuch', missing: true }))
+    const got = await resolveInput('nosuch', api, 'h1', true)
+    expect(got.kind).toBe('agent')
+    expect(got.missing).toBe(true)
+    expect(calls).toHaveLength(1)
   })
   it('agent 对话中：显式 ! 前缀仍强制 shell', async () => {
-    expect(await resolveInput('!ls -la', undefined, 'h1', true)).toEqual({ kind: 'shell', text: 'ls -la' })
+    const { api } = makeApi()
+    expect(await resolveInput('!ls -la', api, 'h1', true)).toEqual({ kind: 'shell', text: 'ls -la' })
+    expect(await resolveInput('!ceshi', api, 'h1', true)).toEqual({ kind: 'shell', text: 'ceshi' })
   })
   it('agent 对话中：? 前缀仍走 Agent 并剥前缀', async () => {
-    expect(await resolveInput('?ls -la', undefined, 'h1', true)).toEqual({ kind: 'agent', text: 'ls -la' })
+    const { api } = makeApi()
+    expect(await resolveInput('?ls -la', api, 'h1', true)).toEqual({ kind: 'agent', text: 'ls -la' })
   })
   it('非 agent 对话：命令仍走 shell', async () => {
-    expect(await resolveInput('ls -la', undefined, 'h1', false)).toEqual({ kind: 'shell', text: 'ls -la' })
+    const { api } = makeApi()
+    expect(await resolveInput('ls -la', api, 'h1', false)).toEqual({ kind: 'shell', text: 'ls -la' })
+  })
+  it('命令库问不了：agent 对话中 ls 仍走 shell，中文仍走 Agent', async () => {
+    expect(await resolveInput('ls -la', undefined, 'h1', true)).toEqual({ kind: 'shell', text: 'ls -la' })
+    expect(await resolveInput('ls', undefined, 'h1', true)).toEqual({ kind: 'shell', text: 'ls' })
+    expect(await resolveInput('好的', undefined, 'h1', true)).toEqual({ kind: 'agent', text: '好的' })
+  })
+  it('命令库抛错：与无绑定相同，非中文按 shell', async () => {
+    const api = {
+      ClassifyShellInput: async () => { throw new Error('bind down') }
+    }
+    expect(await resolveInput('pwd', api, 'h1', true)).toEqual({ kind: 'shell', text: 'pwd' })
   })
 })

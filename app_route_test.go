@@ -7,6 +7,40 @@ import (
 	"ai-shell/internal/vault"
 )
 
+// TestClassifyShellInput 钉住分流用的「是不是 Linux 命令」判定。
+//
+// 关键：命令库 = 内置 DefaultWhitelist + 用户白名单扩展，**不是**用户当前白名单本身。
+// 用户清空白名单（一切走确认）时，`ls` 仍必须被识别为命令，否则控制台敲 ls 会进 Agent。
+func TestClassifyShellInput(t *testing.T) {
+	a, _ := newShellTestApp(t, vault.ModeManual, []string{})
+
+	if !a.ClassifyShellInput("ls") {
+		t.Fatal("空白名单时 ls 仍应被识别为命令（分流用内置命令库）")
+	}
+	if !a.ClassifyShellInput("ls -la") {
+		t.Fatal("ls -la 应被识别为命令")
+	}
+	if !a.ClassifyShellInput("df -h") {
+		t.Fatal("df -h 应被识别为命令")
+	}
+	if a.ClassifyShellInput("nosuch-aishell-bin-xyz") {
+		t.Fatal("未知第三方不应被本地命令库认作命令")
+	}
+	if !a.ClassifyShellInput("./deploy.sh") {
+		t.Fatal("路径形应算命令意图")
+	}
+}
+
+func TestClassifyShellInputUserWhitelistExtends(t *testing.T) {
+	a, _ := newShellTestApp(t, vault.ModeManual, []string{"mycustomtool"})
+	if !a.ClassifyShellInput("mycustomtool --x") {
+		t.Fatal("用户白名单扩展词应被识别为命令")
+	}
+	if a.ClassifyShellInput("not-on-either-list") {
+		t.Fatal("既不在内置库也不在用户白名单的词不应算命令")
+	}
+}
+
 // TestResolveUnknownInput 钉住「首词不在命令库的一行该交给谁」的裁决语义。
 //
 // 这个函数是自动转 LLM 的**唯一入口**，也是那条安全闸门（Missing）的唯一

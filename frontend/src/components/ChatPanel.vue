@@ -2313,10 +2313,13 @@ watch(showThinkingPlaceholder, v => {
 .tool-reason { margin-top: 4px; font-size: 12px; color: var(--text-3); }
 .result-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 12px; }
 .plan {
+  /* 与 .tool-group 同左缘（头像缩进），避免执行计划比工具调用更宽 */
+  margin-left: var(--asst-indent);
   border: 1px solid var(--border);
   background: var(--surface);
   border-radius: 10px;
   padding: 10px 12px;
+  box-sizing: border-box;
 }
 .plan-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; margin-bottom: 6px; }
 .plan-title { font-weight: 600; font-size: 13px; }
