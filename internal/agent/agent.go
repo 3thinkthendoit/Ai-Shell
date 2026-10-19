@@ -50,6 +50,9 @@ const (
 	// 但快照是瞬态上下文 —— 不进会话历史。
 	EvSnapshot = "agent:snapshot"
 	EvDone     = "agent:done"
+	// EvPlan 是本轮执行计划的快照。每次 revise_plan 成功后推一次，
+	// 界面用它画可追踪的步骤，而不是只在提示词里指望模型自己记得。
+	EvPlan = "agent:plan"
 	// EvAgentTransfer 是 agent 侧文件传输的进度事件。
 	//
 	// 与前端文件管理弹窗的 fm:transfer 分开：那条通道是「人点按钮」，
@@ -877,7 +880,20 @@ func (a *Agent) Run(parent context.Context, hostID, sessionID, prompt, profileID
 		Note:     auditNote,
 	})
 
-	for step := 0; step < pol.MaxSteps; step++ {
+	// 计划只活在这一轮。修订不占 MaxSteps（那是运维工具步数），
+	// 另有修订预算，避免模型靠反复改计划把循环转满。
+	plan := newRunPlan(pol.MaxSteps)
+	toolSteps := 0
+	nudges := 0
+	maxLoops := pol.MaxSteps + plan.maxRevise + 3
+
+	for loop, step := 0, 0; loop < maxLoops; loop++ {
+		if toolSteps >= pol.MaxSteps {
+			a.emit(EvError, map[string]string{
+				"message": fmt.Sprintf("已达到最大工具调用步数（%d），会话终止。可在设置中调整。", pol.MaxSteps),
+			})
+			return nil
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -919,6 +935,24 @@ func (a *Agent) Run(parent context.Context, hostID, sessionID, prompt, profileID
 		}
 
 		if len(reply.ToolCalls) == 0 {
+			if plan.hasOpen() {
+				nudges++
+				if nudges > 2 {
+					a.emit(EvError, map[string]string{"message": "计划仍有未完成项，会话终止。"})
+					return nil
+				}
+				reply.Reasoning = ""
+				// 正文已经流式画出去了，这里定稿，避免气泡一直停在输出中。
+				a.emit(EvMessage, map[string]any{
+					"role": "assistant", "content": reply.Content, "step": step, "model": settings.Model,
+				})
+				msgs = append(msgs, reply)
+				turn = append(turn, reply)
+				// 只放进本轮请求，不进 turn。写进历史会让下一轮以为用户说过这句话。
+				msgs = append(msgs, llm.Message{Role: "user", Content: plan.openNote()})
+				step++
+				continue
+			}
 			// 终局回答。带上 step，界面据此把流式过程中拼出来的那条"活"消息定稿。
 			// 带上 model：界面据此在回答上标注「这条是哪个模型给的」，
 			// 让「选中的模型」与「实际回答的模型」对得上，不必靠模型自述。
@@ -943,8 +977,23 @@ func (a *Agent) Run(parent context.Context, hostID, sessionID, prompt, profileID
 			})
 		}
 
+		usedToolStep := false
 		for _, tc := range reply.ToolCalls {
-			out := a.executeTool(ctx, tc, hostID, sessionID, pol, known)
+			var out string
+			var ran bool
+			if tc.Function.Name == toolRevisePlan {
+				out, ran = a.applyRevise(&plan, tc.Function.Arguments)
+			} else {
+				usedToolStep = true
+				if ok, why := plan.allows(tc.Function.Name, commandArg(tc), pol.Whitelist); !ok {
+					out = a.rejectByPlan(tc, why)
+				} else {
+					out, ran = a.executeTool(ctx, tc, hostID, sessionID, pol, known)
+				}
+			}
+			if ran {
+				plan.noteToolRan()
+			}
 			toolMsg := llm.Message{
 				Role:       "tool",
 				ToolCallID: tc.ID,
@@ -957,19 +1006,72 @@ func (a *Agent) Run(parent context.Context, hostID, sessionID, prompt, profileID
 				return ctx.Err()
 			}
 		}
+		if usedToolStep {
+			toolSteps++
+		}
+		step++
 	}
 
 	a.emit(EvError, map[string]string{
-		"message": fmt.Sprintf("已达到最大工具调用步数（%d），会话终止。可在设置中调整。", pol.MaxSteps),
+		"message": "计划修订次数已用尽，会话终止。",
 	})
 	return nil
+}
+
+// applyRevise 提交或改写本轮计划。成功时把快照推给界面。
+// 第二个返回值表示活动项是否因此「执行过」——修订本身不算执行。
+func (a *Agent) applyRevise(plan *runPlan, raw string) (string, bool) {
+	out, ok := plan.revise(raw)
+	if ok {
+		a.emit(EvPlan, plan.event())
+	}
+	return out, false
+}
+
+// rejectByPlan 在工具与活动项的风险类不符时拒绝执行，并写入审计。
+// 计划拦住的尝试也要留下记录，否则排查时会以为模型没提过这条命令。
+func (a *Agent) rejectByPlan(tc llm.ToolCall, reason string) string {
+	args := jsonArgs(tc.Function.Arguments)
+	view := ToolCallView{
+		ID:       tc.ID,
+		Name:     tc.Function.Name,
+		Args:     tc.Function.Arguments,
+		Status:   "denied",
+		Decision: policy.Deny,
+		Reason:   reason,
+		Rule:     "plan",
+		HostID:   strArg(args, "host_id"),
+	}
+	if c := strArg(args, "command"); c != "" {
+		view.Command = c
+	} else if p := strArg(args, "path"); p != "" {
+		view.Command = p
+	}
+	if h, ok := a.v.GetHost(view.HostID); ok {
+		view.HostName = h.Name
+	}
+	a.emit(EvTool, view)
+	a.log(audit.Entry{
+		Kind: audit.KindTool, HostID: view.HostID, HostName: view.HostName,
+		Tool: tc.Function.Name, Command: view.Command,
+		Decision: string(policy.Deny), Rule: "plan",
+		Note: reason,
+	})
+	return "[计划拒绝] " + reason
+}
+
+func commandArg(tc llm.ToolCall) string {
+	return strArg(jsonArgs(tc.Function.Arguments), "command")
 }
 
 // executeTool 执行一次工具调用，并把结果文本返回给 LLM。
 // sessionHostID 是本轮会话所属的主机：工具的目标主机必须等于它，
 // 除非策略放开了跨主机执行（见 PolicySettings.AllowCrossHost）。
 // sessionID 是本轮所属的会话：命中 TTY 时前端要把命令交接到**该任务自己的**常驻终端。
-func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall, sessionHostID, sessionID string, pol vault.PolicySettings, known []string) string {
+//
+// 第二个返回值表示工具体是否真的跑过（策略拒绝、用户拒绝都不算），
+// 计划项只能在跑过之后被标为 done。
+func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall, sessionHostID, sessionID string, pol vault.PolicySettings, known []string) (string, bool) {
 	view := ToolCallView{
 		ID:     tc.ID,
 		Name:   tc.Function.Name,
@@ -1007,7 +1109,7 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall, sessionHostID,
 		// 「未知工具」就完了。
 		view.Status = "error"
 		a.emit(EvTool, view)
-		return fmt.Sprintf("未知工具: %s", tc.Function.Name)
+		return fmt.Sprintf("未知工具: %s", tc.Function.Name), false
 	}
 
 	// 本地工具（不需要主机、也不接触凭证）在跨主机闸门之前短路。
@@ -1046,7 +1148,7 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall, sessionHostID,
 			Note: "跨主机执行被策略拒绝",
 		})
 		return "[已被安全策略拒绝] 该工具的目标主机不是本会话所属的主机，本次调用不会执行。" +
-			"请只操作会话对应的主机；若用户要求操作其他主机，请如实告知当前策略不允许，且不要换着方式重试。"
+			"请只操作会话对应的主机；若用户要求操作其他主机，请如实告知当前策略不允许，且不要换着方式重试。", false
 	}
 
 	verdict := tool.Evaluate(&view, pol)
@@ -1063,7 +1165,7 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall, sessionHostID,
 			Decision: string(verdict.Decision), Rule: verdict.Rule,
 			Note: "硬拒绝：" + verdict.Reason,
 		})
-		return fmt.Sprintf("[已被安全策略拒绝] %s\n规则: %s\n请改用其他方式，或直接告知用户该操作被禁止。", verdict.Reason, verdict.Rule)
+		return fmt.Sprintf("[已被安全策略拒绝] %s\n规则: %s\n请改用其他方式，或直接告知用户该操作被禁止。", verdict.Reason, verdict.Rule), false
 	}
 
 	if verdict.Decision == policy.Confirm {
@@ -1079,7 +1181,7 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall, sessionHostID,
 				Decision: string(verdict.Decision), Rule: verdict.Rule,
 				Approved: &denied, Note: "用户拒绝执行",
 			})
-			return "[用户拒绝执行该操作] 请不要重复请求同一条命令，改为向用户说明你的意图并征求同意。"
+			return "[用户拒绝执行该操作] 请不要重复请求同一条命令，改为向用户说明你的意图并征求同意。", false
 		}
 	}
 
@@ -1093,14 +1195,16 @@ func (a *Agent) executeTool(ctx context.Context, tc llm.ToolCall, sessionHostID,
 //
 // 从 executeTool 里拆出来是因为本地工具与非本地工具共用这一整段：
 // 合在一起会让本地工具也要多绕一次跨主机闸门的代码路径。
-func (a *Agent) finishTool(ctx context.Context, tool Tool, view *ToolCallView, args map[string]any, verdict policy.Verdict, sessionID string, pol vault.PolicySettings, known []string) string {
+//
+// 第二个返回值：执行失败也算「跑过」（远端已接触），便于计划项随后标 done。
+func (a *Agent) finishTool(ctx context.Context, tool Tool, view *ToolCallView, args map[string]any, verdict policy.Verdict, sessionID string, pol vault.PolicySettings, known []string) (string, bool) {
 	res, execErr := tool.Run(a.toolCtx(), args)
 
 	if execErr != nil {
 		view.Status = "error"
 		view.Reason = execErr.Error()
 		a.emit(EvTool, *view)
-		return fmt.Sprintf("[执行失败] %s", execErr.Error())
+		return fmt.Sprintf("[执行失败] %s", execErr.Error()), true
 	}
 
 	view.Status = "done"
@@ -1152,7 +1256,7 @@ func (a *Agent) finishTool(ctx context.Context, tool Tool, view *ToolCallView, a
 		Injection:  findings,
 	})
 
-	return payload
+	return payload, true
 }
 
 // toolCtx 构造工具运行时依赖。
@@ -1406,6 +1510,9 @@ func systemPrompt(v *vault.Vault, allowCrossHost bool, hostID string) string {
 
 按用途分组，前面的先试：
 
+**计划（强制）**
+- revise_plan：提交或改写本轮执行计划。其它工具调用前必须有一条 active 项；证据变了就改写未完成项。
+
 **主机与诊断**
 - list_hosts：列出已配置的主机（只含 id/名称/地址/用户名，不含任何密钥）。
 - system_info：轻量系统概览（发行版、内核、负载、内存、磁盘、失败服务、Top 进程、监听端口）。
@@ -1442,6 +1549,13 @@ func systemPrompt(v *vault.Vault, allowCrossHost bool, hostID string) string {
 
 ## 工作方式
 
+- **先计划再动手**：调用任何运维/主机工具之前，先用 revise_plan 提交计划，并保证恰有一条 status=active。运行时会拒绝不在活动项类别内的工具。
+- **类别固定映射**（不可自报工具名单）：
+  - diagnose：list_hosts、只读诊断、命中只读白名单的 run_command、snapshot/diff/verify、读文件
+  - change：经批准的变更类 run_command / write_file / 上传下载，以及 snapshot/diff/verify
+  - rollback：list_file_backups、restore_file_backup、diff_state、verify_checks
+  - lookup：list_hosts、fetch_webpage、search_web
+- **证据变了就改写**：未完成项可用 revise_plan 替换；已完成/已放弃的项冻结。把项标为 done 前，该项上必须已经真正执行过工具。
 - 会话已绑定主机时（见上面第 7 条），直接在该主机上排查，**不要**先调 list_hosts 绕路；只有用户问到其他主机时才需要 list_hosts（且跨主机执行必须已获允许）。
 - 排查故障：优先 collect_diagnostics（或 system_info）→ journal_query / systemd_status / net_listen 深入 → 用证据做时间线（时间、unit、端口、变更点）再下结论。
 - 变更闭环：snapshot_state（改前）→ 经批准的 write_file/run_command → verify_checks → 失败则 list_file_backups + restore_file_backup，并用 diff_state 说明前后差异。

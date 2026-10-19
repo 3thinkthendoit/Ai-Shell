@@ -99,6 +99,7 @@ type httpDoer interface {
 // 与系统提示里「先读后写」的叙述一致，也让模型在选工具时有个自然的优先级。
 func toolRegistry() []Tool {
 	return []Tool{
+		toolRevisePlanDef,
 		toolListHosts,
 		toolSystemInfo,
 		toolCollectDiagnostics,

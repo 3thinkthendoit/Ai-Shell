@@ -232,6 +232,13 @@ func EvaluateWrite(raw string) Verdict {
 // 安全前提：白名单只放行「段首是白名单词」的命令，因此必须保证段内不存在
 // 其它可执行/可展开的语法，否则段首合法就等同于整体合法。这一步由
 // segmentAllowed 开头的元字符闸门负责 —— 改动这里时务必保持该闸门在最前面。
+// ReadOnlyCommand 判断命令是否落在只读白名单内。
+// 闸门与白名单模式的自动放行是同一套：诊断类计划只允许这类命令，
+// 避免「高危正则没覆盖到的写操作」借诊断项直接执行。
+func ReadOnlyCommand(cmd string, whitelist []string) bool {
+	return matchWhitelist(cmd, whitelist)
+}
+
 func matchWhitelist(cmd string, whitelist []string) bool {
 	if len(whitelist) == 0 {
 		return false

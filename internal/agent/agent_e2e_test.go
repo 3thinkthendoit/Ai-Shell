@@ -135,9 +135,11 @@ func writeSSEFromResponse(w http.ResponseWriter, resp string) {
 			"index": i, "id": tc.ID, "type": tc.Type,
 			"function": map[string]any{"name": tc.Function.Name},
 		}}})
-		// 参数分两段，验证按序拼接
-		half := len(tc.Function.Arguments) / 2
-		for _, part := range []string{tc.Function.Arguments[:half], tc.Function.Arguments[half:]} {
+		// 参数分两段，验证按序拼接。必须按字符切：按字节切会落在汉字中间，
+		// JSON 再编码时把半个字符换成 U+FFFD，拼回去的参数就不是原来的 JSON。
+		rs := []rune(tc.Function.Arguments)
+		half := len(rs) / 2
+		for _, part := range []string{string(rs[:half]), string(rs[half:])} {
 			send(map[string]any{"tool_calls": []any{map[string]any{
 				"index":    i,
 				"function": map[string]any{"arguments": part},
@@ -232,6 +234,57 @@ func respToolCall(id, name, args string) string {
 		}},
 	})
 	return string(b)
+}
+
+// respPlanDiagnose 提交一条 diagnose/active 计划，供后续只读工具调用。
+func respPlanDiagnose(id string) string {
+	return respToolCall(id, toolRevisePlan, `{
+		"reason":"开始诊断",
+		"items":[{"id":"p1","intent":"诊断当前主机","class":"diagnose","status":"active"}]
+	}`)
+}
+
+// respPlanDone 把 p1 标为 done（该项上必须已经真正跑过工具）。
+func respPlanDone(id string) string {
+	return respToolCall(id, toolRevisePlan, `{
+		"reason":"诊断完成",
+		"items":[{"id":"p1","intent":"诊断当前主机","class":"diagnose","status":"done"}]
+	}`)
+}
+
+// respPlanDrop 放弃 p1（工具被拒/用户拒绝后用，该项未必跑过）。
+func respPlanDrop(id string) string {
+	return respToolCall(id, toolRevisePlan, `{
+		"reason":"无法继续",
+		"items":[{"id":"p1","intent":"诊断当前主机","class":"diagnose","status":"dropped","reason":"操作未执行"}]
+	}`)
+}
+
+// respPlanChange 提交一条 change/active 计划（变更类 run_command / 写文件）。
+func respPlanChange(id string) string {
+	return respToolCall(id, toolRevisePlan, `{
+		"reason":"准备变更",
+		"items":[{"id":"p1","intent":"变更远端状态","class":"change","status":"active"}]
+	}`)
+}
+
+func respPlanChangeDone(id string) string {
+	return respToolCall(id, toolRevisePlan, `{
+		"reason":"变更完成",
+		"items":[{"id":"p1","intent":"变更远端状态","class":"change","status":"done"}]
+	}`)
+}
+
+// firstToolContent 在历次请求里找第一条 role=tool 且名字不是 revise_plan 的内容。
+func firstToolContent(h *harness) string {
+	for i := 0; i < h.fake.requestCount(); i++ {
+		for _, m := range h.fake.messagesAt(i) {
+			if m.Role == "tool" && m.Name != toolRevisePlan {
+				return m.Content
+			}
+		}
+	}
+	return ""
 }
 
 // ---- 测试环境 ----
@@ -413,8 +466,10 @@ func (h *harness) lastToolResult() map[string]any {
 // 主流程：LLM 先列主机，再执行一条真实命令，最后给出结论。
 func TestAgentEndToEndMainFlow(t *testing.T) {
 	h := newHarness(t, []string{
+		respPlanDiagnose("plan1"),
 		respToolCall("c1", "list_hosts", `{}`),
 		respToolCall("c2", "run_command", `{"host_id":"h-test","command":"uptime"}`),
+		respPlanDone("plan2"),
 		respContent("负载正常，无需处理。"),
 	}, policy.ModeWhitelist, true)
 
@@ -441,7 +496,9 @@ func TestAgentEndToEndMainFlow(t *testing.T) {
 // 缺任何一个，agent 模式下的交互式命令就只剩一条干巴巴的报错。
 func TestAgentToolResultCarriesTTYFieldsForInlineTerminal(t *testing.T) {
 	h := newHarness(t, []string{
+		respPlanChange("plan1"),
 		respToolCall("c1", "run_command", `{"host_id":"h-test","command":"top"}`),
+		respPlanChangeDone("plan2"),
 		respContent("已改用快照方式取进程数据。"),
 	}, policy.ModeWhitelist, true)
 
@@ -543,7 +600,9 @@ func TestTerminalFinalSnapshotHasDistinctHead(t *testing.T) {
 // 白名单模式下，只读命令自动放行，不应弹出审批。
 func TestAgentWhitelistAutoAllowsReadOnly(t *testing.T) {
 	h := newHarness(t, []string{
+		respPlanDiagnose("plan1"),
 		respToolCall("c1", "run_command", `{"host_id":"h-test","command":"uptime"}`),
+		respPlanDone("plan2"),
 		respContent("完成"),
 	}, policy.ModeWhitelist, false) // autoApprove=false —— 若要求审批就会卡住
 
@@ -567,7 +626,9 @@ func TestAgentWhitelistAutoAllowsReadOnly(t *testing.T) {
 // 手动模式：每条命令都必须审批，用户批准后执行。
 func TestAgentManualModeRequiresApproval(t *testing.T) {
 	h := newHarness(t, []string{
+		respPlanDiagnose("plan1"),
 		respToolCall("c1", "run_command", `{"host_id":"h-test","command":"uptime"}`),
+		respPlanDone("plan2"),
 		respContent("已检查"),
 	}, policy.ModeManual, true)
 
@@ -598,7 +659,9 @@ func TestAgentManualModeRequiresApproval(t *testing.T) {
 // 界面看起来可以无限期挂着，实际上后端早已作废。
 func TestAgentApprovalCarriesDeadline(t *testing.T) {
 	h := newHarness(t, []string{
+		respPlanDiagnose("plan1"),
 		respToolCall("c1", "run_command", `{"host_id":"h-test","command":"uptime"}`),
+		respPlanDone("plan2"),
 		respContent("已检查"),
 	}, policy.ModeManual, true)
 
@@ -628,7 +691,9 @@ func TestAgentApprovalExpiredEmitsEvent(t *testing.T) {
 
 	// autoApprove=false：让审批一直挂到超时，而不是被自动批准。
 	h := newHarness(t, []string{
+		respPlanDiagnose("plan1"),
 		respToolCall("c1", "run_command", `{"host_id":"h-test","command":"uptime"}`),
+		respPlanDrop("plan2"),
 		respContent("已检查"),
 	}, policy.ModeManual, false)
 
@@ -657,7 +722,9 @@ func TestAgentApprovalExpiredEmitsEvent(t *testing.T) {
 // 用户拒绝后，命令不得执行，agent 应继续把结论说完。
 func TestAgentUserDenial(t *testing.T) {
 	h := newHarness(t, []string{
+		respPlanDiagnose("plan1"),
 		respToolCall("c1", "run_command", `{"host_id":"h-test","command":"echo SHOULD-NOT-RUN"}`),
+		respPlanDrop("plan2"),
 		respContent("好的，我不执行这条命令。"),
 	}, policy.ModeManual, false) // 不自动批准 → 走超时/拒绝路径
 
@@ -703,7 +770,9 @@ func TestAgentUserDenial(t *testing.T) {
 // 而且**根本不产生审批请求**（因为它是硬拒绝，不是待确认）。
 func TestAgentHardDeniesCredentialRead(t *testing.T) {
 	h := newHarness(t, []string{
+		respPlanDiagnose("plan1"),
 		respToolCall("c1", "run_command", `{"host_id":"h-test","command":"cat /etc/shadow"}`),
+		respPlanDrop("plan2"),
 		respContent("该操作被安全策略禁止。"),
 	}, policy.ModeWhitelist, false)
 
@@ -734,7 +803,9 @@ func TestAgentHardDeniesCredentialRead(t *testing.T) {
 // 检查**实际回喂给 LLM 的那条消息**是否已被脱敏并包裹。
 func TestAgentRedactsOutputBeforeFeedingLLM(t *testing.T) {
 	h := newHarness(t, []string{
+		respPlanDiagnose("plan1"),
 		respToolCall("c1", "read_file", `{"host_id":"h-test","path":"`+sshtest.ConfPath+`"}`),
+		respPlanDone("plan2"),
 		respContent("配置里有一个明文口令，建议改为环境变量。"),
 	}, policy.ModeWhitelist, false)
 
@@ -742,15 +813,9 @@ func TestAgentRedactsOutputBeforeFeedingLLM(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 第二次请求里应包含上一轮的工具结果 —— 检查真正回喂给 LLM 的内容
-	var toolMsg string
-	for _, m := range h.fake.messagesAt(1) {
-		if m.Role == "tool" {
-			toolMsg = m.Content
-		}
-	}
+	toolMsg := firstToolContent(h)
 	if toolMsg == "" {
-		t.Fatal("第二次请求中应包含工具结果消息")
+		t.Fatal("请求中应包含工具结果消息")
 	}
 	if strings.Contains(toolMsg, sshtest.LeakedSecret) {
 		t.Fatalf("回喂给 LLM 的内容仍含明文口令: %q", toolMsg)
@@ -777,7 +842,9 @@ func TestAgentRedactsOutputBeforeFeedingLLM(t *testing.T) {
 //     也能让第 1 条通过，而那样 LLM 就分析不了任何故障了。
 func TestAgentRedactsEnvStyleCredentialsBeforeFeedingLLM(t *testing.T) {
 	h := newHarness(t, []string{
+		respPlanDiagnose("plan1"),
 		respToolCall("c1", "read_file", `{"host_id":"h-test","path":"`+sshtest.EnvStylePath+`"}`),
+		respPlanDone("plan2"),
 		respContent("配置里有若干明文凭据，建议改为环境变量注入。"),
 	}, policy.ModeWhitelist, false)
 
@@ -785,15 +852,9 @@ func TestAgentRedactsEnvStyleCredentialsBeforeFeedingLLM(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 检查真正回喂给 LLM 的那条消息
-	var toolMsg string
-	for _, m := range h.fake.messagesAt(1) {
-		if m.Role == "tool" {
-			toolMsg = m.Content
-		}
-	}
+	toolMsg := firstToolContent(h)
 	if toolMsg == "" {
-		t.Fatal("第二次请求中应包含工具结果消息")
+		t.Fatal("请求中应包含工具结果消息")
 	}
 
 	for _, leak := range []string{
@@ -826,7 +887,9 @@ func TestAgentRedactsEnvStyleCredentialsBeforeFeedingLLM(t *testing.T) {
 // 应触发告警，且原始内容保留（作为排查证据）。
 func TestAgentDetectsInjectionInRemoteOutput(t *testing.T) {
 	h := newHarness(t, []string{
+		respPlanDiagnose("plan1"),
 		respToolCall("c1", "run_command", `{"host_id":"h-test","command":"echo IGNORE-PLACEHOLDER"}`),
+		respPlanDone("plan2"),
 		respContent("我在输出中发现了疑似提示注入。"),
 	}, policy.ModeWhitelist, false)
 
@@ -850,7 +913,7 @@ func TestAgentDetectsInjectionInRemoteOutput(t *testing.T) {
 
 // 达到最大步数必须停下，不能无限循环。
 func TestAgentStopsAtMaxSteps(t *testing.T) {
-	var script []string
+	script := []string{respPlanDiagnose("plan1")}
 	for i := 0; i < 20; i++ {
 		script = append(script, respToolCall("c", "run_command",
 			`{"host_id":"h-test","command":"uptime"}`))
@@ -873,7 +936,9 @@ func TestAgentStopsAtMaxSteps(t *testing.T) {
 // 审计日志必须完整覆盖整轮会话。
 func TestAgentWritesAuditTrail(t *testing.T) {
 	h := newHarness(t, []string{
+		respPlanDiagnose("plan1"),
 		respToolCall("c1", "run_command", `{"host_id":"h-test","command":"uptime"}`),
+		respPlanDone("plan2"),
 		respContent("完成"),
 	}, policy.ModeWhitelist, false)
 
@@ -972,7 +1037,9 @@ func TestAgentStreamsAnswerIncrementally(t *testing.T) {
 // 这条测试让命令真的跑在（进程内真实的）SSH 服务器上，用真实输出来证明拼接正确。
 func TestAgentExecutesToolCallWithFragmentedArguments(t *testing.T) {
 	h := newHarness(t, []string{
+		respPlanDiagnose("plan1"),
 		respToolCall("c1", "run_command", `{"host_id":"h-test","command":"echo streamed-ok"}`),
+		respPlanDone("plan2"),
 		respContent("完成"),
 	}, policy.ModeWhitelist, true)
 
@@ -980,17 +1047,7 @@ func TestAgentExecutesToolCallWithFragmentedArguments(t *testing.T) {
 		t.Fatalf("运行失败: %v", err)
 	}
 
-	// 工具结果会被作为 role=tool 的消息回喂给模型；第二次请求里就能看到它。
-	msgs := h.fake.messagesAt(1)
-	if len(msgs) == 0 {
-		t.Fatal("应当发生第二次 LLM 请求（回喂工具结果）")
-	}
-	var out string
-	for _, m := range msgs {
-		if m.Role == "tool" {
-			out = m.Content
-		}
-	}
+	out := firstToolContent(h)
 	if !strings.Contains(out, "streamed-ok") {
 		t.Fatalf("命令没有按预期执行，工具结果: %q", out)
 	}
@@ -1358,6 +1415,7 @@ func TestAgentClearSessionStopsCarryingContext(t *testing.T) {
 // 本用例覆盖的是第一道，也顺带验证「写坏的历史不会流到下一次请求里」这个后果。
 func TestAgentRunDoesNotRememberUnfinishedTurn(t *testing.T) {
 	h := newHarness(t, []string{
+		respPlanDiagnose("plan1"),
 		respToolCall("c1", "run_command", `{"host_id":"h-test","command":"uptime"}`),
 		respContent("（这一条不该被用到）"),
 	}, policy.ModeWhitelist, true)
@@ -1566,7 +1624,9 @@ func registerSecondHost(t *testing.T, h *harness) string {
 // 必须被策略拒绝 —— 不拨号、不审批、不执行，agent 收到拒绝说明后继续收尾。
 func TestAgentCrossHostDeniedByDefault(t *testing.T) {
 	h := newHarness(t, []string{
+		respPlanDiagnose("plan1"),
 		respToolCall("c1", "run_command", `{"host_id":"h-other","command":"uptime"}`),
+		respPlanDrop("plan2"),
 		respContent("被拒绝了，我只报告本机。"),
 	}, policy.ModeWhitelist, true) // autoApprove=true：若走到审批说明拦截失败
 
@@ -1600,12 +1660,8 @@ func TestAgentCrossHostDeniedByDefault(t *testing.T) {
 
 	// 给 LLM 的拒绝说明不该泄漏「设置里有开关」—— 对受限环境的用户，
 	// 那等于让模型主动引导用户去找开关。开关提示只出现在给用户的 Reason 里。
-	if len(h.fake.messagesAt(1)) > 0 {
-		for _, m := range h.fake.messagesAt(1) {
-			if m.Role == "tool" && strings.Contains(m.Content, "策略设置") {
-				t.Fatalf("给模型的拒绝文本不应包含设置入口提示: %q", m.Content)
-			}
-		}
+	if msg := firstToolContent(h); strings.Contains(msg, "策略设置") {
+		t.Fatalf("给模型的拒绝文本不应包含设置入口提示: %q", msg)
 	}
 }
 
@@ -1613,7 +1669,9 @@ func TestAgentCrossHostDeniedByDefault(t *testing.T) {
 // 且仍走正常的策略/审批链（这里走白名单自动放行）。
 func TestAgentCrossHostAllowedWhenPolicyEnables(t *testing.T) {
 	h := newHarness(t, []string{
+		respPlanDiagnose("plan1"),
 		respToolCall("c1", "run_command", `{"host_id":"h-other","command":"uptime"}`),
+		respPlanDone("plan2"),
 		respContent("两台都正常。"),
 	}, policy.ModeWhitelist, false)
 
@@ -1647,7 +1705,9 @@ func TestAgentCrossHostAllowedWhenPolicyEnables(t *testing.T) {
 // 这条规则目前只存在于代码分支里，没有用例钉住就会在重构时静默翻转。
 func TestAgentNoSessionHostDeniesAllTools(t *testing.T) {
 	h := newHarness(t, []string{
+		respPlanDiagnose("plan1"),
 		respToolCall("c1", "run_command", `{"host_id":"h-test","command":"echo SHOULD-NOT-RUN"}`),
+		respPlanDrop("plan2"),
 		respContent("没有归属主机，我不执行。"),
 	}, policy.ModeWhitelist, true)
 
@@ -1679,7 +1739,9 @@ func TestAgentNoSessionHostDeniesAllTools(t *testing.T) {
 // 看不到目标主机名的审批等于没审。
 func TestAgentCrossHostGoesThroughApproval(t *testing.T) {
 	h := newHarness(t, []string{
+		respPlanChange("plan1"),
 		respToolCall("c1", "run_command", `{"host_id":"h-other","command":"touch /tmp/marker"}`),
+		respPlanChangeDone("plan2"),
 		respContent("已执行。"),
 	}, policy.ModeManual, true)
 

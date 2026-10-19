@@ -156,6 +156,10 @@ const statusLabel = s => ({
   done: t('console.toolStatus.done'), denied: t('console.toolStatus.denied'),
   error: t('console.toolStatus.error')
 }[s] || s)
+const planStatusLabel = s => ({
+  active: t('console.plan.active'), pending: t('console.plan.pending'),
+  done: t('console.plan.done'), dropped: t('console.plan.dropped')
+}[s] || s)
 
 const activeProfileId = computed(() =>
   store.selectedProfileId || (store.llmProfiles.find(p => p.active) || {}).id || ''
@@ -861,6 +865,20 @@ watch(showThinkingPlaceholder, v => {
           <div v-if="it.injection && it.injection.length" class="tool-reason">
             {{ t('console.injection.found', { findings: it.injection.join('、') }) }}
           </div>
+        </div>
+
+        <div v-else-if="it.kind === 'plan'" class="plan">
+          <div class="plan-head">
+            <span class="plan-title">{{ t('console.plan.title') }}</span>
+            <span v-if="it.reason" class="muted tiny">{{ t('console.plan.reason', { reason: it.reason }) }}</span>
+          </div>
+          <ul class="plan-items">
+            <li v-for="item in (it.items || [])" :key="item.id" :class="'plan-' + item.status">
+              <span class="badge neutral">{{ planStatusLabel(item.status) }}</span>
+              <span class="badge">{{ item.class }}</span>
+              <span>{{ item.intent || item.id }}</span>
+            </li>
+          </ul>
         </div>
 
         <div v-else-if="it.kind === 'user'" class="msg user">
@@ -2294,6 +2312,18 @@ watch(showThinkingPlaceholder, v => {
 }
 .tool-reason { margin-top: 4px; font-size: 12px; color: var(--text-3); }
 .result-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 12px; }
+.plan {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.plan-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; margin-bottom: 6px; }
+.plan-title { font-weight: 600; font-size: 13px; }
+.plan-items { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.plan-items li { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 13px; }
+.plan-active { font-weight: 600; }
+.plan-dropped { opacity: 0.65; text-decoration: line-through; }
 .injection {
   border: 1px solid #f59e0b;
   background: color-mix(in srgb, #f59e0b 10%, var(--surface));

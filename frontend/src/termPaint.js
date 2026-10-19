@@ -197,6 +197,21 @@ export function paintAssistantEnd(write, md) {
 // 与后端协议匹配的标识符，不翻；只有展示层走字典。
 const DECISION_LABELS = { allow: 'tl.decision.allow', confirm: 'tl.decision.confirm', deny: 'tl.decision.deny' }
 
+// 执行计划：每次 revise_plan 成功后画一帧清单，方便对照「强制遵循」的当前活动项。
+export function paintPlan(write, plan) {
+  if (!write || !plan) return
+  nl(write, '')
+  const reason = plan.reason ? DIM + ' · ' + String(plan.reason) + RESET : ''
+  nl(write, CYAN + BOLD + '☰ ' + t('tl.plan.title') + RESET + reason)
+  const items = Array.isArray(plan.items) ? plan.items : []
+  for (const it of items) {
+    const st = String(it.status || '')
+    const mark = st === 'active' ? '→' : st === 'done' ? '✓' : st === 'dropped' ? '×' : '·'
+    const color = st === 'active' ? YELLOW : st === 'done' ? GREEN : st === 'dropped' ? DIM : RESET
+    nl(write, color + '  ' + mark + ' [' + String(it.class || '') + '] ' + String(it.intent || it.id || '') + RESET)
+  }
+}
+
 // 工具调用：**实时**画一行 —— agent 每调一次画一次，让人当场看到它在调什么工具，
 // 不必等收尾、也不必翻「对话归档」。卡片风格（▸ + 工具名 + 命令），
 // 刻意不用 shell 的 `$ cmd`，避免一段对话看起来像命令行。

@@ -133,7 +133,7 @@ describe('bindEvents 事件接线', () => {
     bindEvents()
     for (const name of [
       'agent:message', 'agent:tool', 'agent:toolResult', 'agent:injection',
-      'agent:approval', 'approval:expired', 'agent:status', 'agent:error', 'agent:done',
+      'agent:approval', 'approval:expired', 'agent:status', 'agent:error', 'agent:plan', 'agent:done',
       'audit:error'
     ]) {
       expect(rt.handlerCount(name), `缺少监听: ${name}`).toBe(1)
@@ -180,6 +180,19 @@ describe('bindEvents 事件接线', () => {
     const r = store.entries.find(e => e.kind === 'result')
     expect(r.redacted).toBe(3)
     expect(r.injection).toEqual(['忽略先前指令'])
+  })
+
+  it('agent:plan 落一条可追踪的计划记录', () => {
+    install({ runtime: rt, app: makeApp().app })
+    bindEvents()
+    rt.emit('agent:plan', {
+      reason: '开始诊断',
+      items: [{ id: 'p1', intent: '看负载', class: 'diagnose', status: 'active' }]
+    })
+    const p = store.entries.find(e => e.kind === 'plan')
+    expect(p.reason).toBe('开始诊断')
+    expect(p.items).toHaveLength(1)
+    expect(p.items[0].status).toBe('active')
   })
 
   it('agent:snapshot 落一条快照记录到归属会话的时间线', () => {

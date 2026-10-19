@@ -23,6 +23,7 @@ import { estimateTokens } from '../tokenEstimate.js'
 const EV_NAMES = [
   'agent:delta', 'agent:message', 'agent:reasoning', 'agent:tool', 'agent:toolResult',
   'agent:injection', 'agent:approval', 'approval:expired', 'agent:status', 'agent:error',
+  'agent:plan',
   'audit:error', 'agent:done', 'term:data', 'term:exit', 'term:tui', 'term:cmd', 'term:cwd', 'agent:snapshot',
   'fm:transfer', 'agent:transfer'
 ]
@@ -343,6 +344,16 @@ export function bindTerminalEvents(runtime) {
     paint.paintAssistantHeader(w, badge)
     paint.paintAssistantDelta(w, m.content, mdAnsi)
     paint.paintAssistantEnd(w, mdAnsi)
+  })
+
+  runtime.EventsOn('agent:plan', p => {
+    stopThinking(paintHost())
+    push({
+      kind: 'plan',
+      reason: (p && p.reason) || '',
+      items: (p && p.items) || []
+    })
+    paint.paintPlan(surfaceWrite(paintHost()), p)
   })
 
   runtime.EventsOn('agent:tool', v => {
