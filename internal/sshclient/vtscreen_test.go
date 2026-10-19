@@ -210,8 +210,9 @@ func TestSnapshotterAbandonSuppressesFinal(t *testing.T) {
 	sn := NewSnapshotter(s, 0, func(string, bool) { n++ })
 	sn.Abandon()
 	sn.Final() // 主动关闭路径：不应把 MOTD 当结束画面送出
+	sn.Flush()
 	if n != 0 {
-		t.Fatalf("Abandon 后 Final 不该送帧，实得 %d 次", n)
+		t.Fatalf("Abandon 后 Final/Flush 不该送帧，实得 %d 次", n)
 	}
 }
 

@@ -547,6 +547,11 @@ func TestTerminalSnapshotIsTransientContext(t *testing.T) {
 	}, policy.ModeWhitelist, true)
 
 	h.ag.InjectTerminalSnapshot(h.hostID, "", "h-test#a1", "> load: 9.9", 1, nil, false)
+	for _, ev := range h.events {
+		if ev == EvSnapshot {
+			t.Fatal("屏幕快照不应回写对话时间线（agent:snapshot）")
+		}
+	}
 
 	if err := runDefault(h.ag, context.Background(), h.hostID, "屏幕上现在是什么"); err != nil {
 		t.Fatal(err)
@@ -603,6 +608,50 @@ func TestTerminalFinalSnapshotHasDistinctHead(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("首轮请求应含定格帧 system 消息，实得 %v", h.fake.messagesAt(0))
+	}
+}
+
+// 关闭后再打开，关闭前拿到的代际不能把旧屏幕写回队列。
+func TestStaleSnapGenerationDroppedAfterReopen(t *testing.T) {
+	ag := New(nil, nil, func(string, any) {})
+	gen, ok := ag.PrepareSnap("h", "s")
+	if !ok {
+		t.Fatal("未关闭时应允许入队")
+	}
+	ag.DiscardSnaps("h", "s")
+	ag.UnsealSnaps("h", "s")
+	if ag.InjectConsoleFailureHint("h", "s", 1, "old", nil, gen) {
+		t.Fatal("关闭前的代际在重新打开后不该写入")
+	}
+	if notes := ag.DrainSnapsForTest("h", "s"); len(notes) != 0 {
+		t.Fatalf("旧代际不该留在队列，实得 %d", len(notes))
+	}
+	gen2, ok := ag.PrepareSnap("h", "s")
+	if !ok || !ag.InjectConsoleFailureHint("h", "s", 2, "new", nil, gen2) {
+		t.Fatal("重新打开后的新代际应能写入")
+	}
+}
+
+// 清空上下文必须让已经开始处理的失败提示写不回来，同时不封印后续提示。
+func TestClearSessionDropsInFlightFailureHint(t *testing.T) {
+	ag := New(nil, nil, func(string, any) {})
+	gen, ok := ag.PrepareSnap("h", "s")
+	if !ok {
+		t.Fatal("未清空时应允许入队")
+	}
+	ag.InjectTerminalSnapshot("h", "s", "h#s", "old-screen", 0, nil, false)
+	if _, busy := ag.ClearSession("h", "s"); busy {
+		t.Fatal("没有正在跑的回合，不该拒绝清空")
+	}
+	if ag.InjectConsoleFailureHint("h", "s", 1, "old", nil, gen) {
+		t.Fatal("清空前拿到的代际不该写回")
+	}
+	if notes := ag.DrainSnapsForTest("h", "s"); len(notes) != 0 {
+		t.Fatalf("清空后队列应为空，实得 %d 条", len(notes))
+	}
+	gen2, ok := ag.PrepareSnap("h", "s")
+	if !ok || !ag.InjectConsoleFailureHint("h", "s", 2, "new", nil, gen2) {
+		t.Fatal("清空不该封印终端，新的失败提示仍要能入队")
 	}
 }
 

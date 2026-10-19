@@ -43,13 +43,13 @@ type App struct {
 	tSeq     int64 // 传输 id 发生器（原子递增）
 	tCancels map[string]context.CancelFunc
 
-	// termVT 是常驻终端的 VT 管线注册表（termKey = host+session → 状态）：每条任务
-	// 各一条独立 shell，屏幕模型负责认全屏重绘（OSC 133 命令边界 + CUP/ED 特征 +
-	// 备用屏幕开关），在命令结束/备用屏幕释放/PTY 退出时把最后一帧定格送进快照管线。
-	// 快照器不开周期静止timer：agent 命令的输出已有有界捕获，
-	// 模型缺的只是「人眼看到的那一屏」。
+	// termVT 是常驻终端的 VT 管线注册表（termKey = host+session → 状态）。
+	// 全屏退出和 PTY 自然结束时，最后一屏留在 frameText 里供 read_console 读取，
+	// 不自动进模型上下文。用户主动关闭或切走会话时，frameGen 加一并把画面丢掉。
 	mu         sync.Mutex
 	termVT     map[string]*termVTState
+	frameGen   map[string]uint64
+	frameText  map[string]string
 	activeSess map[string]string // hostID → 前端正在看的会话（Ask 上下文路由用）
 
 	// bgWg 跟踪后台杂务（目前只有 shell integration 注入）。它的存在是为了
@@ -755,20 +755,24 @@ func (a *App) OpenTerminal(hostID, sessionID string, cols, rows int) error {
 	}
 
 	key := termKey(hostID, sessionID)
+	// 重新打开后允许失败提示入队。上次关闭留下的封印只覆盖那一次终端。
+	if a.ag != nil {
+		a.ag.UnsealSnaps(hostID, sessionID)
+	}
 	// 只留当前任务：关掉同主机其它任务的 shell。
-	// 先 Abandon 再关：切会话是主动卸下，不要把登录 MOTD 当「结束画面」灌进对话；
-	// top/vim 有意义的帧在退出全屏时已经 Flush 过了。
+	// 先 Abandon 再关，并丢掉旧会话尚未消费的队列：切会话是主动卸下，
+	// 登录画面和 vim 里的最后一屏都不进下一轮对话。
 	for _, oldKey := range a.listHostTermKeysExcept(hostID, key) {
 		a.abandonTermVT(oldKey)
+		a.invalidateFrame(oldKey)
+		a.discardSnapsForTermKey(oldKey)
 	}
 	for _, oldKey := range a.ssh.CloseHostPTYsExcept(hostID, key) {
 		a.dropTermVT(oldKey, nil)
 	}
 
-	// 屏幕模型与定格管线每条任务一份：top/vim 退出时的最后一帧
-	// 靠它进模型上下文。触发点：
-	// 命令结束且全屏重绘过、命令非 0 退出（报错留在可见屏）、备用屏幕释放、PTY 退出。
-	// 成功的流式命令（ls）不送：结尾画面没有信息量。
+	// 屏幕模型每条任务一份。全屏退出和 PTY 结束不把画面送进模型，
+	// 失败命令只塞短提示；完整屏幕由 read_console 读取。
 	c, r := cols, rows
 	if c < 2 || c > 512 {
 		c = 80
@@ -777,13 +781,19 @@ func (a *App) OpenTerminal(hostID, sessionID string, cols, rows int) error {
 		r = 24
 	}
 	screen := sshclient.NewScreen(c, r)
+	// 全屏退出 / PTY 自然结束时把最后一屏留下来给 read_console。
+	// 不入队、不进对话。gen 在打开时取走：用户随后关闭会把代际加一，
+	// 迟到的定格写不回去。
+	frameGen := a.frameGeneration(key)
 	snapper := sshclient.NewSnapshotter(screen, 0, func(text string, final bool) {
-		// 定格归属本任务自己的 sessionID（不再依赖 activeSession）。
-		a.deliverSnapshot(hostID, sessionID, key, text, final)
+		if !final || strings.TrimSpace(text) == "" {
+			return
+		}
+		a.retainFrame(key, text, frameGen)
 	})
 	screen.SetTriggers(
 		func(tui bool, exitCode int, exitKnown bool) {
-			// 全屏重绘：定格最后一帧（top 按 q 后屏上就是结论）。
+			// 全屏重绘结束：留下这一帧给 read_console，不进模型队列。
 			if tui {
 				snapper.Flush()
 				return
@@ -794,7 +804,7 @@ func (a *App) OpenTerminal(hostID, sessionID string, cols, rows int) error {
 				a.deliverConsoleFailureHint(hostID, sessionID, exitCode, screen.TextTail(40))
 			}
 		},
-		func() { snapper.Flush() }, // 备用屏幕释放：vim/htop 退出的那一瞬
+		func() { snapper.Flush() }, // 备用屏幕释放：留下给 read_console，不进模型队列
 	)
 	// onExit 捕获这一份 vt：晚到的退出只应清掉自己这条管线，不能把
 	// 「切走再切回」后新开的那条的状态误删（见 dropTermVT 的身份守卫）。
@@ -841,7 +851,7 @@ func (a *App) OpenTerminal(hostID, sessionID string, cols, rows int) error {
 			a.emit(EvTermData, termDataPayload(hostID, sessionID, b))
 		},
 		func(reason string) {
-			// 最后机会：把退出时的画面定格留给模型（内容未变时自动去重）。
+			// 自然退出：Final 把最后一屏留在 frameText。主动关闭已 Abandon，这里不会再留。
 			snapper.Final()
 			a.dropTermVT(key, vt)
 			// 竞态守卫（与 dropTermVT 的身份守卫同源）：dropTermVT 只在登记的仍是
@@ -1035,6 +1045,15 @@ func (a *App) abandonTermVT(key string) {
 	a.mu.Unlock()
 }
 
+// discardSnapsForTermKey 按终端注册表键丢掉该会话尚未消费的队列。
+func (a *App) discardSnapsForTermKey(key string) {
+	hostID, sessionID, ok := strings.Cut(key, termKeySep)
+	if !ok || a.ag == nil {
+		return
+	}
+	a.ag.DiscardSnaps(hostID, sessionID)
+}
+
 // listHostTermKeysExcept 列出某主机上除 keepKey 外已登记的 VT 键（关之前 Abandon 用）。
 func (a *App) listHostTermKeysExcept(hostID, keepKey string) []string {
 	prefix := hostID + termKeySep
@@ -1152,8 +1171,16 @@ func (a *App) CloseTerminal(hostID, sessionID string) bool {
 		return false
 	}
 	key := termKey(hostID, sessionID)
-	// 主动关闭：放弃定格，避免登录 banner 进对话（见 Snapshotter.Abandon）。
+	// 本来就没开着：不要封印会话，否则后续失败提示会被误丢。
+	if a.ssh.PTY(key) == nil {
+		return false
+	}
+	// 主动关闭：放弃定格，并丢掉尚未消费的队列和保留画面。
 	a.abandonTermVT(key)
+	a.invalidateFrame(key)
+	if a.ag != nil {
+		a.ag.DiscardSnaps(hostID, sessionID)
+	}
 	if !a.ssh.ClosePTY(key) {
 		return false
 	}
@@ -1169,7 +1196,41 @@ func (a *App) CloseTerminal(hostID, sessionID string) bool {
 	return true
 }
 
+// frameGeneration 返回该终端当前的画面代际。关闭或切走时会加一。
+func (a *App) frameGeneration(key string) uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.frameGen[key]
+}
+
+// retainFrame 保存全屏退出或 PTY 自然结束时的最后一屏，供 read_console 读取。
+// gen 与当前代际不一致时丢掉：那是用户已经关闭之后才到的迟到帧。
+func (a *App) retainFrame(key, text string, gen uint64) {
+	text = clipBytes(clipTailLines(text, 200), 8*1024)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.frameGen[key] != gen {
+		return
+	}
+	if a.frameText == nil {
+		a.frameText = map[string]string{}
+	}
+	a.frameText[key] = text
+}
+
+// invalidateFrame 丢掉保留画面，并让已取出的代际全部失效。
+func (a *App) invalidateFrame(key string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.frameGen == nil {
+		a.frameGen = map[string]uint64{}
+	}
+	a.frameGen[key]++
+	delete(a.frameText, key)
+}
+
 // ReadConsole 实现 agent.consoleReader：返回某任务常驻终端的可见屏幕纯文本。
+// 终端进程已经结束时，返回退出前保留的最后一屏。用户主动关闭后该画面不留。
 // maxLines 从底部向上截取；<=0 时用默认 80。
 func (a *App) ReadConsole(hostID, sessionID string, maxLines int) (string, error) {
 	if a == nil || a.ssh == nil {
@@ -1178,52 +1239,48 @@ func (a *App) ReadConsole(hostID, sessionID string, maxLines int) (string, error
 	key := termKey(hostID, sessionID)
 	a.mu.Lock()
 	vt := a.termVT[key]
+	held := a.frameText[key]
 	a.mu.Unlock()
-	if vt == nil || vt.screen == nil {
-		return "", fmt.Errorf("该任务的控制台未打开，请先切换到终端视图")
-	}
 	if maxLines <= 0 {
 		maxLines = 80
 	}
 	if maxLines > 200 {
 		maxLines = 200
 	}
-	// TextTail 含滚出可视区的行：报错刚被新提示符顶上去时仍能读到。
-	return vt.screen.TextTail(maxLines), nil
-}
-
-// deliverSnapshot 把一帧屏幕快照送完安全管线再交给 agent 的瞬态上下文。
-//
-// 顺序不能换：先脱敏再注入检测 —— 注入话术里嵌着机密时，
-// 脱敏后的文本才是进检测器和进上下文的同一份东西。
-func (a *App) deliverSnapshot(hostID, sessionID, termID, text string, final bool) {
-	text = clipSnapshot(text)
-	known := a.v.SecretStrings()
-	clean, n := policy.Redact(text, known)
-	findings := policy.DetectInjection(clean)
-	what := "终端屏幕快照进入模型上下文"
-	if final {
-		what = "终端结束画面进入模型上下文"
+	var live string
+	if vt != nil && vt.screen != nil {
+		live = vt.screen.TextTail(maxLines)
 	}
-	a.auditLog(audit.Entry{
-		Kind:     audit.KindTerminal,
-		HostID:   hostID,
-		HostName: hostNameOf(a.v, hostID),
-		Decision: "human",
-		Rule:     "pty",
-		Note: fmt.Sprintf("%s（term=%s，%d 字节，脱敏 %d 处，注入告警 %d 条）",
-			what, termID, len(clean), n, len(findings)),
-	})
-	a.ag.InjectTerminalSnapshot(hostID, sessionID, termID, clean, n, findings, final)
+	if strings.TrimSpace(live) == "" && strings.TrimSpace(held) == "" {
+		return "", fmt.Errorf("该任务的控制台未打开，请先切换到终端视图")
+	}
+	held = clipTailLines(held, maxLines)
+	if strings.TrimSpace(held) == "" || strings.Contains(live, strings.TrimSpace(held)) {
+		return live, nil
+	}
+	if strings.TrimSpace(live) == "" {
+		return held, nil
+	}
+	return live + "\n--- 最近一次全屏退出时的画面 ---\n" + held, nil
 }
 
 // deliverConsoleFailureHint 在普通命令非 0 退出时只塞短提示（辅）。
 // 完整画面留给模型调 read_console（主）。
 func (a *App) deliverConsoleFailureHint(hostID, sessionID string, exitCode int, text string) {
+	if a.ag == nil {
+		return
+	}
+	gen, ok := a.ag.PrepareSnap(hostID, sessionID)
+	if !ok {
+		return
+	}
 	tail := clipTailLines(text, 20)
 	known := a.v.SecretStrings()
 	clean, n := policy.Redact(tail, known)
 	findings := policy.DetectInjection(clean)
+	if !a.ag.InjectConsoleFailureHint(hostID, sessionID, exitCode, clean, findings, gen) {
+		return
+	}
 	a.auditLog(audit.Entry{
 		Kind:     audit.KindTerminal,
 		HostID:   hostID,
@@ -1233,15 +1290,9 @@ func (a *App) deliverConsoleFailureHint(hostID, sessionID string, exitCode int, 
 		Note: fmt.Sprintf("控制台失败提示进入模型上下文（exit=%d，摘要 %d 字节，脱敏 %d 处，注入告警 %d 条）",
 			exitCode, len(clean), n, len(findings)),
 	})
-	a.ag.InjectConsoleFailureHint(hostID, sessionID, exitCode, clean, findings)
 }
 
-// clipSnapshot 给快照封顶：可见屏幕通常几十行，但异常尺寸（512 行）
-// 不该把整篇文章塞进一次请求。先裁行再裁字节（字节裁切按 UTF-8 边界）。
-func clipSnapshot(text string) string {
-	return clipBytes(clipTailLines(text, 200), 8*1024)
-}
-
+// clipTailLines 只保留末尾若干行。失败提示用它，避免整屏进上下文。
 func clipTailLines(text string, maxLines int) string {
 	if maxLines <= 0 {
 		return text

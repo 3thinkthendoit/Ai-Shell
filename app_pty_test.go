@@ -29,8 +29,8 @@ func newTermTestApp(t *testing.T) (*App, string) {
 
 	a := newTestApp(t)
 	a.ssh = sshclient.New(a.v)
-	// 快照管线的终点是 agent 的瞬态上下文 + EvSnapshot 事件：
-	// 不给它真实例，deliverSnapshot 会在 nil 上炸。
+	// 快照管线的终点是 agent 的瞬态上下文：
+	// 不给它真实例，失败提示入队会在 nil 上炸。
 	a.ag = agent.New(a.v, a.ssh, a.emit)
 	a.ctx = nil // 事件推送在测试里是空操作（见 a.emit），不影响绑定逻辑
 
@@ -48,6 +48,12 @@ func newTermTestApp(t *testing.T) (*App, string) {
 		t.Fatalf("初始化审计日志失败: %v", err)
 	}
 	a.audit = lg
+	t.Cleanup(func() {
+		a.bgWg.Wait()
+		if a.ssh != nil {
+			a.ssh.Close()
+		}
+	})
 	return a, "h1"
 }
 
@@ -419,16 +425,12 @@ func TestReportActiveSessionRoutesSnapshot(t *testing.T) {
 	}
 }
 
-// 全屏重绘型命令（tuispin：CUP+ED 重绘三帧后退出，不发备用屏幕）在
-// OSC 133;D 命令结束时必须定格最后一帧：走完快照管线、审计出现
-// 「终端结束画面进入模型上下文」。top 这类不发 ?1049h 的程序全靠
-// 「命令期间全屏重绘过」这个特征识别 —— 早先只认备用屏幕会漏掉它们。
+// 全屏重绘（tuispin）结束后，最后一屏留在终端里，不进模型上下文。
 func TestPersistentTerminalFinalSnapshotOnTUICommandEnd(t *testing.T) {
 	a, hostID := newTermTestApp(t)
 	if err := a.OpenTerminal(hostID, "s1", 80, 24); err != nil {
 		t.Fatalf("打开失败: %v", err)
 	}
-	// 报告快照归属的会话：定格快照落进本 PTY 自己的 sessionID（s1）。
 	if err := a.ReportActiveSession(hostID, "s1"); err != nil {
 		t.Fatalf("报告会话失败: %v", err)
 	}
@@ -437,14 +439,19 @@ func TestPersistentTerminalFinalSnapshotOnTUICommandEnd(t *testing.T) {
 		t.Fatalf("写入命令失败: %v", err)
 	}
 
-	waitForTerm(t, "TUI 命令结束的定格快照审计落盘", func() bool {
-		for _, e := range a.ListAudit(0).Entries {
-			if e.Kind == audit.KindTerminal && strings.Contains(e.Note, "终端结束画面进入模型上下文") {
-				return true
-			}
-		}
-		return false
+	waitForTerm(t, "tuispin 画面出现在终端", func() bool {
+		text, err := a.ReadConsole(hostID, "s1", 80)
+		return err == nil && strings.Contains(text, "load:")
 	})
+	time.Sleep(200 * time.Millisecond)
+	for _, e := range a.ListAudit(0).Entries {
+		if e.Kind == audit.KindTerminal && strings.Contains(e.Note, "进入模型上下文") {
+			t.Errorf("全屏退出不该把屏幕送进模型，实得 %q", e.Note)
+		}
+	}
+	if notes := a.ag.DrainSnapsForTest(hostID, "s1"); len(notes) != 0 {
+		t.Errorf("全屏退出不该入队，实得 %d 条", len(notes))
+	}
 }
 
 // 用户点「关闭终端」/ 切会话主动卸下：不应把登录 MOTD 当结束画面灌进对话。
@@ -476,11 +483,63 @@ func TestCloseTerminalDoesNotInjectFinalSnapshot(t *testing.T) {
 			t.Errorf("主动关闭不该定格结束画面，实得 %q", e.Note)
 		}
 	}
+	if notes := a.ag.DrainSnapsForTest(hostID, "s1"); len(notes) != 0 {
+		t.Errorf("主动关闭应丢掉尚未消费的快照队列，实得 %d 条", len(notes))
+	}
+	if _, err := a.ReadConsole(hostID, "s1", 80); err == nil {
+		t.Error("主动关闭后不该再读到保留画面")
+	}
 }
 
-// PTY 退出（人手敲 exit，shell 结束）是定格的第三个触发点：哪怕这条
-// 命令没有全屏重绘，退出时的最后一屏也要留给模型 —— 「死亡现场」
-// 往往就是结论本身。
+// vim 退出会 Flush 最后一屏入队；用户随后关闭终端，那一屏不该留到下一轮对话。
+func TestCloseTerminalDiscardsQueuedSnapshot(t *testing.T) {
+	a, hostID := newTermTestApp(t)
+	if err := a.OpenTerminal(hostID, "s1", 80, 24); err != nil {
+		t.Fatalf("打开失败: %v", err)
+	}
+	// 模拟 vim 退出时 Flush 已经把最后一屏入队，用户随后点关闭。
+	a.ag.InjectTerminalSnapshot(hostID, "s1", hostID+"#s1", "JWT_SECRET=***", 1, nil, true)
+	if !a.CloseTerminal(hostID, "s1") {
+		t.Fatal("关闭应当返回 true")
+	}
+	waitForTerm(t, "关闭审计落盘", func() bool {
+		for _, e := range a.ListAudit(0).Entries {
+			if e.Kind == audit.KindTerminal && strings.Contains(e.Note, "关闭了交互终端") {
+				return true
+			}
+		}
+		return false
+	})
+	if notes := a.ag.DrainSnapsForTest(hostID, "s1"); len(notes) != 0 {
+		t.Errorf("关闭后快照队列应为空，实得 %d 条", len(notes))
+	}
+	// 关闭之后迟到的写入也要丢掉，直到这条终端再次打开。
+	a.ag.InjectTerminalSnapshot(hostID, "s1", hostID+"#s1", "JWT_SECRET=***", 1, nil, true)
+	if notes := a.ag.DrainSnapsForTest(hostID, "s1"); len(notes) != 0 {
+		t.Errorf("关闭后的迟到快照不该入队，实得 %d 条", len(notes))
+	}
+}
+
+// 切到同主机另一条任务时，旧会话里已经入队的屏幕也要丢掉。
+func TestSwitchSessionDiscardsQueuedSnapshot(t *testing.T) {
+	a, hostID := newTermTestApp(t)
+	if err := a.OpenTerminal(hostID, "s1", 80, 24); err != nil {
+		t.Fatalf("打开 s1 失败: %v", err)
+	}
+	a.ag.InjectTerminalSnapshot(hostID, "s1", hostID+"#s1", "JWT_SECRET=***", 1, nil, true)
+	if err := a.OpenTerminal(hostID, "s2", 80, 24); err != nil {
+		t.Fatalf("打开 s2 失败: %v", err)
+	}
+	if notes := a.ag.DrainSnapsForTest(hostID, "s1"); len(notes) != 0 {
+		t.Errorf("切走后 s1 的快照队列应为空，实得 %d 条", len(notes))
+	}
+	a.ag.InjectTerminalSnapshot(hostID, "s1", hostID+"#s1", "late", 0, nil, true)
+	if notes := a.ag.DrainSnapsForTest(hostID, "s1"); len(notes) != 0 {
+		t.Errorf("切走后 s1 的迟到快照不该入队，实得 %d 条", len(notes))
+	}
+}
+
+// PTY 自己退出时，最后一屏不进模型队列，但 read_console 仍能读到。
 func TestPersistentTerminalFinalSnapshotOnPTYExit(t *testing.T) {
 	a, hostID := newTermTestApp(t)
 	if err := a.OpenTerminal(hostID, "s1", 80, 24); err != nil {
@@ -489,26 +548,85 @@ func TestPersistentTerminalFinalSnapshotOnPTYExit(t *testing.T) {
 	if err := a.ReportActiveSession(hostID, "s1"); err != nil {
 		t.Fatalf("报告会话失败: %v", err)
 	}
+	if err := a.WriteTerminal(hostID, "s1", base64.StdEncoding.EncodeToString([]byte("echo HOLDME\n"))); err != nil {
+		t.Fatalf("写入 echo 失败: %v", err)
+	}
+	waitForTerm(t, "标记出现在终端", func() bool {
+		text, err := a.ReadConsole(hostID, "s1", 80)
+		return err == nil && strings.Contains(text, "HOLDME")
+	})
 
 	if err := a.WriteTerminal(hostID, "s1", base64.StdEncoding.EncodeToString([]byte("exit\n"))); err != nil {
 		t.Fatalf("写入 exit 失败: %v", err)
 	}
 
-	waitForTerm(t, "PTY 退出的定格快照审计落盘", func() bool {
-		var ended, snapped bool
+	waitForTerm(t, "PTY 退出审计落盘", func() bool {
 		for _, e := range a.ListAudit(0).Entries {
-			if e.Kind != audit.KindTerminal {
-				continue
-			}
-			if strings.Contains(e.Note, "交互终端已结束") {
-				ended = true
-			}
-			if strings.Contains(e.Note, "终端结束画面进入模型上下文") {
-				snapped = true
+			if e.Kind == audit.KindTerminal && strings.Contains(e.Note, "交互终端已结束") {
+				return true
 			}
 		}
-		return ended && snapped
+		return false
 	})
+	time.Sleep(200 * time.Millisecond)
+	for _, e := range a.ListAudit(0).Entries {
+		if e.Kind == audit.KindTerminal && strings.Contains(e.Note, "进入模型上下文") {
+			t.Errorf("shell 退出不该把屏幕送进模型，实得 %q", e.Note)
+		}
+	}
+	if notes := a.ag.DrainSnapsForTest(hostID, "s1"); len(notes) != 0 {
+		t.Errorf("shell 退出不该入队，实得 %d 条", len(notes))
+	}
+	text, err := a.ReadConsole(hostID, "s1", 80)
+	if err != nil {
+		t.Fatalf("进程退出后应仍能读到最后一屏: %v", err)
+	}
+	if !strings.Contains(text, "HOLDME") {
+		t.Fatalf("最后一屏应含退出前的输出，实得 %q", text)
+	}
+}
+
+// 全屏程序退出后，备用屏幕上的那一帧仍能通过 read_console 读到，且不进模型队列。
+func TestTUIExitFrameRemainsReadable(t *testing.T) {
+	a, hostID := newTermTestApp(t)
+	if err := a.OpenTerminal(hostID, "s1", 80, 24); err != nil {
+		t.Fatalf("打开失败: %v", err)
+	}
+	if err := a.WriteTerminal(hostID, "s1", base64.StdEncoding.EncodeToString([]byte("tuitop\n"))); err != nil {
+		t.Fatalf("写入 tuitop 失败: %v", err)
+	}
+	waitForTerm(t, "tuitop 画面出现", func() bool {
+		text, err := a.ReadConsole(hostID, "s1", 80)
+		return err == nil && strings.Contains(text, "load: 1.2")
+	})
+	if err := a.WriteTerminal(hostID, "s1", base64.StdEncoding.EncodeToString([]byte("q"))); err != nil {
+		t.Fatalf("写入 q 失败: %v", err)
+	}
+	waitForTerm(t, "tuitop 退出后仍能读到那一帧", func() bool {
+		text, err := a.ReadConsole(hostID, "s1", 80)
+		return err == nil && strings.Contains(text, "load: 1.2")
+	})
+	if notes := a.ag.DrainSnapsForTest(hostID, "s1"); len(notes) != 0 {
+		t.Errorf("全屏退出不该入队，实得 %d 条", len(notes))
+	}
+}
+
+// 终端没开着时关闭应返回 false，且不能封印该会话的失败提示。
+func TestCloseTerminalWhenNotOpenDoesNotSeal(t *testing.T) {
+	a, hostID := newTermTestApp(t)
+	gen, ok := a.ag.PrepareSnap(hostID, "s1")
+	if !ok {
+		t.Fatal("未关闭时应允许入队")
+	}
+	if a.CloseTerminal(hostID, "s1") {
+		t.Fatal("没开着的终端关闭应返回 false")
+	}
+	if _, ok := a.ag.PrepareSnap(hostID, "s1"); !ok {
+		t.Fatal("没开着的关闭不该封印会话")
+	}
+	if !a.ag.InjectConsoleFailureHint(hostID, "s1", 1, "still-open", nil, gen) {
+		t.Fatal("没开着的关闭不该丢掉失败提示")
+	}
 }
 
 // 成功的流式命令（ls，退出码 0）结束时不该定格，也不该塞失败提示。

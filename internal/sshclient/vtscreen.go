@@ -719,9 +719,9 @@ func (sn *Snapshotter) Kick() {
 // final=true 表示这是定格帧（TUI 退出/PTY 结束），会原样传给 onSnap。
 func (sn *Snapshotter) fire(final bool) {
 	sn.mu.Lock()
-	if sn.stopped && !final {
-		// 静止触发在停表后作废；但 Final 定格是「最后机会」，
-		// 即使已 Stop 也要送 —— 所以它走 final=true 且绕过这里的拦截。
+	if sn.abandoned || (sn.stopped && !final) {
+		// 静止触发在停表后作废；Final 走 final=true，停表后仍可送。
+		// Abandon 之后连定格帧也不送：主动关闭不该再把屏幕送出去。
 		sn.mu.Unlock()
 		return
 	}
@@ -731,7 +731,7 @@ func (sn *Snapshotter) fire(final bool) {
 	sum := fnvSum(text)
 
 	sn.mu.Lock()
-	if sn.stopped && !final {
+	if sn.abandoned || (sn.stopped && !final) {
 		sn.mu.Unlock()
 		return
 	}
