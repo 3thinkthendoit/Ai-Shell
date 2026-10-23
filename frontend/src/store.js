@@ -1519,22 +1519,22 @@ export async function fmUpload(file) {
   }
 }
 
-// fmDownload 把远端文件下载到用户挑选的本地路径。
+// fmDownload 把远端文件或目录下载到用户挑选的本地路径。
 //
-// 保存走 Wails 原生对话框、传输由后端分块落盘（app_files.go 的
-// downloadTo）：前端只发一次请求，之后通过 fm:transfer 事件收进度与速度。
-//
-// 旧实现把整个文件 base64 塞回前端、用 <a download> 触发浏览器下载 ——
-// 在应用窗口里这依赖 WebView 的下载行为，macOS 的 WKWebView 对它支持
-// 很差（表现为点了没反应），而且传输期间没有任何进度可看。
-export async function fmDownload(entryPath, name) {
+// isDir=true 时调 DownloadRemoteFolder（远端 tar 打包 → 分块下载 → 本地解压），
+// isDir=false 时调 DownloadRemoteFile（直接分块下载）。
+// 两者共用同一套进度事件机制（fm:transfer），目录下载额外有
+// compressing / extracting 两个不定进度阶段。
+export async function fmDownload(entryPath, name, isDir) {
   const fm = fmState()
   if (!api()) return
   fm.busy = true
   fm.error = ''
   fm.notice = ''
   try {
-    const res = await api().DownloadRemoteFile(fm.hostId, entryPath)
+    const res = isDir
+      ? await api().DownloadRemoteFolder(fm.hostId, entryPath)
+      : await api().DownloadRemoteFile(fm.hostId, entryPath)
     if (res && res.cancelled) {
       // 用户在保存对话框里按了取消：不是错误，界面什么都不该显示。
       return

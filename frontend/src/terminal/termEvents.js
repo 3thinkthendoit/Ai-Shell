@@ -492,7 +492,18 @@ export function bindTerminalEvents(runtime) {
   })
 
   runtime.EventsOn('fm:transfer', d => {
-    if (!d || d.kind !== 'download') return
+    if (!d) return
+    // compressing / extracting：不定进度阶段（目录下载的打包与解压）
+    if (d.kind === 'compressing' || d.kind === 'extracting') {
+      store.fileManager.progress = {
+        phase: d.kind,
+        name: d.name,
+        total: 0,
+        loaded: 0,
+      }
+      return
+    }
+    if (d.kind !== 'download') return
     store.fileManager.progress = {
       phase: 'downloading',
       id: d.id,

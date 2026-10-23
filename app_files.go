@@ -14,11 +14,15 @@ package main
 //   - 所有操作写审计，事后可查。
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -242,6 +246,125 @@ func (a *App) pickSaveDest(target string) (string, error) {
 	return strings.TrimSpace(dest), nil
 }
 
+// DownloadRemoteFolder 把远端目录下载到用户挑选的本地目录。
+//
+// 策略：远端 tar czf → 分块下载到本地临时文件 → 本地解压 → 清理两端临时文件。
+//
+// 为什么用 tar 而不是逐文件下载：目录里可能有成百上千个小文件，
+// 每个文件一次 SSH exec（stat + read chunks）会产生数千次网络往返，
+// 既慢又容易超时。tar 只需一次打包命令，然后用已有的分块机制把压缩包传下来，
+// 代价是远端和本地各需要一份临时空间。
+//
+// 进度分三阶段：
+//   - compressing：远端 tar 打包（不定进度）
+//   - downloading：分块下载压缩包（确定进度，复用 downloadTo）
+//   - extracting：本地解压（不定进度）
+func (a *App) DownloadRemoteFolder(hostID, remotePath string) FileOpResult {
+	if err := a.ready(); err != nil {
+		return FileOpResult{Error: err.Error()}
+	}
+	if strings.TrimSpace(hostID) == "" {
+		return FileOpResult{Error: "请先选择一台主机"}
+	}
+	target := normalizeRemotePath(strings.TrimSpace(remotePath))
+	if target == "" || target == "/" {
+		return FileOpResult{Error: "请选择一个目录"}
+	}
+
+	folderName := path.Base(target)
+
+	// 1. 让用户选本地目标目录（原生对话框）
+	destDir, err := a.pickDirDest()
+	if err != nil {
+		return FileOpResult{Error: err.Error()}
+	}
+	if destDir == "" {
+		return FileOpResult{Cancelled: true}
+	}
+
+	// 2. 远端打包：tar czf /tmp/aishell_folder_<ts>.tar.gz -C <parent> <basename>
+	//    用 -C parent basename 而不是直接传绝对路径：前者在包里存的是
+	//    相对路径（如 nginx/conf.d/default.conf），解压到 destDir 后结构正确；
+	//    后者存的是 /etc/nginx/... 形式，解压时若不做处理会写到错误位置。
+	tmpRemote := fmt.Sprintf("/tmp/aishell_folder_%d.tar.gz", time.Now().UnixNano())
+	parentDir := path.Dir(target)
+
+	// 发 compressing 阶段事件（在可能耗时的 tar 命令之前）
+	a.emit(EvFileTransfer, FileTransferProgress{
+		Kind: "compressing",
+		Name: folderName,
+		Dest: destDir,
+	})
+
+	// defer 在 Exec 之前注册：即使 Exec 超时/连接断开（terr != nil），
+	// 远端也可能已写入了部分 tmpRemote 文件，必须清理。
+	// rm -f 对不存在的文件无害，所以提前注册没有副作用。
+	defer func() {
+		_, _ = a.ssh.Exec(hostID, "rm -f -- "+shellQuote(tmpRemote), 30*time.Second)
+	}()
+
+	tarCmd := fmt.Sprintf("tar czf %s -C %s -- %s",
+		shellQuote(tmpRemote), shellQuote(parentDir), shellQuote(folderName))
+	res, terr := a.ssh.Exec(hostID, tarCmd, 10*time.Minute)
+	if terr != nil {
+		a.auditFile("下载目录失败：远端打包 "+terr.Error(), hostID, target)
+		return FileOpResult{Error: "远端打包失败：" + terr.Error()}
+	}
+	if res.ExitCode != 0 {
+		errMsg := strings.TrimSpace(res.Stderr)
+		if errMsg == "" {
+			errMsg = "退出码 " + strconv.Itoa(res.ExitCode)
+		}
+		a.auditFile("下载目录失败：远端打包 "+errMsg, hostID, target)
+		return FileOpResult{Error: "远端打包失败：" + errMsg}
+	}
+
+	// 3. 分块下载压缩包到本地临时文件（复用 downloadTo + 进度事件）
+	tmpLocal := filepath.Join(os.TempDir(), fmt.Sprintf("aishell_folder_%d.tar.gz", time.Now().UnixNano()))
+	defer os.Remove(tmpLocal) // 无论成败都清理本地临时文件
+
+	result := a.downloadTo(hostID, tmpRemote, tmpLocal, func(p FileTransferProgress) {
+		p.Name = folderName // 把临时文件名替换成用户看得懂的目录名
+		a.emit(EvFileTransfer, p)
+	})
+	if !result.OK {
+		return result
+	}
+
+	// 4. 本地解压到 destDir
+	a.emit(EvFileTransfer, FileTransferProgress{
+		Kind: "extracting",
+		Name: folderName,
+		Dest: destDir,
+	})
+
+	if err := extractTarGz(tmpLocal, destDir); err != nil {
+		// 清掉半成品目录：与 downloadTo 的铁律一致 ——
+		// 一个「看起来完整」的残缺目录比失败更危险。
+		_ = os.RemoveAll(filepath.Join(destDir, folderName))
+		a.auditFile("下载目录失败：解压 "+err.Error(), hostID, target)
+		return FileOpResult{Error: "解压失败：" + err.Error()}
+	}
+
+	localPath := filepath.Join(destDir, folderName)
+	a.auditFile(fmt.Sprintf("下载目录到本地 %s", localPath), hostID, target)
+	return FileOpResult{OK: true, Message: localPath}
+}
+
+// pickDirDest 弹出原生目录选择对话框，返回用户选的本地目录（取消返回空串）。
+func (a *App) pickDirDest() (string, error) {
+	if a.ctx == nil {
+		return "", fmt.Errorf("窗口尚未就绪")
+	}
+	dir, err := runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{
+		Title: "选择保存到哪个目录",
+	})
+	if err != nil {
+		return "", fmt.Errorf("无法打开目录选择对话框：%w", err)
+	}
+	return strings.TrimSpace(dir), nil
+}
+
 // downloadTo 分块读取远端文件并写到本地 dest，逐块回报进度。
 //
 // 单独抽出来（而不是并进 DownloadRemoteFile）是为了可测：进度回调与
@@ -326,6 +449,106 @@ func (a *App) downloadTo(hostID, target, dest string, onProgress func(FileTransf
 	}
 	a.auditFile(fmt.Sprintf("下载 %d 字节到本地 %s", written, dest), hostID, target)
 	return FileOpResult{OK: true, Message: dest}
+}
+
+// extractTarGz 把 .tar.gz 压缩包解压到 destDir。
+//
+// 安全约束：压缩包内任何条目的解析路径若超出 destDir，一律拒绝（防止
+// 恶意 tarball 通过 ../ 路径穿越写到任意位置）。
+func extractTarGz(archivePath, destDir string) error {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		return fmt.Errorf("解压 gzip 失败：%w", err)
+	}
+	defer gr.Close()
+
+	destDirAbs, _ := filepath.Abs(destDir)
+	tr := tar.NewReader(gr)
+
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("读取压缩包失败：%w", err)
+		}
+
+		name := hdr.Name
+		if name == "" {
+			continue
+		}
+
+		// 路径穿越防护：解析后的绝对路径必须在 destDir 内
+		targetAbs := filepath.Join(destDirAbs, name)
+		if targetAbs != destDirAbs && !strings.HasPrefix(targetAbs, destDirAbs+string(os.PathSeparator)) {
+			return fmt.Errorf("压缩包包含非法路径：%s", name)
+		}
+
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(targetAbs, 0o755); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(targetAbs), 0o755); err != nil {
+				return err
+			}
+			outFile, err := os.OpenFile(targetAbs, os.O_CREATE|os.O_WRONLY|os.O_TRUNC,
+				os.FileMode(hdr.Mode&0o777))
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(outFile, tr); err != nil {
+				outFile.Close()
+				return err
+			}
+			outFile.Close()
+		case tar.TypeLink:
+			// 硬链接：Linkname 是相对于压缩包根的路径，需解析到 destDir 下
+			linkTarget := filepath.Join(destDirAbs, hdr.Linkname)
+			if linkTarget != destDirAbs && !strings.HasPrefix(linkTarget, destDirAbs+string(os.PathSeparator)) {
+				return fmt.Errorf("压缩包包含非法硬链接目标：%s -> %s", name, hdr.Linkname)
+			}
+			if err := os.MkdirAll(filepath.Dir(targetAbs), 0o755); err != nil {
+				return err
+			}
+			_ = os.Remove(targetAbs)
+			if err := os.Link(linkTarget, targetAbs); err != nil {
+				return err
+			}
+		case tar.TypeSymlink:
+			if err := os.MkdirAll(filepath.Dir(targetAbs), 0o755); err != nil {
+				return err
+			}
+			// 纵深防御：校验 symlink 目标解析后是否仍在 destDir 内。
+			// 恶意 tarball 可以先建一个 foo -> /tmp 的 symlink，
+			// 再通过 foo/bar 条目将内容写到 destDir 外部。
+			// 绝对路径或解析后超出 destDir 的 symlink 直接跳过（系统目录里
+			// 常见 /etc/alternatives 这类绝对链接，跳过比失败更合理）。
+			linkname := hdr.Linkname
+			var resolved string
+			if filepath.IsAbs(linkname) {
+				resolved = linkname
+			} else {
+				resolved = filepath.Join(filepath.Dir(targetAbs), linkname)
+			}
+			resolvedAbs, _ := filepath.Abs(resolved)
+			if resolvedAbs != destDirAbs && !strings.HasPrefix(resolvedAbs, destDirAbs+string(os.PathSeparator)) {
+				continue // symlink 指向 destDir 外部，跳过
+			}
+			_ = os.Remove(targetAbs)
+			// symlink 创建失败不致命：某些文件系统或权限可能不支持
+			_ = os.Symlink(linkname, targetAbs)
+		}
+	}
+	return nil
 }
 
 // registerTransfer / unregisterTransfer 维护活跃传输的取消注册表。

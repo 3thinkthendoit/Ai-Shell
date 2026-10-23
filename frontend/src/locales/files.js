@@ -10,6 +10,7 @@ export const files = {
     'fm.enterDir': '进入目录',
     'fm.link': '链接',
     'fm.download': '下载到本机',
+    'fm.downloadDir': '下载文件夹',
     'fm.cancel': '取消',
     'fm.cancelTitle': '取消下载（半成品文件会被清掉）',
     'fm.upload': '上传到当前目录',
@@ -18,6 +19,8 @@ export const files = {
     'fm.preparing': '准备中 · {size}',
     'fm.preparingNoSize': '准备中…',
     'fm.sending': '发送中 · {size}',
+    'fm.compressing': '打包中…',
+    'fm.extracting': '解压中…',
     'fm.done': '完成'
   },
   en: {
@@ -30,6 +33,7 @@ export const files = {
     'fm.enterDir': 'Open directory',
     'fm.link': 'link',
     'fm.download': 'Download to this machine',
+    'fm.downloadDir': 'Download folder',
     'fm.cancel': 'Cancel',
     'fm.cancelTitle': 'Cancel download (the partial file will be removed)',
     'fm.upload': 'Upload to this directory',
@@ -38,6 +42,8 @@ export const files = {
     'fm.preparing': 'Preparing · {size}',
     'fm.preparingNoSize': 'Preparing…',
     'fm.sending': 'Sending · {size}',
+    'fm.compressing': 'Compressing…',
+    'fm.extracting': 'Extracting…',
     'fm.done': 'Done'
   }
 }

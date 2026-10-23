@@ -9,6 +9,22 @@ const busy = ref(false)
 const testing = ref('')
 const testResult = reactive({})
 
+// Wails 在 macOS 上跑的是 WKWebView，原生 confirm() 不会弹框且直接返回 undefined，
+// 会让「删除」「清除指纹」在首行 return。这里用一个 Promise 化的自绘模态替代。
+const confirmState = ref(null)
+
+function askConfirm({ message, okLabel, danger = false }) {
+  return new Promise(resolve => {
+    confirmState.value = { message, okLabel, danger, resolve }
+  })
+}
+
+function settleConfirm(ok) {
+  const s = confirmState.value
+  confirmState.value = null
+  if (s) s.resolve(ok)
+}
+
 const blank = () => ({
   id: '',
   name: '',
@@ -60,7 +76,12 @@ async function save() {
 }
 
 async function remove(h) {
-  if (!confirm(t('hosts.confirmDelete', { name: h.name }))) return
+  const ok = await askConfirm({
+    message: t('hosts.confirmDelete', { name: h.name }),
+    okLabel: t('hosts.delete'),
+    danger: true
+  })
+  if (!ok) return
   try {
     await window.go.main.App.DeleteHost(h.id)
     await refreshHosts()
@@ -84,7 +105,11 @@ async function test(h) {
 }
 
 async function forgetKey(h) {
-  if (!confirm(t('hosts.confirmForget', { name: h.name }))) return
+  const ok = await askConfirm({
+    message: t('hosts.confirmForget', { name: h.name }),
+    okLabel: t('hosts.forgetKey')
+  })
+  if (!ok) return
   try {
     await window.go.main.App.ForgetHostKey(h.id)
     push({ kind: 'system', content: t('hosts.forgot', { name: h.name }) })
@@ -135,6 +160,19 @@ const authLabel = m => ({ password: t('hosts.auth.password'), private_key: t('ho
           <button class="sm" @click="startEdit(h)">{{ t('hosts.edit') }}</button>
           <button class="sm" @click="forgetKey(h)">{{ t('hosts.forgetKey') }}</button>
           <button class="sm danger" @click="remove(h)">{{ t('hosts.delete') }}</button>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="confirmState" class="overlay" @click.self="settleConfirm(false)">
+      <div class="modal confirm-modal">
+        <p class="confirm-msg">{{ confirmState.message }}</p>
+        <div class="modal-actions">
+          <button @click="settleConfirm(false)">{{ t('hosts.cancel') }}</button>
+          <button
+            :class="confirmState.danger ? 'danger' : 'primary'"
+            @click="settleConfirm(true)"
+          >{{ confirmState.okLabel }}</button>
         </div>
       </div>
     </div>
@@ -263,6 +301,8 @@ const authLabel = m => ({ password: t('hosts.auth.password'), private_key: t('ho
 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
 .chk { display: flex; align-items: center; gap: 8px; margin-top: 14px; color: var(--danger); font-size: 12px; }
+.confirm-modal { width: 420px; }
+.confirm-msg { margin: 0 0 6px; font-size: 13px; line-height: 1.7; color: var(--text); }
 .hint {
   background: var(--surface-2);
   border-radius: 8px;

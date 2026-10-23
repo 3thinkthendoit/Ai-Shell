@@ -68,18 +68,16 @@
             <!-- 下载用图标而不是文字按钮：一列「下载」两个字占掉约 60px，
                  而这一列对每一行都是同一种操作，文字没有增加信息量。
                  换成图标后名字那一列能宽出不少（长文件名不再那么容易被截断）。
-                 图标只对文件有意义：目录要被打包才能传，所以目录位留一个
-                 等宽占位，保证各行的图标列仍然对齐。 -->
+                 目录也可以下载（远端 tar 打包后传），用同一个图标，只是 title 不同。 -->
             <button
-              v-if="!e.isDir"
               class="fm-dl"
               :disabled="fm.busy"
-              :title="t('fm.download')"
-              :aria-label="t('fm.download')"
+              :title="e.isDir ? t('fm.downloadDir') : t('fm.download')"
+              :aria-label="e.isDir ? t('fm.downloadDir') : t('fm.download')"
               @click="download(e)"
             >
               <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
-                <!-- 云 + 下箭头：云表示"远端/云端"，箭头朝下表示"取到本机"。 -->
+                <!-- 云 + 下箭头：云表示“远端/云端”，箭头朝下表示“取到本机”。 -->
                 <path
                   d="M6.5 17.5a4.5 4.5 0 0 1-.3-8.99A6 6 0 0 1 17.7 9.2a3.9 3.9 0 0 1-.2 8.3"
                   fill="none"
@@ -98,7 +96,6 @@
                 />
               </svg>
             </button>
-            <span v-else class="fm-dl-gap"></span>
           </div>
         </template>
       </div>
@@ -174,12 +171,14 @@ const canGoParent = computed(() => fm.parent && fm.parent !== fm.cwd)
 // 它们都要处理"total 未知/为 0"的情况，散在模板里会重复三遍同样的判断，
 // 而且模板里的除零只会安静地产生 NaN%，不容易在 code review 里被看见。
 
-// progressKnown 表示"能给出一个有意义的百分比"。
+// progressKnown 表示“能给出一个有意义的百分比”。
 // 读阶段（上传）与下载阶段都可以（有文件大小），发送阶段不行
 // （拿不到回调）—— 后者宁可显示不定进度，也不显示一个骗人的数字。
+// compressing / extracting（目录下载的两个阶段）同样是不定进度。
 const progressKnown = computed(() => {
   const p = fm.progress
   if (!p) return false
+  if (p.phase === 'compressing' || p.phase === 'extracting') return false
   if (p.phase === 'reading' || p.phase === 'downloading') return p.total > 0
   return false
 })
@@ -198,6 +197,8 @@ const progressPct = computed(() => {
 const progressText = computed(() => {
   const p = fm.progress
   if (!p) return ''
+  if (p.phase === 'compressing') return t('fm.compressing')
+  if (p.phase === 'extracting') return t('fm.extracting')
   const size = p.total ? fmtBytes(p.total) : ''
   if (progressKnown.value) {
     const base = `${progressPct.value}% · ${fmtBytes(p.loaded)} / ${size}`
@@ -251,7 +252,7 @@ function onRowClick(e) {
 }
 
 async function download(e) {
-  await fmDownload(e.path, e.name)
+  await fmDownload(e.path, e.name, e.isDir)
 }
 
 function pickFile() {
