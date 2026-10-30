@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -719,7 +720,10 @@ func (a *Agent) log(e audit.Entry) {
 		return
 	}
 	if err := au.Append(e); err != nil {
+		// 固定文案带 i18n code：前端按当前语言翻译（storeMsg.js 的 msg.*），
+		// message 保留中文兜底（老前端 / code 无对应文案时）。
 		a.emit(EvAuditError, map[string]string{
+			"code": "msg.auditWriteFail", "detail": err.Error(),
 			"message": "审计日志写入失败，审计轨迹可能已不完整：" + err.Error(),
 		})
 	}
@@ -895,7 +899,10 @@ func (a *Agent) Run(parent context.Context, hostID, sessionID, prompt, profileID
 		a.mu.Unlock()
 		// 这里发生在 defer（EvDone）注册之前，若不发事件，前端会永远
 		// 停在「运行中」且看不到任何报错 —— 必须显式告知。
-		a.emit(EvError, map[string]string{"message": "已有会话正在运行，请等待其完成或点「中断」"})
+		// code 是前端 i18n key：推送文案不再固化后端语言（见 log() 注释）。
+		a.emit(EvError, map[string]string{
+			"code": "msg.agentBusy", "message": "已有会话正在运行，请等待其完成或点「中断」",
+		})
 		return fmt.Errorf("已有会话正在运行")
 	}
 	ctx, cancel := context.WithCancel(parent)
@@ -916,15 +923,21 @@ func (a *Agent) Run(parent context.Context, hostID, sessionID, prompt, profileID
 	// 会以为选的那套在回答。整轮固定这一套：同一轮里不会中途换模型。
 	settings, apiKey, ok := a.v.LLMFor(profileID)
 	if !ok {
-		a.emit(EvError, map[string]string{"message": "所选服务商已不存在（可能已被删除），请刷新后重试。"})
+		a.emit(EvError, map[string]string{
+			"code": "msg.agentProfileGone", "message": "所选服务商已不存在（可能已被删除），请刷新后重试。",
+		})
 		return fmt.Errorf("LLM 服务商不存在: %s", profileID)
 	}
 	if len(images) > 0 && !settings.SupportsVision {
-		a.emit(EvError, map[string]string{"message": "当前方案未声明支持视觉（vision），请先在设置中开启"})
+		a.emit(EvError, map[string]string{
+			"code": "msg.agentNeedVision", "message": "当前方案未声明支持视觉（vision），请先在设置中开启",
+		})
 		return fmt.Errorf("方案未声明 vision")
 	}
 	if apiKey == "" && !isLocalEndpoint(settings.BaseURL) {
-		a.emit(EvError, map[string]string{"message": "尚未配置 LLM API Key，请先到「设置」里填写"})
+		a.emit(EvError, map[string]string{
+			"code": "msg.agentNeedKey", "message": "尚未配置 LLM API Key，请先到「设置」里填写",
+		})
 		return fmt.Errorf("未配置 LLM API Key")
 	}
 	client := llm.New(settings.BaseURL, apiKey, settings.Model)
@@ -1003,6 +1016,7 @@ func (a *Agent) Run(parent context.Context, hostID, sessionID, prompt, profileID
 	for loop, step := 0, 0; loop < maxLoops; loop++ {
 		if toolSteps >= pol.MaxSteps {
 			a.emit(EvError, map[string]string{
+				"code": "msg.agentMaxSteps", "max": strconv.Itoa(pol.MaxSteps),
 				"message": fmt.Sprintf("已达到最大工具调用步数（%d），会话终止。可在设置中调整。", pol.MaxSteps),
 			})
 			return nil
@@ -1051,7 +1065,9 @@ func (a *Agent) Run(parent context.Context, hostID, sessionID, prompt, profileID
 			if plan.hasOpen() {
 				nudges++
 				if nudges > 2 {
-					a.emit(EvError, map[string]string{"message": "计划仍有未完成项，会话终止。"})
+					a.emit(EvError, map[string]string{
+						"code": "msg.agentPlanOpen", "message": "计划仍有未完成项，会话终止。",
+					})
 					return nil
 				}
 				reply.Reasoning = ""
@@ -1126,7 +1142,7 @@ func (a *Agent) Run(parent context.Context, hostID, sessionID, prompt, profileID
 	}
 
 	a.emit(EvError, map[string]string{
-		"message": "计划修订次数已用尽，会话终止。",
+		"code": "msg.agentPlanRevises", "message": "计划修订次数已用尽，会话终止。",
 	})
 	return nil
 }

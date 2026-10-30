@@ -259,6 +259,51 @@ func (a *App) RunShellInTerminal(hostID, sessionID, command string) ShellResult 
 	return base
 }
 
+// CheckShellCommand 只裁决、不执行：给前端「乐观透传窗口」（cmdPending）里的
+// 回车做硬拒绝复核用。
+//
+// 背景：cmdPending 窗口内按键一律直达 PTY，绕过 RunShellInTerminal 的裁决链。
+// 命令输出结束后窗口还要静默兜底 6 秒才关——这段时间里提示符早已回来，用户
+// 敲的下一条命令会直灌 bash，硬拒绝形同虚设。前端在窗口内把可见字符攒成行，
+// 回车时拿来这里复核：只有明确 Deny 才吞掉回车（见 frontend/src/terminal/
+// termInput.js），其余一律放行，保证 vim 菜单 / read 等交互场景零改动。
+//
+// Deny 时照常审计：这条命令确实到了人手里，拦截本身就是一次应留痕的裁决。
+func (a *App) CheckShellCommand(hostID, command string) ShellResult {
+	if err := a.ready(); err != nil {
+		return ShellResult{Status: "error", Error: err.Error()}
+	}
+	cmd := strings.TrimSpace(command)
+	if cmd == "" {
+		return ShellResult{Status: "error", Error: "命令为空"}
+	}
+
+	verdict := policy.EvaluateHuman(cmd)
+	base := ShellResult{
+		Decision: string(verdict.Decision),
+		Reason:   verdict.Reason,
+		Rule:     verdict.Rule,
+		Risk:     policy.Risk(cmd),
+	}
+	if verdict.Decision == policy.Deny {
+		a.auditLog(audit.Entry{
+			Kind:     audit.KindDirect,
+			HostID:   hostID,
+			HostName: hostNameOf(a.v, hostID),
+			Command:  cmd,
+			Decision: string(verdict.Decision),
+			Rule:     verdict.Rule,
+			Note:     "人工 shell 硬拒绝（透传窗口拦截）：" + verdict.Reason,
+		})
+		base.Status = "denied"
+		return base
+	}
+	// 放行时前端自己会把攒下的按键照常透传，这里不写 PTY、不审计 ——
+	// 它可能是 vim 菜单选项或 read 的应答，不该在审计里留下噪音。
+	base.Status = "ok"
+	return base
+}
+
 type missingProbe struct {
 	Reason string
 	Hint   string

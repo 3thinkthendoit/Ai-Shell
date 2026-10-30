@@ -5,6 +5,7 @@
 // 目的：把「Go 发事件 -> JS 改状态 -> UI 据此渲染」这条链路里最容易出错的
 // 状态流转（审批条的生死、running 标志、并发发送）钉死。
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { i18n } from '../i18n.js'
 import {
   store, push, clearLog, clearSession, bootstrap, refreshHosts, refreshSessions, bindEvents,
   ask, approve, stop, dismissAuditError, bucketKey,
@@ -263,6 +264,38 @@ describe('bindEvents 事件接线', () => {
     rt.emit('agent:error', { message: '连接超时' })
     expect(store.running).toBe(false)
     expect(store.entries.at(-1)).toMatchObject({ kind: 'error', content: '连接超时' })
+  })
+
+  it('agent:error 带 i18n code 时按当前语言翻译，不再固化后端语言', () => {
+    // 后端固定文案随事件带 code（msg.*），前端按当前 locale 翻译；
+    // 切到英文后推同一条错误，展示必须跟着变 —— 这是本用例要钉住的行为。
+    install({ runtime: rt, app: makeApp().app })
+    bindEvents()
+    const restore = i18n.locale
+    try {
+      i18n.locale = 'zh'
+      rt.emit('agent:error', { code: 'msg.agentMaxSteps', max: '12', message: '已达到最大工具调用步数（12），会话终止。可在设置中调整。' })
+      expect(store.entries.at(-1).content).toBe('已达到最大工具调用步数（12），会话终止。可在设置中调整。')
+      i18n.locale = 'en'
+      rt.emit('agent:error', { code: 'msg.agentMaxSteps', max: '12', message: '已达到最大工具调用步数（12），会话终止。可在设置中调整。' })
+      expect(store.entries.at(-1).content).toBe('Max tool-call steps (12) reached; session ended. Adjust it in Settings.')
+    } finally {
+      i18n.locale = restore
+    }
+  })
+
+  it('audit:error 带 code 时同样翻译（带 detail 参数）', () => {
+    install({ runtime: rt, app: makeApp().app })
+    bindEvents()
+    const restore = i18n.locale
+    try {
+      i18n.locale = 'en'
+      rt.emit('audit:error', { code: 'msg.auditWriteFail', detail: 'disk full', message: '审计日志写入失败，审计轨迹可能已不完整：disk full' })
+      expect(store.auditError).toBe('Failed to write the audit log; the audit trail may be incomplete: disk full')
+    } finally {
+      i18n.locale = restore
+      store.auditError = ''
+    }
   })
 
   it('agent:done 同时清掉运行态与待审批条', () => {

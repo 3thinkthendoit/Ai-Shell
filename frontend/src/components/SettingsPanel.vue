@@ -24,6 +24,11 @@ const corrected = ref('')   // 被自动修正的 Base URL（原值多填了端�
 const cardTesting = reactive({})
 const cardResult = reactive({})
 
+// 「模型名」的候选列表：从网关标准 GET /models 拉取。
+// 仅辅助手输（datalist 不限制输入），拉不到时用户照常手动填写。
+const modelOptions = ref([])
+const modelsBusy = ref(false)
+
 // Wails 在 macOS 上跑的是 WKWebView，原生 confirm() 不会弹框且直接返回 undefined。
 // 与 HostsPanel 相同，用一个 Promise 化的自绘模态替代。
 const confirmState = ref(null)
@@ -55,6 +60,7 @@ const form = reactive({
 function startNew() {
   editingId.value = ''
   resetForm()
+  modelOptions.value = []
   editing.value = true
 }
 
@@ -70,6 +76,7 @@ function startEdit(p) {
   form.clearKey = false
   testRes.value = null
   corrected.value = ''
+  modelOptions.value = []
   editing.value = true
 }
 
@@ -157,6 +164,28 @@ async function testSaved(p) {
   }
 }
 
+// 拉取当前网关的模型列表做候选。
+// 与 testSaved 同款回落：编辑已有方案时表单字段留空由后端补已保存值，
+// 所以不重填 API Key 也能拉；新建模式用表单里现填的值。
+async function fetchModels() {
+  modelsBusy.value = true
+  try {
+    const res = await window.go.main.App.ListLLMModels(editingId.value, form.baseUrl, form.apiKey)
+    if (res.ok) {
+      modelOptions.value = res.models || []
+    } else {
+      // 拉取失败清掉旧候选：用户可能已改 Base URL，旧候选来自别家网关，留着会误导。
+      modelOptions.value = []
+      push({ kind: 'error', content: res.message })
+    }
+  } catch (e) {
+    modelOptions.value = []
+    push({ kind: 'error', content: String(e) })
+  } finally {
+    modelsBusy.value = false
+  }
+}
+
 // 预设按钮的显示名走字典（品牌名不翻，但「本地」这类描述词要跟语言走）。
 const presets = computed(() => [
   { label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
@@ -171,6 +200,8 @@ function applyPreset(p) {
   form.model = p.model
   testRes.value = null
   corrected.value = ''
+  // Base URL 换了，上一个网关的模型候选不再是这家服务的
+  modelOptions.value = []
 }
 
 // 从后端回传的「实际请求地址」反推它真正使用的 Base URL。
@@ -334,7 +365,15 @@ const editingProfileHasApiKey = computed(() =>
         </div>
         <div class="field">
           <label>{{ t('settings.conn.model') }}</label>
-          <input v-model="form.model" class="model-name" placeholder="gpt-4o-mini" />
+          <div class="model-row">
+            <input v-model="form.model" class="model-name" list="model-options" placeholder="gpt-4o-mini" />
+            <button class="sm" :disabled="modelsBusy" @click="fetchModels">
+              {{ modelsBusy ? t('settings.models.fetching') : t('settings.models.fetch') }}
+            </button>
+          </div>
+          <datalist id="model-options">
+            <option v-for="m in modelOptions" :key="m" :value="m" />
+          </datalist>
         </div>
         <div class="field">
           <label>{{ t('settings.conn.ctxWindow') }}</label>
@@ -413,7 +452,7 @@ const editingProfileHasApiKey = computed(() =>
 .panel-head h2 { font-size: 16px; margin: 0 0 6px; }
 .panel-head p { margin: 0; font-size: 12px; line-height: 1.7; max-width: 620px; }
 
-.list { display: flex; flex-direction: column; gap: 10px; max-width: 820px; }
+.list { display: flex; flex-direction: column; gap: 10px; }
 
 .profile { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; }
 .profile-main { min-width: 0; }
@@ -476,6 +515,7 @@ const editingProfileHasApiKey = computed(() =>
 
 .confirm-modal { width: 420px; }
 .confirm-msg { margin: 0 0 6px; font-size: 13px; line-height: 1.7; color: var(--text); }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
 
 /* 字段：统一「标签在上、控件在下」的节奏 */
 .field { margin-top: 14px; }
@@ -485,6 +525,8 @@ const editingProfileHasApiKey = computed(() =>
 
 /* 长文本输入给个上限：不随窗口无限拉长 */
 .base-url, .model-name, .api-key, .profile-name, .ctx-window { max-width: 100%; }
+.model-row { display: flex; gap: 8px; align-items: center; }
+.model-row .model-name { flex: 1; }
 .field-hint { margin-top: 6px; font-size: 12px; line-height: 1.45; }
 
 .notice {

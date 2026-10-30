@@ -1,8 +1,8 @@
-import { store, writeTerminal, textToBase64, stop, isPtyDirty, termState } from '../store.js'
+import { store, writeTerminal, textToBase64, stop, isPtyDirty, termState, backendAPI } from '../store.js'
 import * as paint from '../termPaint.js'
 import { enqueueSubmit } from './termSubmit.js'
 import { hasCJK } from '../inputRoute.js'
-import { endCmdPending } from './termEvents.js'
+import { endCmdPending, pendingLine, appendPendingLine, clearPendingLine } from './termEvents.js'
 import {
   getTerm,
   isFullscreen,
@@ -13,7 +13,8 @@ import {
   clearLocalEcho,
   flushLocalToPty,
   clearWelcomeHintByKey,
-  clearLLMHintByKey
+  clearLLMHintByKey,
+  surfaceWrite
 } from './termSession.js'
 
 // 终端内直接输入：在提示符下就地编辑、回车分类。
@@ -21,6 +22,53 @@ import {
 // 真 PTY 逐字符透传的话，自然语言会被 bash 当命令执行而报错。所以把
 // 「shell 提示符下等待输入一条命令」这一常态改成本地行编辑：可打印字符
 // 本地回显、退格本地删，回车时 resolveInput 决定交给 Agent 还是发回 PTY。
+
+// 乐观透传窗口（cmdPending）的回车复核。
+//
+// 窗口期间按键一律直达 PTY，RunShellInTerminal 的硬拒绝链被绕过；命令输出
+// 结束后窗口还要静默兜底 6 秒才关，这段时间里提示符早已回来，下一条命令
+// 会直灌 bash。这里把窗口内敲的可见字符攒成行，回车时交后端复核
+// （CheckShellCommand）：**只有明确 Deny 才拦**，其余一律放行——vim 菜单、
+// read 应答、E325 直接回车等交互场景必须零改动，所以宁可漏拦不可误拦。
+const gateBusy = new Map() // key → 复核进行中（hold 住后到的回车，别重复发）
+
+function gatePendingKey(key, t, d, send) {
+  const st = termState(t.hostId, t.sessionId)
+  // 只管乐观窗口：真 cmdActive（OSC 133 命令边界）时命令起止有权威信号，
+  // 键属于前台程序，轮不到本地裁决。
+  if (!st || !st.cmdPending || st.cmdActive) return true
+  if (d === '\r') {
+    const line = pendingLine(key).trim()
+    if (!line) return true // 空行直接放行（vim E325 空回车选默认）
+    if (gateBusy.get(key)) return false // 上一发还在复核，hold 住别重复发
+    gateBusy.set(key, true)
+    backendAPI().CheckShellCommand(t.hostId, line).then(res => {
+      gateBusy.set(key, false)
+      if (res && res.status === 'denied') {
+        // 命令字符早已透传进远端行缓冲：Ctrl-U（bash kill-line）清掉，
+        // 再把裁决画到终端——观感与正常硬拒绝路径一致。既然用户是在
+        // 提示符下敲命令，说明窗口早该关了，顺手关掉恢复本地行编辑。
+        send(textToBase64('\x15'))
+        paint.paintShellVerdict(surfaceWrite(key), res)
+        endCmdPending(t.hostId, t.sessionId)
+      } else {
+        send(textToBase64('\r')) // 放行：补发被 hold 的回车，顺序不变
+      }
+    }).catch(() => {
+      gateBusy.set(key, false)
+      send(textToBase64('\r')) // 复核通道失败宁可放行，别把交互程序卡死
+    })
+    return false // 本次回车先不发，等复核结果
+  }
+  if (/[\x00-\x1f\x7f]/.test(d)) {
+    // 控制键（方向键历史、Tab 补全、Ctrl-C、粘贴括号序列）之后攒的行
+    // 已不可靠，放弃裁决只放行——漏拦的风险交给下一次干净的行。
+    clearPendingLine(key)
+    return true
+  }
+  appendPendingLine(key, d)
+  return true
+}
 
 export function onTermData(key, d) {
   const t = getTerm(key)
@@ -44,6 +92,7 @@ export function onTermData(key, d) {
     } else {
       clearWelcomeHintByKey(key)
       clearLLMHintByKey(key)
+      if (!gatePendingKey(key, t, d, send)) return
       send(textToBase64(d))
       return
     }

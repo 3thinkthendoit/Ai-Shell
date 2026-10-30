@@ -26,6 +26,7 @@ function makeApp(impl = {}) {
       id: req.id || 'new-id', name: req.name || '默认',
       baseUrl: req.baseUrl, model: req.model, hasApiKey: !!req.apiKey, active: false
     }),
+    ListLLMModels: async (id, base, key) => ({ ok: true, models: ['m1', 'm2'], message: '获取到 2 个模型' }),
     ActivateLLMProfile: async () => undefined,
     DeleteLLMProfile: async () => undefined
   }
@@ -263,6 +264,72 @@ describe('SettingsPanel 新增弹窗 · 测试连接', () => {
     expect(calls.find(c => c.name === 'SaveLLMProfile').args[0].id).toBe('')
     expect(wrapper.find('.overlay').exists()).toBe(false)
   })
+
+  it('获取模型列表：新建模式带表单值调用，结果填进 datalist 候选', async () => {
+    setup()
+    await openNew()
+    await wrapper.find('.base-url').setValue('https://n/v1')
+    await wrapper.find('.api-key').setValue('sk-typed')
+    await wrapper.find('.model-row button').trigger('click')
+    await flushPromises()
+
+    expect(calls.find(c => c.name === 'ListLLMModels').args).toEqual(['', 'https://n/v1', 'sk-typed'])
+    expect(wrapper.findAll('#model-options option').map(o => o.attributes('value'))).toEqual(['m1', 'm2'])
+  })
+
+  it('模型名手动输入不受候选影响（datalist 只辅助，不强制）', async () => {
+    setup()
+    await openNew()
+    await wrapper.find('.model-row button').trigger('click')
+    await flushPromises()
+    // 手输一个列表里没有的名字，照常生效
+    await wrapper.find('.model-name').setValue('my-private-model')
+    expect(wrapper.find('.model-name').element.value).toBe('my-private-model')
+  })
+
+  it('拉取失败时清空候选并提示原因（不阻塞手动填写）', async () => {
+    setup({ ListLLMModels: async () => ({ ok: false, models: [], message: '这个网关没有实现标准 /models 接口（404）' }) })
+    await openNew()
+    await wrapper.find('.model-row button').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.findAll('#model-options option')).toHaveLength(0)
+    // 失败原因进了消息流，用户知道为什么没候选
+    const msgs = Object.values(store.bySession).flat()
+    expect(msgs.some(m => String(m.content).includes('/models'))).toBe(true)
+  })
+
+  it('换了 Base URL 后拉取失败要清掉上一家的旧候选（留着会误导）', async () => {
+    setup({
+      ListLLMModels: async (id, base) => base === 'https://ok/v1'
+        ? { ok: true, models: ['m1'], message: '获取到 1 个模型' }
+        : { ok: false, models: [], message: '连接失败' }
+    })
+    await openNew()
+    // 先在 A 网关成功拉到候选
+    await wrapper.find('.base-url').setValue('https://ok/v1')
+    await wrapper.find('.model-row button').trigger('click')
+    await flushPromises()
+    expect(wrapper.findAll('#model-options option')).toHaveLength(1)
+
+    // 手动改到 B 网关再拉，失败 → 旧候选（A 网关的）必须清掉
+    await wrapper.find('.base-url').setValue('https://bad/v1')
+    await wrapper.find('.model-row button').trigger('click')
+    await flushPromises()
+    expect(wrapper.findAll('#model-options option')).toHaveLength(0)
+  })
+
+  it('切换预设后清空上一家的模型候选', async () => {
+    setup()
+    await openNew()
+    await wrapper.find('.base-url').setValue('https://n/v1')
+    await wrapper.find('.model-row button').trigger('click')
+    await flushPromises()
+    expect(wrapper.findAll('#model-options option')).toHaveLength(2)
+
+    await wrapper.findAll('.presets button')[0].trigger('click')
+    expect(wrapper.findAll('#model-options option')).toHaveLength(0)
+  })
 })
 
 // ---- 多方案（profile）----
@@ -300,6 +367,18 @@ describe('SettingsPanel 多方案', () => {
     await modalBtn('保存').trigger('click')
     await flushPromises()
     expect(calls.find(c => c.name === 'SaveLLMProfile').args[0].id).toBe('p1')
+  })
+
+  it('编辑模式拉模型列表带方案 ID（Key 留空由后端回落已保存值）', async () => {
+    setup()
+    await openEdit('p1')
+    await wrapper.find('.model-row button').trigger('click')
+    await flushPromises()
+
+    const call = calls.find(c => c.name === 'ListLLMModels')
+    expect(call.args[0]).toBe('p1')
+    expect(call.args[2]).toBe('') // 表单 Key 必为空，回落到该方案已保存的 Key
+    expect(wrapper.findAll('#model-options option')).toHaveLength(2)
   })
 
   it('卡片上的「设为当前」调用 ActivateLLMProfile 并切换到该方案', async () => {

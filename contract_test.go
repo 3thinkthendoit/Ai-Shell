@@ -108,9 +108,12 @@ func slicesContains(xs []string, want string) bool {
 
 var (
 	eventsOnRe = regexp.MustCompile(`EventsOn\(\s*['"]([^'"]+)['"]`)
-	// 前端有两条调用后端的路径：直接 window.go.main.App.X，以及经 api() 辅助函数 api().X。
-	// 两条都必须覆盖 —— 只匹配其中一条会让测试给出假信心。
-	appCallRe = regexp.MustCompile(`(?:go\.main\.App|api\(\))\.(\w+)`)
+	// 前端有三条调用后端的路径：直接 window.go.main.App.X，以及经 api() /
+	// backendAPI() 辅助函数的 api().X / backendAPI().X。
+	// 三条都必须覆盖 —— 只匹配其中一条会让测试给出假信心。
+	// 注意大小写：backendAPI 是大写 API，`api\(\)` 匹配不上它（踩过一次：
+	// CheckShellCommand 只经 backendAPI() 调用，正则漏扫导致假失败）。
+	appCallRe = regexp.MustCompile(`(?:go\.main\.App|backendAPI\(\)|api\(\))\.(\w+)`)
 )
 
 // requiredMethods 是 UI 正常运行所必需的后端方法。
@@ -126,7 +129,9 @@ var requiredMethods = []string{
 	// 控制台单表面：composer 里的 shell 行走 RunShellInTerminal（写进常驻 PTY），
 	// ReportActiveSession 把「当前看着哪条会话」报给后端用于路由 PTY 定格快照。
 	// 旧的有界 RunShell 仅剩后端 agent 工具通道内部使用，前端不再直接调它。
-	"RunShellInTerminal", "ReportActiveSession",
+	// CheckShellCommand 是透传窗口（cmdPending）回车的硬拒绝复核 —— 少了它，
+	// 乐观窗口期间敲的命令会绕过策略直灌 bash。
+	"RunShellInTerminal", "ReportActiveSession", "CheckShellCommand",
 	"ClearSession", "CompactSession",
 	// 会话的增删改查。这四条一起构成「一台主机多条会话」的全部入口，
 	// 少任何一条，对应的界面操作就会静默失效（点了没反应）。

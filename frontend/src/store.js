@@ -102,6 +102,11 @@ export const store = reactive({
     // 跨主机执行默认禁止：一条会话的工具只能打它所属的主机。
     allowCrossHost: false
   },
+
+  // 文件上传的大小上限（字节）。由 Bootstrap 下发 —— 数值只有后端一处
+  // 说了算（sshclient.MaxTransferBytes 同时管上传校验和下载截断），前端
+  // 抄写数值迟早漂移。0 表示还没拿到 Bootstrap：预检放行，由后端兜底。
+  maxTransferBytes: 0,
   currentHostId: '',
 
   // draftHostId：新建任务首页底栏「预选」的主机。
@@ -406,6 +411,10 @@ export async function bootstrap() {
       store.selectedProfileId = (store.llmProfiles.find(p => p.active) || {}).id || ''
     }
     store.policy = info.policy || store.policy
+    // 上传上限以后端为唯一权威（见 store.maxTransferBytes 注释）。
+    // Number() 兜底：绑定未重新生成或后端旧版本时是 undefined，落到 0
+    // 表示「没拿到」，预检放行、后端硬拒绝兜底。
+    store.maxTransferBytes = Number(info.maxTransferBytes) || 0
     // 自动选中只在「只有一台主机」时发生：猜对率 100% 且省一次点击。
     // 多台时不猜 —— 选错的主机会被立即建立 SSH 连接（远端登录、审计痕迹），
     // 而用户启动后未必先用终端（可能只想看审计/改设置）。选中动作交给用户，
@@ -1489,7 +1498,15 @@ export async function fmGoParent() {
 export async function fmUpload(file) {
   const fm = fmState()
   if (!api() || !file) return
-  // 上传不设大小上限（按需求去掉）：任何大小的文件都直接分块读、整体交给后端。
+  // 大小预检：与后端同一上限（Bootstrap 下发的 maxTransferBytes）。在这里
+  // 拦而不是只靠后端：base64 整串在前端、IPC、后端各存一份内存，超限的
+  // 文件连读都不该读。上限拿不到（0）时放行，由后端硬拒绝兜底。
+  const limit = store.maxTransferBytes
+  if (limit > 0 && file.size > limit) {
+    fm.error = t('msg.uploadTooLarge', { max: Math.round(limit / 1048576) })
+    fm.progress = null
+    return
+  }
   fm.busy = true
   fm.error = ''
   fm.notice = ''

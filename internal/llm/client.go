@@ -297,6 +297,19 @@ func (c *Client) Ping(ctx context.Context) (PingResult, error) {
 // 截断上限从 500 放宽到 2000：网关的报错往往是嵌套 JSON（外层包一次上游原文），
 // 真正有用的那句「为什么被拒」常在第 600 字符之后 —— 原样截到 500 时，
 // 用户看到的是一串没头没尾的转义引号，等于什么都没说。
+// StatusError 是带 HTTP 状态码的服务端错误。
+//
+// 单独做成类型是为了让调用方（app.go）能用 errors.As 拿到状态码，
+// 按状态给出针对性提示 —— 光靠解析错误字符串太脆。
+type StatusError struct {
+	Status int
+	Body   string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("LLM 返回 %d: %s", e.Status, e.Body)
+}
+
 func (c *Client) redactErr(status int, data []byte) error {
 	msg := strings.TrimSpace(string(data))
 	if len(msg) > 2000 {
@@ -305,7 +318,60 @@ func (c *Client) redactErr(status int, data []byte) error {
 	if c.apiKey != "" {
 		msg = strings.ReplaceAll(msg, c.apiKey, "[REDACTED]")
 	}
-	return fmt.Errorf("LLM 返回 %d: %s", status, msg)
+	return &StatusError{Status: status, Body: msg}
+}
+
+// Models 拉取 OpenAI 兼容网关的标准模型列表（GET {base}/models）。
+//
+// 列表只是给「模型名」输入框做候选的辅助信息，不是权威来源 ——
+// 个别网关不实现 /models 或返回非标准结构，失败由调用方决定怎么提示。
+// 不校验模型名：列表接口与 chat 接口不同，本方法不依赖 c.model。
+func (c *Client) Models(ctx context.Context) ([]string, error) {
+	if c.baseURL == "" {
+		return nil, fmt.Errorf("未配置 LLM Base URL")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, fmt.Errorf("读取响应失败: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, c.redactErr(resp.StatusCode, data)
+	}
+
+	var out struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("响应不是标准的模型列表（/models）: %w", err)
+	}
+	ids := make([]string, 0, len(out.Data))
+	seen := make(map[string]bool, len(out.Data))
+	for _, m := range out.Data {
+		id := strings.TrimSpace(m.ID)
+		if id != "" && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids, nil
 }
 
 // Chat 发送一轮对话，返回模型的回复（可能包含 tool_calls）。

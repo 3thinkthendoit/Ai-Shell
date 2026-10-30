@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -379,5 +380,65 @@ func TestPingReportsUnreachable(t *testing.T) {
 	}
 	if res.Status != 0 {
 		t.Fatalf("压根没连上时 Status 应为 0，实得 %d", res.Status)
+	}
+}
+
+func TestModelsFetchesStandardList(t *testing.T) {
+	var auth, path string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		auth = r.Header.Get("Authorization")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-4o-mini"},{"id":"deepseek-chat"},{"id":"gpt-4o-mini"}]}`))
+	}))
+	defer srv.Close()
+
+	models, err := New(srv.URL, "sk-secret", "").Models(context.Background())
+	if err != nil {
+		t.Fatalf("Models 应成功: %v", err)
+	}
+	if path != "/models" {
+		t.Fatalf("路径错误: %q", path)
+	}
+	if auth != "Bearer sk-secret" {
+		t.Fatalf("Authorization 头错误: %q", auth)
+	}
+	// 去重 + 排序，给输入框做候选时保持稳定顺序
+	want := []string{"deepseek-chat", "gpt-4o-mini"}
+	if !reflect.DeepEqual(models, want) {
+		t.Fatalf("模型列表不符: want %v, got %v", want, models)
+	}
+}
+
+func TestModelsSurfacesStatusAndRedactsKey(t *testing.T) {
+	const key = "sk-verysecret1234567890"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"invalid api key: ` + key + `"}}`))
+	}))
+	defer srv.Close()
+
+	_, err := New(srv.URL, key, "").Models(context.Background())
+	if err == nil {
+		t.Fatal("401 时 Models 应报错")
+	}
+	if strings.Contains(err.Error(), key) || !strings.Contains(err.Error(), "[REDACTED]") {
+		t.Fatalf("错误信息泄漏了 API Key: %v", err)
+	}
+}
+
+func TestModelsRejectsNonListResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`<html><body>not a model list</body></html>`))
+	}))
+	defer srv.Close()
+
+	if _, err := New(srv.URL, "k", "").Models(context.Background()); err == nil {
+		t.Fatal("返回 HTML 时 Models 应报错")
+	}
+}
+
+func TestModelsRequiresBaseURL(t *testing.T) {
+	if _, err := New("", "k", "").Models(context.Background()); err == nil {
+		t.Fatal("缺 Base URL 时应报错")
 	}
 }

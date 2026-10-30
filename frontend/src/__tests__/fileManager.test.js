@@ -372,6 +372,23 @@ describe('文件管理 上传进度', () => {
     expect(atSend.loaded, '小文件的 loaded 必须等于它的大小').toBe(10)
     expect(atSend.total).toBe(10)
   })
+
+  it('超过 Bootstrap 下发上限的文件在前端就被拦下：不读、不发、不进 busy', async () => {
+    // base64 整串在前端、IPC、后端各存一份内存 —— 超限文件连读都是浪费，
+    // 必须在 fmUpload 入口就拦。后端还有同一上限的硬拒绝兜底。
+    const { app, calls } = makeApp()
+    window.go = { main: { App: app } }
+    await openFileManager('h1', 's1')
+    store.maxTransferBytes = 3 * 1024 * 1024 // 模拟 Bootstrap 已下发 3 MiB 上限
+
+    await fmUpload(fakeFile('huge.bin', 10 * 1024 * 1024))
+
+    expect(calls.filter(c => c.name === 'UploadRemoteFile'), '超限文件不应发给后端').toEqual([])
+    expect(store.fileManager.error, '应给出带上限数值的报错').toContain('上传上限')
+    expect(store.fileManager.busy).toBe(false)
+    expect(store.fileManager.progress).toBeNull()
+    store.maxTransferBytes = 0
+  })
 })
 
 // 下载进度与取消。

@@ -37,6 +37,15 @@ function makeApp(impl = {}) {
     Ask: async () => undefined,
     Stop: async () => undefined,
     RunShellInTerminal: async () => ({ status: 'done', decision: 'allow', reason: '', rule: 'auto_safe', risk: 'low' }),
+    // 乐观窗口回车的硬拒绝复核替身：默认放行；命中 rm 模式才 Deny，
+    // 供「窗口内敲危险命令被拦」用例复用同一个 calls 记录通道。
+    CheckShellCommand: async (hostID, cmd) => {
+      const c = String(cmd || '')
+      if (/\brm\b/.test(c)) {
+        return { status: 'denied', decision: 'deny', reason: '不可逆删除', rule: 'rm_irreversible', risk: 'critical' }
+      }
+      return { status: 'ok', decision: 'allow', reason: '', rule: 'auto_safe', risk: 'low' }
+    },
     ClassifyShellInput: async text => {
       const first = String(text || '').trim().split(/\s+/)[0] || ''
       if (first.includes('/')) return true
@@ -378,13 +387,68 @@ describe('cmdPending · 提交命令后的乐观透传窗口', () => {
     expect(callsOf('RunShellInTerminal').length).toBe(1)
     calls.length = 0
     onTermData(key, 'R')
-    onTermData(key, '\r') // E325 里 "Press ENTER" —— 回车也应透传给程序而非本地提交
+    onTermData(key, '\r') // E325 里 "Press ENTER" —— 回车先经硬拒绝复核，放行后才透传
+    await flushPromises()
     const wt = callsOf('WriteTerminal')
     expect(wt.length).toBe(2)
     expect(toBytes(base64ToBytes(wt[0].args[2]))).toEqual(toBytes(new TextEncoder().encode('R')))
     expect(toBytes(base64ToBytes(wt[1].args[2]))).toEqual(toBytes(new TextEncoder().encode('\r')))
     // 回车走的是透传分支，没再触发一次提交。
     expect(callsOf('RunShellInTerminal').length).toBe(0)
+  })
+
+  it('窗口内敲危险命令：回车被硬拒绝复核拦下，Ctrl-U 清远端行并关窗', async () => {
+    withHost()
+    const key = await createSurface()
+    await enqueueSubmit(key, 'ls')
+    expect(isCmdRunning(key)).toBe(true)
+    calls.length = 0
+    onTermData(key, 'rm')
+    onTermData(key, ' -rf /data')
+    onTermData(key, '\r')
+    await flushPromises()
+    // 可见字符本就透传（'rm'、' -rf /data'），拦下的只是回车：代替它的是
+    // Ctrl-U（bash kill-line 清远端行缓冲）—— 否则命令就真的跑了。
+    const wt = callsOf('WriteTerminal')
+    expect(wt.length).toBe(3)
+    expect(toBytes(base64ToBytes(wt[2].args[2]))).toEqual(toBytes(new TextEncoder().encode('\x15')))
+    // 复核拿到的是攒出来的整行
+    const chk = callsOf('CheckShellCommand')
+    expect(chk.length).toBe(1)
+    expect(chk[0].args[1]).toBe('rm -rf /data')
+    // 拦下即关窗：既然是在提示符下敲命令，恢复本地行编辑
+    expect(isCmdRunning(key)).toBe(false)
+  })
+
+  it('窗口内菜单输入 + 回车：复核放行，回车照常透传且窗口保持', async () => {
+    withHost()
+    const key = await createSurface()
+    await enqueueSubmit(key, 'ls')
+    calls.length = 0
+    onTermData(key, '1')
+    onTermData(key, '\r')
+    await flushPromises()
+    const wt = callsOf('WriteTerminal')
+    expect(wt.length).toBe(2)
+    expect(toBytes(base64ToBytes(wt[1].args[2]))).toEqual(toBytes(new TextEncoder().encode('\r')))
+    expect(callsOf('CheckShellCommand').length).toBe(1)
+    // 交互程序还在前台（read/菜单在等输入），窗口不该关。
+    expect(isCmdRunning(key)).toBe(true)
+  })
+
+  it('窗口内按方向键后回车：攒行已不可靠，不再复核直接放行', async () => {
+    withHost()
+    const key = await createSurface()
+    await enqueueSubmit(key, 'ls')
+    calls.length = 0
+    onTermData(key, 'ls')
+    onTermData(key, '\x1b[A') // ↑ 历史方向键：行编辑复杂化，攒的行作废
+    onTermData(key, '\r')
+    // 全程同步放行：复核通道压根没被叫醒
+    expect(callsOf('CheckShellCommand')).toEqual([])
+    const wt = callsOf('WriteTerminal')
+    expect(wt.length).toBe(3)
+    expect(toBytes(base64ToBytes(wt[2].args[2]))).toEqual(toBytes(new TextEncoder().encode('\r')))
   })
 
   it('乐观窗口里敲中文：关窗改走本地行编辑，回车交给 Agent', async () => {

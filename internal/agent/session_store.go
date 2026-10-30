@@ -460,6 +460,7 @@ func (a *Agent) persist(snap sessionSnapshot) {
 	// agent 的锁横跨一次 IPC。
 	if firstFailure {
 		a.emit(EvError, map[string]string{
+			"code": "msg.agentPersistFail", "detail": err.Error(),
 			"message": "会话历史落盘失败，重启后可能丢失：" + err.Error(),
 		})
 	}

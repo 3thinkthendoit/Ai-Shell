@@ -2,8 +2,12 @@ package main
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"ai-shell/internal/vault"
 )
 
 // 「测试模型配置」的价值几乎全在错误信息上。
@@ -111,5 +115,62 @@ func TestDiagnoseLLMErrorFallsBackToRawMessage(t *testing.T) {
 	got := diagnoseLLMError(errors.New("某种没见过的错误"), 418, "https://x/v1", true)
 	if !strings.Contains(got, "某种没见过的错误") {
 		t.Fatalf("未知状态码应回落到原始错误，实得: %s", got)
+	}
+}
+
+// ListLLMModels 的 404/400 要给 /models 专属提示：这两个状态码走通用诊断会误导 ——
+// 404 会被说成「地址填多了端点」，400 会被说成「模型名写错了」（此时模型名还没填）。
+func TestListLLMModelsSpecialStatusHints(t *testing.T) {
+	t.Setenv("AISHELL_KEYFILE", "1")
+	v := vault.New(t.TempDir())
+	if err := v.Open(); err != nil {
+		t.Fatalf("打开凭证库失败: %v", err)
+	}
+	a := &App{v: v}
+
+	cases := []struct {
+		name     string
+		status   int
+		want     string // 专属提示的标志词
+		notWants []string
+	}{
+		{
+			name:   "404 → 未实现 /models 接口，而不是地址填错了",
+			status: http.StatusNotFound,
+			want:   "没有实现标准 /models 接口",
+			notWants: []string{
+				"chat/completions", // 通用诊断会让用户去删 URL 里的端点 —— 但这里 URL 是对的
+			},
+		},
+		{
+			name:   "400 → 网关拒绝，而不是模型名写错了",
+			status: http.StatusBadRequest,
+			want:   "网关拒绝了这次 /models 请求",
+			notWants: []string{
+				"写错", // 通用诊断会归因到模型名 —— 但调 /models 时模型名还没填
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(c.status)
+				_, _ = w.Write([]byte(`{"error":{"message":"nope"}}`))
+			}))
+			defer srv.Close()
+
+			res := a.ListLLMModels("", srv.URL, "")
+			if res.OK {
+				t.Fatalf("%d 不应成功", c.status)
+			}
+			if !strings.Contains(res.Message, c.want) {
+				t.Errorf("提示应包含 %q，实得: %s", c.want, res.Message)
+			}
+			for _, nw := range c.notWants {
+				if strings.Contains(res.Message, nw) {
+					t.Errorf("提示不应包含 %q（对 /models 是误导），实得: %s", nw, res.Message)
+				}
+			}
+		})
 	}
 }

@@ -191,6 +191,23 @@ export function afterTermQuiet(hostId, sessionId, fn) {
 export const CMD_PENDING_IDLE_MS = 6000
 const cmdPendingTimers = new Map()
 
+// 窗口内攒的「可见字符行」：回车时拿来给后端做硬拒绝复核（CheckShellCommand）。
+// 见 termInput.onTermData —— 只有明确 Deny 才吞回车。开窗/关窗都必须清，
+// 否则上一次窗口残留的半行会被当成新窗口的行首，误判风险。
+const pendingLines = new Map()
+
+export function clearPendingLine(key) {
+  pendingLines.delete(key)
+}
+
+export function pendingLine(key) {
+  return pendingLines.get(key) || ''
+}
+
+export function appendPendingLine(key, text) {
+  pendingLines.set(key, (pendingLines.get(key) || '') + text)
+}
+
 function clearCmdPendingTimer(key) {
   const timer = cmdPendingTimers.get(key)
   if (timer) {
@@ -215,6 +232,7 @@ export function armCmdPending(hostId, sessionId) {
   const st = termState(hostId, sessionId)
   if (!st) return
   st.cmdPending = true
+  clearPendingLine(key)
   armCmdPendingTimer(key, hostId, sessionId)
 }
 
@@ -230,7 +248,9 @@ function resetCmdPending(hostId, sessionId) {
 // 也供 termInput 在「乐观窗口里敲了中文」时主动关掉：中文是自然语言，
 // 不属于 vim/菜单选项，不应直灌 bash。
 export function endCmdPending(hostId, sessionId) {
-  clearCmdPendingTimer(bucketKey(hostId, sessionId))
+  const key = bucketKey(hostId, sessionId)
+  clearCmdPendingTimer(key)
+  clearPendingLine(key)
   const st = termState(hostId, sessionId)
   if (st) st.cmdPending = false
 }
@@ -430,13 +450,18 @@ export function bindTerminalEvents(runtime) {
     clearStagedUserImages()
     flushMdStreamsForHost(paintHost())
     freezeStreams()
-    push({ kind: 'error', content: e.message })
-    paint.paintError(surfaceWrite(paintHost()), e.message)
+    // 固定文案由后端带 i18n code（msg.*），按当前语言翻译，推送不再固化
+    // 后端语言；动态技术诊断（err.Error() 一类）没有 code，原文展示 ——
+    // 与 i18n.js 的既有约定一致。
+    const msg = e && e.code ? t(e.code, e) : e.message
+    push({ kind: 'error', content: msg })
+    paint.paintError(surfaceWrite(paintHost()), msg)
   })
 
   runtime.EventsOn('audit:error', e => {
-    store.auditError = String(e && e.message ? e.message : e)
-    push({ kind: 'error', content: store.auditError })
+    const msg = e && e.code ? t(e.code, e) : String(e && e.message ? e.message : e)
+    store.auditError = msg
+    push({ kind: 'error', content: msg })
   })
 
   runtime.EventsOn('agent:done', () => {

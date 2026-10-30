@@ -297,6 +297,27 @@ func TestUploadRemoteFile_RejectsPathTraversal(t *testing.T) {
 	}
 }
 
+// 上传必须受 MaxTransferBytes 硬限制：整份内容作为 base64 在内存里要
+// 存三份（IPC 串、解码缓冲、远端脚本的 stdin），超限文件会把进程顶到 OOM。
+// 这道墙与 agent 通道（toolfiles.go）共用同一个数，两边不会漂移。
+func TestUploadRemoteFile_RejectsOversized(t *testing.T) {
+	a, hostID := newShellTestApp(t, vault.ModeManual, nil)
+
+	// 压小上限，避免测试里真的分配几十 MiB。
+	old := sshclient.MaxTransferBytes
+	sshclient.MaxTransferBytes = 1024
+	t.Cleanup(func() { sshclient.MaxTransferBytes = old })
+
+	raw := make([]byte, 4096) // base64 后约 5.5 KiB，远超 1 KiB 上限
+	res := a.UploadRemoteFile(hostID, "/srv", "huge.bin", base64.StdEncoding.EncodeToString(raw))
+	if res.OK {
+		t.Fatal("超过 MaxTransferBytes 的上传应被拒绝")
+	}
+	if !strings.Contains(res.Error, "scp/sftp") {
+		t.Fatalf("错误应指明大文件的替代路径（终端 scp/sftp），实得: %s", res.Error)
+	}
+}
+
 // doDownload 走一遍真实下载（分块落盘路径 downloadTo），把进度事件收集起来。
 // dest 固定落在临时目录，测试结束时自动清理。
 func doDownload(t *testing.T, a *App, hostID, path string) (string, FileOpResult, []FileTransferProgress) {

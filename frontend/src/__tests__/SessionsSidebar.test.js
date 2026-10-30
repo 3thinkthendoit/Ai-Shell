@@ -8,6 +8,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import { nextTick } from 'vue'
 import SessionsSidebar from '../components/SessionsSidebar.vue'
+import { i18n } from '../i18n.js'
 import { store, push } from '../store.js'
 
 function makeApp(impl = {}) {
@@ -288,6 +289,28 @@ describe('SessionsSidebar 会话列表', () => {
 
   // 新建入口在控制台顶栏（ConsolePanel.test.js 覆盖），
   // 侧边栏只负责列表与重命名/删除。
+
+  // 相对时间必须跟着语言走：timeAgo 在模板里经 t() 渲染，依赖
+  // i18n.locale 的响应式 —— 切语言后旧文案若不更新，就是这里回归了。
+  it('相对时间随语言切换即时更新', async () => {
+    const restore = i18n.locale
+    try {
+      mountWithHost()
+      store.sessions = {
+        h1: [{ id: 's1', name: 'nginx 排查', turns: 4, archivedTurns: 0, isDefault: false, updatedAt: Date.now() - 5 * 60 * 1000 }]
+      }
+      await nextTick()
+      i18n.locale = 'zh'
+      await nextTick()
+      expect(items()[0].text()).toContain('5分钟前')
+      i18n.locale = 'en'
+      await nextTick()
+      expect(items()[0].text()).toContain('5m ago')
+    } finally {
+      i18n.locale = restore
+    }
+  })
+
   it('没选主机也没有主机时，提示暂无任务', () => {
     store.hosts = []
     store.currentHostId = ''

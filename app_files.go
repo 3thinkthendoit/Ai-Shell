@@ -10,7 +10,9 @@ package main
 // 但这不等于「什么都不拦」：
 //   - 删除由前端弹窗二次确认（用户明确点过才知道自己删的是什么）；
 //   - 后端拒绝空路径与根目录（前端那一道拦不住 bug，后端这道是底线）；
-//   - 上传/下载都不设大小上限（按需求去掉）：下载分块流式落盘、内存平稳；上传由前端分块读、后端一次性 base64 落盘；
+//   - 下载分块流式落盘、内存平稳；上传有防 OOM 的大小上限（与 agent
+//     通道共用 sshclient.MaxTransferBytes）：整份 base64 在内存里要存
+//     三份，不设上限时一个大文件就能把进程顶爆，更大的文件走终端 scp/sftp；
 //   - 所有操作写审计，事后可查。
 
 import (
@@ -160,6 +162,17 @@ func (a *App) UploadRemoteFile(hostID, dir, name, base64Data string) FileOpResul
 		return FileOpResult{Error: "文件名不合法（不能为空、不能含 /）"}
 	}
 	target := joinRemote(normalizeRemotePath(dir), name)
+
+	// 防 OOM 的硬防线：整份内容作为 base64 要在内存里存在三份（IPC 串、
+	// 解码缓冲、远端脚本的 stdin），不设上限时一个大文件就能把进程顶爆。
+	// 在解码**之前**用 base64 长度估算原始大小 —— 超限时连解码的开销都省了。
+	// agent 通道（toolfiles.go）早已按同一个 MaxTransferBytes 拦，这里是
+	// UI 通道的同一道墙：两边共用一个数，不会出现「Agent 能传、人不能传」的漂移。
+	if est := int64(len(base64Data))*3/4 + 1; est > sshclient.MaxTransferBytes {
+		return FileOpResult{Error: fmt.Sprintf(
+			"文件超过上传上限（%d MiB）。请改用终端里的 scp/sftp 传输大文件。",
+			sshclient.MaxTransferBytes>>20)}
+	}
 
 	data, err := base64.StdEncoding.DecodeString(base64Data)
 	if err != nil {

@@ -514,6 +514,70 @@ type LLMTestResult struct {
 	DurationMs int64  `json:"durationMs"`
 }
 
+// LLMModelsResult 是拉取模型列表的结果。
+type LLMModelsResult struct {
+	OK      bool     `json:"ok"`
+	Models  []string `json:"models"`
+	Message string   `json:"message"`
+}
+
+// ListLLMModels 拉取网关的模型列表（标准 GET /models），给「模型名」输入框做候选。
+//
+// 与 TestLLMProfile 同款回落规则：profileID 非空时，Base URL 与 API Key
+// 留空则沿用该方案已保存的值 —— 编辑已有方案时无需重填 Key 就能拉列表。
+// 不要求模型名：列表接口与 chat 接口不同，模型名此时还是用户要填的东西。
+func (a *App) ListLLMModels(profileID, baseURL, apiKey string) LLMModelsResult {
+	if err := a.ready(); err != nil {
+		return LLMModelsResult{Message: err.Error()}
+	}
+
+	var saved vault.LLMSettings
+	savedKey := ""
+	if id := strings.TrimSpace(profileID); id != "" {
+		p, ok := a.v.LLMProfile(id)
+		if !ok {
+			return LLMModelsResult{Message: "该服务商已不存在（可能已被删除），请刷新后重试。"}
+		}
+		saved = vault.LLMSettings{BaseURL: p.BaseURL, Model: p.Model}
+		savedKey = a.v.LLMKey(id)
+	}
+
+	base, _, key := resolveLLMConfig(baseURL, "", apiKey, saved, savedKey)
+	if base == "" {
+		return LLMModelsResult{Message: "请先填写 Base URL。"}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), llmTestTimeout)
+	defer cancel()
+
+	models, err := llm.New(base, key, "").Models(ctx)
+
+	// 404 单独说：/models 不是所有网关都实现（老版 vLLM、某些中转站），
+	// 拉不到列表不影响正常对话 —— 沿用通用诊断会误导向「地址填错了」。
+	var se *llm.StatusError
+	if errors.As(err, &se) && se.Status == http.StatusNotFound {
+		return LLMModelsResult{Message: "这个网关没有实现标准 /models 接口（404）—— 模型名请手动填写，不影响正常对话。"}
+	}
+
+	// 400 同理单独说：调用 /models 时模型名还没填（它正是这次要选的东西），
+	// 通用诊断里「多半是模型名写错了」的提示在这里不成立。
+	if errors.As(err, &se) && se.Status == http.StatusBadRequest {
+		return LLMModelsResult{Message: "网关拒绝了这次 /models 请求（400）—— 不影响正常对话，模型名请手动填写。"}
+	}
+
+	status := 0
+	if errors.As(err, &se) {
+		status = se.Status
+	}
+	if err != nil {
+		return LLMModelsResult{Message: diagnoseLLMError(err, status, base, key != "")}
+	}
+	if len(models) == 0 {
+		return LLMModelsResult{Message: "网关返回了空模型列表 —— 它可能没实现标准 /models 接口，模型名请手动填写。"}
+	}
+	return LLMModelsResult{OK: true, Models: models, Message: fmt.Sprintf("获取到 %d 个模型", len(models))}
+}
+
 // llmTestTimeout 是「测试连接」的超时。
 //
 // 之所以做成变量而不是直接写 20*time.Second：测试需要验证这个 deadline
