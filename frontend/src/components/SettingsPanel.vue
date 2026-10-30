@@ -2,24 +2,48 @@
 import { reactive, ref, computed } from 'vue'
 import { store, push } from '../store'
 import { t } from '../i18n'
-import UiSelect from './UiSelect.vue'
 
-// ---- 方案（多套 LLM 配置，可切换） ----
+// ---- 方案（多套 LLM 配置，可切换）----
 //
+// 布局与 HostsPanel 一致：列表卡片 + 弹窗编辑。
 // 数据事实来源是 store.llmProfiles（Bootstrap 拉回，每项带 active 标记）。
-// editingId 是「正在编辑」的方案；空串表示「新建中」，而不是某个真实方案。
+// editingId 是「弹窗正在编辑」的方案；空串表示「新建中」。
 // 与「正在使用」（active）是两回事：编辑非激活方案时，两者不同。
 const profiles = computed(() => store.llmProfiles || [])
-const editingId = ref(profiles.value.find(p => p.active)?.id || '')
 
-const profileOptions = computed(() =>
-  profiles.value.map(p => ({ value: p.id, label: `${p.name}${p.active ? t('settings.active') : ''}` }))
-)
+const editing = ref(false)
+const editingId = ref('')
+const busy = ref(false)
+const testing = ref(false)
+const testRes = ref(null)   // 弹窗内「测试连接」的结果，见 app.go 的 LLMTestResult
+const corrected = ref('')   // 被自动修正的 Base URL（原值多填了端点）
+
+// 卡片上的「测试连接」：对已保存的方案发一次真实请求。
+// 传空字段 —— 后端 TestLLMProfile 会回落到该方案已保存的值。
+// 按卡片 id 记录进行中标记：允许同时测多张卡片，互不挤掉对方的状态。
+const cardTesting = reactive({})
+const cardResult = reactive({})
+
+// Wails 在 macOS 上跑的是 WKWebView，原生 confirm() 不会弹框且直接返回 undefined。
+// 与 HostsPanel 相同，用一个 Promise 化的自绘模态替代。
+const confirmState = ref(null)
+
+function askConfirm({ message, okLabel, danger = false }) {
+  return new Promise(resolve => {
+    confirmState.value = { message, okLabel, danger, resolve }
+  })
+}
+
+function settleConfirm(ok) {
+  const s = confirmState.value
+  confirmState.value = null
+  if (s) s.resolve(ok)
+}
 
 const form = reactive({
-  name: profiles.value.find(p => p.id === editingId.value)?.name || t('settings.defaultName'),
-  baseUrl: store.llm.baseUrl,
-  model: store.llm.model,
+  name: '',
+  baseUrl: '',
+  model: '',
   // 空串 = 自动按模型名推断；数字 = 用户指定的上下文窗口（token）。
   contextWindow: '',
   supportsVision: false,
@@ -27,30 +51,29 @@ const form = reactive({
   clearKey: false
 })
 
-const busy = ref(false)
-const testing = ref(false)
-const testRes = ref(null)   // TestLLM 的返回，见 app.go 的 LLMTestResult
-const corrected = ref('')   // 被自动修正的 Base URL（原值多填了端点）
+// 新建模式：清空表单，编辑目标指向尚不存在的方案。
+function startNew() {
+  editingId.value = ''
+  resetForm()
+  editing.value = true
+}
 
-const editingProfile = () => profiles.value.find(p => p.id === editingId.value)
-
-// 把某套方案载入表单。Key 永远不回填（后端不下发），留空 = 不修改。
-function loadEditing() {
-  const p = editingProfile()
-  form.name = p ? p.name : ''
-  form.baseUrl = p ? p.baseUrl : ''
-  form.model = p ? p.model : ''
-  form.contextWindow = p && p.contextWindow > 0 ? String(p.contextWindow) : ''
-  form.supportsVision = !!(p && p.supportsVision)
+// 编辑模式：把方案载入表单。Key 永远不回填（后端不下发），留空 = 不修改。
+function startEdit(p) {
+  editingId.value = p.id
+  form.name = p.name
+  form.baseUrl = p.baseUrl
+  form.model = p.model
+  form.contextWindow = p.contextWindow > 0 ? String(p.contextWindow) : ''
+  form.supportsVision = !!p.supportsVision
   form.apiKey = ''
   form.clearKey = false
   testRes.value = null
   corrected.value = ''
+  editing.value = true
 }
 
-// 新建模式：清空表单，编辑目标指向尚不存在的方案。
-function newProfile() {
-  editingId.value = ''
+function resetForm() {
   form.name = ''
   form.baseUrl = ''
   form.model = ''
@@ -62,6 +85,12 @@ function newProfile() {
   corrected.value = ''
 }
 
+function closeModal() {
+  // 保存进行中不允许关闭：半途关掉会让人误以为已保存。
+  if (busy.value) return
+  editing.value = false
+}
+
 function parseContextWindow(raw) {
   const s = String(raw || '').trim().replace(/[,_\s]/g, '')
   if (!s) return 0
@@ -70,30 +99,23 @@ function parseContextWindow(raw) {
   return Math.floor(n)
 }
 
-// 保存/切换/删除后统一重拉状态。顺带把表单对齐到「当前编辑的方案」——
-// 新增方案的 ID 是后端生成的，前端必须跟着改。
+// 保存/切换/删除后统一重拉状态。
+// 「设为当前」/删除/新增都会改激活方案 —— 让「下一轮用哪套」跟着走，
+// 否则在设置里切了方案，下一轮请求仍带着旧的那套（见 store.ask）。
 async function refreshLLM() {
   const info = await window.go.main.App.Bootstrap()
   store.llm = info.llm
   store.llmProfiles = info.llmProfiles || []
-  // 「设为当前」/删除/新增都会改激活方案 —— 让「下一轮用哪套」跟着走，
-  // 否则在设置里切了方案，下一轮请求仍带着旧的那套（见 store.ask）。
   store.selectedProfileId = (store.llmProfiles.find(p => p.active) || {}).id || ''
-  if (!profiles.value.some(p => p.id === editingId.value)) {
-    editingId.value = profiles.value.find(p => p.active)?.id || ''
-  }
-  loadEditing()
 }
 
 // 设为当前使用的方案。下一次对话即生效，无需重启。
-async function activate() {
-  const id = editingId.value
-  if (!id) return
+async function activate(p) {
   busy.value = true
   try {
-    await window.go.main.App.ActivateLLMProfile(id)
+    await window.go.main.App.ActivateLLMProfile(p.id)
     await refreshLLM()
-    push({ kind: 'system', content: t('settings.switched', { name: form.name }) })
+    push({ kind: 'system', content: t('settings.switched', { name: p.name }) })
   } catch (e) {
     push({ kind: 'error', content: t('settings.switchFail', { err: e && e.message ? e.message : e }) })
   } finally {
@@ -102,18 +124,36 @@ async function activate() {
 }
 
 // 删除方案。后端保证至少留一套，这里不重复判断 —— 让后端说那句话。
-async function removeProfile() {
-  const id = editingId.value
-  if (!id) return
+async function removeProfile(p) {
+  const ok = await askConfirm({
+    message: t('settings.confirmDelete', { name: p.name }),
+    okLabel: t('settings.delete'),
+    danger: true
+  })
+  if (!ok) return
   busy.value = true
   try {
-    await window.go.main.App.DeleteLLMProfile(id)
+    await window.go.main.App.DeleteLLMProfile(p.id)
     await refreshLLM()
     push({ kind: 'system', content: t('settings.removed') })
   } catch (e) {
     push({ kind: 'error', content: t('settings.removeFail', { err: e && e.message ? e.message : e }) })
   } finally {
     busy.value = false
+  }
+}
+
+// 卡片上的「测试连接」：验证的是**该方案已保存的配置**（空字段回落），
+// 不经过表单，所以测试结论与编辑中的草稿互不干扰。
+async function testSaved(p) {
+  cardTesting[p.id] = true
+  cardResult[p.id] = null
+  try {
+    cardResult[p.id] = await window.go.main.App.TestLLMProfile(p.id, '', '', '')
+  } catch (e) {
+    cardResult[p.id] = { ok: false, message: String(e) }
+  } finally {
+    delete cardTesting[p.id]
   }
 }
 
@@ -153,10 +193,11 @@ async function save() {
       apiKey: form.apiKey,
       clearKey: form.clearKey
     })
-    editingId.value = saved.id
-    // refreshLLM 内部会 loadEditing()：表单对齐到保存后的值
-    // （含后端规范化过的 Base URL），并清掉 Key 输入框与测试结果。
     await refreshLLM()
+    // 配置已变，卡片上旧的测试结论不再可信 —— 清掉，避免「结论对不上已改配置」的误导。
+    if (editingId.value) delete cardResult[editingId.value]
+    editing.value = false
+    // 用后端规范化后的名称提示，而不是表单原值（后端可能补了默认名/去掉了空格）。
     push({ kind: 'system', content: t('settings.saved', { name: saved.name }) })
   } catch (e) {
     push({ kind: 'error', content: String(e) })
@@ -204,50 +245,80 @@ async function test() {
 }
 
 const isLocal = () => /localhost|127\.0\.0\.1|0\.0\.0\.0/.test(form.baseUrl)
+
+// 编辑中的方案是否已保存 Key（弹窗里「留空表示不修改」的提示只对它有意义）。
+const editingProfileHasApiKey = computed(() =>
+  !!(profiles.value.find(p => p.id === editingId.value) || {}).hasApiKey
+)
 </script>
 
 <template>
   <div class="panel">
-    <div class="panel-inner">
-      <header class="panel-head">
+    <header class="panel-head">
+      <div>
         <h2>{{ t('settings.title') }}</h2>
         <p class="muted">
           {{ t('settings.headHint.a') }}<span class="mono">/v1/chat/completions</span>{{ t('settings.headHint.b') }}
           {{ t('settings.headHint.c') }}
         </p>
-      </header>
+      </div>
+      <button class="primary" @click="startNew">{{ t('settings.add') }}</button>
+    </header>
 
-      <div class="card">
-        <div class="card-title">{{ t('settings.card.title') }}</div>
-        <div class="card-sub">{{ t('settings.card.sub') }}</div>
-        <div class="profile-bar">
-          <UiSelect
-            class="profile-select"
-            v-model="editingId"
-            :options="profileOptions"
-            :disabled="!profiles.length"
-            :placeholder="t('settings.noProfiles')"
-            @change="loadEditing"
-          />
-          <button class="sm" @click="newProfile">{{ t('settings.new') }}</button>
-          <button class="sm" v-if="editingId && !editingProfile()?.active" :disabled="busy" @click="activate">
-            {{ t('settings.activate') }}
+    <div class="list">
+      <div v-if="!profiles.length" class="card muted">{{ t('settings.empty') }}</div>
+
+      <div v-for="p in profiles" :key="p.id" class="card profile">
+        <div class="profile-main">
+          <div class="profile-name">
+            {{ p.name }}
+            <span v-if="p.active" class="tag ok">{{ t('settings.using') }}</span>
+            <span v-if="!p.hasApiKey" class="tag danger">{{ t('settings.noKey') }}</span>
+          </div>
+          <div class="profile-addr mono">{{ p.model }} · {{ p.baseUrl }}</div>
+          <div v-if="cardResult[p.id]" class="test" :class="cardResult[p.id].ok ? 'ok' : 'bad'">
+            {{ cardResult[p.id].message }}
+            <span v-if="cardResult[p.id].durationMs" class="muted">({{ cardResult[p.id].durationMs }}ms)</span>
+          </div>
+        </div>
+        <div class="profile-actions">
+          <button class="sm" :disabled="!!cardTesting[p.id]" @click="testSaved(p)">
+            {{ cardTesting[p.id] ? t('settings.test.testing') : t('settings.test.run') }}
           </button>
-          <button class="sm danger" v-if="profiles.length > 1 && editingId" :disabled="busy" @click="removeProfile">
+          <button v-if="!p.active" class="sm" :disabled="busy" @click="activate(p)">{{ t('settings.activate') }}</button>
+          <button class="sm" @click="startEdit(p)">{{ t('settings.edit') }}</button>
+          <button v-if="profiles.length > 1" class="sm danger" :disabled="busy" @click="removeProfile(p)">
             {{ t('settings.delete') }}
           </button>
         </div>
-        <div class="profile-hint muted" v-if="editingId">
-          {{ editingProfile()?.active ? t('settings.hint.active') : t('settings.hint.inactive') }}
+      </div>
+    </div>
+
+    <!-- 删除确认：与 HostsPanel 相同的自绘模态（WKWebView 下原生 confirm 不可用） -->
+    <div v-if="confirmState" class="overlay" @click.self="settleConfirm(false)">
+      <div class="modal confirm-modal">
+        <p class="confirm-msg">{{ confirmState.message }}</p>
+        <div class="modal-actions">
+          <button @click="settleConfirm(false)">{{ t('settings.cancel') }}</button>
+          <button
+            :class="confirmState.danger ? 'danger' : 'primary'"
+            @click="settleConfirm(true)"
+          >{{ confirmState.okLabel }}</button>
         </div>
       </div>
+    </div>
 
-      <div class="card">
-        <div class="card-title">{{ t('settings.info.title') }}</div>
+    <!-- 只允许通过「取消」按钮或右上角关闭图标关闭，避免误点遮罩丢失已填内容 -->
+    <div v-if="editing" class="overlay">
+      <div class="modal">
+        <button class="modal-close" :aria-label="t('settings.cancel')" :disabled="busy" @click="closeModal">×</button>
+        <h3>{{ editingId ? t('settings.editTitle') : t('settings.addTitle') }}</h3>
+
         <div class="field">
           <label>{{ t('settings.info.name') }}</label>
           <input v-model="form.name" class="profile-name" :placeholder="t('settings.info.namePh')" />
         </div>
+
         <div class="field">
           <label>{{ t('settings.info.presets') }}</label>
           <div class="presets">
@@ -256,10 +327,7 @@ const isLocal = () => /localhost|127\.0\.0\.1|0\.0\.0\.0/.test(form.baseUrl)
             </button>
           </div>
         </div>
-      </div>
 
-      <div class="card">
-        <div class="card-title">{{ t('settings.conn.title') }}</div>
         <div class="field">
           <label>Base URL</label>
           <input v-model="form.baseUrl" class="base-url" placeholder="https://api.openai.com/v1" />
@@ -286,13 +354,13 @@ const isLocal = () => /localhost|127\.0\.0\.1|0\.0\.0\.0/.test(form.baseUrl)
         <div class="field">
           <label>
             API Key
-            <span v-if="editingId && editingProfile()?.hasApiKey" class="muted">{{ t('settings.key.saved') }}</span>
+            <span v-if="editingId && editingProfileHasApiKey" class="muted">{{ t('settings.key.saved') }}</span>
             <span v-else-if="!editingId && store.llm.hasApiKey" class="muted">{{ t('settings.key.activeSaved') }}</span>
           </label>
           <input v-model="form.apiKey" class="api-key" type="password" placeholder="sk-..." />
         </div>
 
-        <label class="chk" v-if="editingId && editingProfile()?.hasApiKey">
+        <label class="chk" v-if="editingId && editingProfileHasApiKey">
           <input type="checkbox" v-model="form.clearKey" />
           {{ t('settings.key.clear') }}
         </label>
@@ -326,6 +394,7 @@ const isLocal = () => /localhost|127\.0\.0\.1|0\.0\.0\.0/.test(form.baseUrl)
 
         <div class="actions">
           <span class="test-note">{{ t('settings.test.note') }}</span>
+          <button :disabled="busy" @click="closeModal">{{ t('settings.cancel') }}</button>
           <button :disabled="testing" @click="test">{{ testing ? t('settings.test.testing') : t('settings.test.run') }}</button>
           <button class="primary" :disabled="busy" @click="save">{{ busy ? t('settings.saving') : t('settings.save') }}</button>
         </div>
@@ -340,32 +409,82 @@ const isLocal = () => /localhost|127\.0\.0\.1|0\.0\.0\.0/.test(form.baseUrl)
 
 <style scoped>
 .panel { padding: 24px 28px 36px; overflow-y: auto; height: 100%; }
-/* 内容列：窗口再宽也不把表单拉成一条 —— 保持稳定的阅读宽度。 */
-.panel-inner { max-width: 820px; }
-
-.panel-head { margin-bottom: 18px; }
+.panel-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; margin-bottom: 18px; }
 .panel-head h2 { font-size: 16px; margin: 0 0 6px; }
-.panel-head p { margin: 0; font-size: 12px; line-height: 1.7; max-width: 640px; }
+.panel-head p { margin: 0; font-size: 12px; line-height: 1.7; max-width: 620px; }
 
-/* 卡片节奏：统一间距（不再用行内 style 拼），标题与说明做层级 */
-.card { padding: 16px 18px; }
-.card + .card { margin-top: 12px; }
-.card-title { font-size: 13px; font-weight: 600; margin: 0 0 12px; }
-.card-sub { font-size: 12px; color: var(--text-3); line-height: 1.6; margin: -6px 0 12px; }
+.list { display: flex; flex-direction: column; gap: 10px; max-width: 820px; }
 
-/* 字段：统一「标签在上、控件在下」的节奏，间距只在这里定义 */
+.profile { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; }
+.profile-main { min-width: 0; }
+.profile-name { font-weight: 500; display: flex; align-items: center; gap: 8px; }
+.profile-addr { color: var(--text-2); margin-top: 3px; font-size: 12px; }
+.profile-actions { display: flex; gap: 6px; flex-shrink: 0; }
+
+.tag {
+  font-size: 11px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  border-radius: 20px;
+  padding: 1px 8px;
+  font-weight: 400;
+}
+.tag.ok { background: var(--ok-bg); color: var(--ok); }
+.tag.danger { background: var(--danger-bg); color: var(--danger); }
+
+.test { margin-top: 8px; font-size: 12px; word-break: break-all; }
+.test.ok { color: var(--ok); }
+.test.bad { color: var(--danger); }
+
+.overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.28);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 30px;
+  z-index: 20;
+}
+.modal {
+  position: relative;
+  background: var(--surface);
+  border-radius: 12px;
+  padding: 22px 24px;
+  width: 620px;
+  max-width: 100%;
+  max-height: 100%;
+  overflow-y: auto;
+}
+.modal h3 { margin: 0 0 16px; font-size: 14px; }
+.modal-close {
+  position: absolute;
+  top: 12px;
+  right: 14px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  line-height: 1;
+  font-size: 18px;
+  border: none;
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+  border-radius: 6px;
+}
+.modal-close:hover { background: var(--surface-2); color: var(--text); }
+
+.confirm-modal { width: 420px; }
+.confirm-msg { margin: 0 0 6px; font-size: 13px; line-height: 1.7; color: var(--text); }
+
+/* 字段：统一「标签在上、控件在下」的节奏 */
 .field { margin-top: 14px; }
 .field label { margin-bottom: 6px; }
 
 .presets { display: flex; flex-wrap: wrap; gap: 8px; }
 
-.profile-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-/* 方案选择器不必占满整行：给个舒适宽度，按钮紧跟其后 */
-.profile-select { flex: 0 1 340px; min-width: 200px; }
-.profile-hint { margin-top: 10px; font-size: 12px; }
-
 /* 长文本输入给个上限：不随窗口无限拉长 */
-.base-url, .model-name, .api-key, .profile-name, .ctx-window { max-width: 620px; }
+.base-url, .model-name, .api-key, .profile-name, .ctx-window { max-width: 100%; }
 .field-hint { margin-top: 6px; font-size: 12px; line-height: 1.45; }
 
 .notice {

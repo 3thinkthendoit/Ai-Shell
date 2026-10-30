@@ -177,8 +177,10 @@ const authLabel = m => ({ password: t('hosts.auth.password'), private_key: t('ho
       </div>
     </div>
 
-    <div v-if="editing" class="overlay" @click.self="editing = false">
+    <!-- 只允许通过「取消」按钮或右上角关闭图标关闭，避免误点遮罩丢失已填内容 -->
+    <div v-if="editing" class="overlay">
       <div class="modal">
+        <button class="modal-close" :aria-label="t('hosts.cancel')" @click="editing = false">×</button>
         <h3>{{ form.id ? t('hosts.editTitle') : t('hosts.addTitle') }}</h3>
 
         <div class="grid">
@@ -289,6 +291,7 @@ const authLabel = m => ({ password: t('hosts.auth.password'), private_key: t('ho
   z-index: 20;
 }
 .modal {
+  position: relative;
   background: var(--surface);
   border-radius: 12px;
   padding: 22px 24px;
@@ -297,6 +300,22 @@ const authLabel = m => ({ password: t('hosts.auth.password'), private_key: t('ho
   max-height: 100%;
   overflow-y: auto;
 }
+.modal-close {
+  position: absolute;
+  top: 12px;
+  right: 14px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  line-height: 1;
+  font-size: 18px;
+  border: none;
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+  border-radius: 6px;
+}
+.modal-close:hover { background: var(--surface-2); color: var(--text); }
 .modal h3 { margin: 0 0 16px; font-size: 14px; }
 .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
