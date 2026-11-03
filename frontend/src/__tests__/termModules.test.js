@@ -8,7 +8,7 @@
 // 落在 instance.written，退格/擦除是转义序列，都能逐字节断言。
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { flushPromises } from '@vue/test-utils'
-import { store, bucketKey, base64ToBytes } from '../store.js'
+import { store, bucketKey, base64ToBytes, resetShellMarks } from '../store.js'
 import {
   openedKeys,
   ensureTerm,
@@ -24,7 +24,7 @@ import {
 } from '../terminal/termSession.js'
 import { onTermData } from '../terminal/termInput.js'
 import { enqueueSubmit } from '../terminal/termSubmit.js'
-import { CMD_PENDING_IDLE_MS } from '../terminal/termEvents.js'
+import { bindTerminalEvents, CMD_PENDING_IDLE_MS } from '../terminal/termEvents.js'
 import { instances, resetInstances } from './stubs/xterm.js'
 
 const toBytes = x => Array.from(x)
@@ -83,6 +83,7 @@ function resetStore() {
   store.busy = false
   store.llmProfiles = [{ id: 'p1', name: 'default', model: 'm', active: true }]
   store.selectedProfileId = 'p1'
+  resetShellMarks()
 }
 
 let calls
@@ -326,11 +327,34 @@ describe('termSubmit · enqueueSubmit 分流', () => {
     expect(toBytes(base64ToBytes(wt[0].args[2]))).toEqual(toBytes(new TextEncoder().encode('\n')))
   })
 
-  it('agent 对话中回车：已知命令仍写进 PTY', async () => {
+  it('agent 等待回复：已知命令仍执行（回归：重连后敲 ls 不许被 Agent 劫持）', async () => {
     withHost()
-    // 本会话已有 Agent 回复 → agent 模式只锁「非命令」回复；`ls -la` 必须仍执行。
+    // 时间线最后一条是 assistant（AI 刚说完话在等回复）。用户看到的却是
+    // 终端提示符，敲 `ls` 就是要列目录 —— 之前这里被当成对话交给 Agent，
+    // 实测重连后第一条命令全被吞。命令识别优先于 agentMode。
     store.bySession[bucketKey('h1', 'default')] = [{ kind: 'assistant', content: '先确认来源 IP。' }]
     const key = await createSurface()
+    await enqueueSubmit(key, 'ls -la')
+    expect(callsOf('RunShellInTerminal').length).toBe(1)
+    expect(callsOf('Ask')).toEqual([])
+  })
+
+  it('提示符空闲压过时间线：AI 刚说完话、终端空闲，中文短回复仍走 Agent', async () => {
+    withHost()
+    store.bySession[bucketKey('h1', 'default')] = [{ kind: 'assistant', content: '要继续吗？' }]
+    const key = await createSurface()
+    await enqueueSubmit(key, '好的')
+    expect(callsOf('Ask').length).toBe(1)
+    expect(callsOf('RunShellInTerminal')).toEqual([])
+  })
+
+  it('跑过命令后：回到命令模式，ls 恢复执行', async () => {
+    withHost()
+    store.bySession[bucketKey('h1', 'default')] = [{ kind: 'assistant', content: '先确认来源 IP。' }]
+    const key = await createSurface()
+    // ! 前缀强制跑一条命令（触发 markShellRun，退出 agent 等待态）。
+    await enqueueSubmit(key, '!who')
+    calls.length = 0
     await enqueueSubmit(key, 'ls -la')
     expect(callsOf('RunShellInTerminal').length).toBe(1)
     expect(callsOf('Ask')).toEqual([])
@@ -397,7 +421,7 @@ describe('cmdPending · 提交命令后的乐观透传窗口', () => {
     expect(callsOf('RunShellInTerminal').length).toBe(0)
   })
 
-  it('窗口内敲危险命令：回车被硬拒绝复核拦下，Ctrl-U 清远端行并关窗', async () => {
+  it('窗口内敲危险命令：回车被硬拒绝复核吞掉，窗口保持、无 Ctrl-U 副作用', async () => {
     withHost()
     const key = await createSurface()
     await enqueueSubmit(key, 'ls')
@@ -407,17 +431,44 @@ describe('cmdPending · 提交命令后的乐观透传窗口', () => {
     onTermData(key, ' -rf /data')
     onTermData(key, '\r')
     await flushPromises()
-    // 可见字符本就透传（'rm'、' -rf /data'），拦下的只是回车：代替它的是
-    // Ctrl-U（bash kill-line 清远端行缓冲）—— 否则命令就真的跑了。
+    // 可见字符本就透传（'rm'、' -rf /data'），吞掉的只是回车 —— 回车不发，
+    // 命令就跑不了。不发 Ctrl-U、不关窗：窗口开着不代表这是提示符（vi 这类
+    // 无信号程序里回车可能是正文换行），关窗会让 vi 冻死。
     const wt = callsOf('WriteTerminal')
-    expect(wt.length).toBe(3)
-    expect(toBytes(base64ToBytes(wt[2].args[2]))).toEqual(toBytes(new TextEncoder().encode('\x15')))
+    expect(wt.length).toBe(2)
     // 复核拿到的是攒出来的整行
     const chk = callsOf('CheckShellCommand')
     expect(chk.length).toBe(1)
     expect(chk[0].args[1]).toBe('rm -rf /data')
-    // 拦下即关窗：既然是在提示符下敲命令，恢复本地行编辑
-    expect(isCmdRunning(key)).toBe(false)
+    // 窗口保持：后续按键继续透传（见下个用例的知情放行）
+    expect(isCmdRunning(key)).toBe(true)
+  })
+
+  it('同一行被拒后再次回车：知情放行（裁决已画上屏，用户看过仍要继续）', async () => {
+    withHost()
+    const key = await createSurface()
+    await enqueueSubmit(key, 'ls')
+    calls.length = 0
+    onTermData(key, 'rm -rf /data')
+    onTermData(key, '\r') // 拒绝：吞一次
+    await flushPromises()
+    expect(callsOf('WriteTerminal').length).toBe(1) // 只有字符透传，没有回车
+    calls.length = 0
+    onTermData(key, '\r') // 同一行再次回车：知情放行
+    await flushPromises()
+    const wt = callsOf('WriteTerminal')
+    expect(wt.length).toBe(1)
+    expect(toBytes(base64ToBytes(wt[0].args[2]))).toEqual(toBytes(new TextEncoder().encode('\r')))
+    // 放行即消费：攒行清空，拒绝记忆清除
+    onTermData(key, 'rm -rf /data')
+    onTermData(key, '\r') // 内容相同但已是新的一行：重新复核
+    await flushPromises()
+    // 重新走了一遍复核（记录窗口自知情放行起算，恰好 1 次），并且照旧拦下
+    expect(callsOf('CheckShellCommand')).toHaveLength(1)
+    // 写进 PTY 的只有知情放行的回车与新行的字符 —— 第二次回车照旧被吞
+    const enc = s => toBytes(new TextEncoder().encode(s))
+    const tail = callsOf('WriteTerminal').map(c => toBytes(base64ToBytes(c.args[2])))
+    expect(tail).toEqual([enc('\r'), enc('rm -rf /data')])
   })
 
   it('窗口内菜单输入 + 回车：复核放行，回车照常透传且窗口保持', async () => {
@@ -464,10 +515,10 @@ describe('cmdPending · 提交命令后的乐观透传窗口', () => {
     const chk = callsOf('CheckShellCommand')
     expect(chk.length).toBe(1)
     expect(chk[0].args[1]).toBe('rm')
-    // 危险命令照旧拦下：字符透传（'rmx'、'\x7f'）+ Ctrl-U 清远端行
+    // 危险命令照旧拦下：字符透传（'rmx'、'\x7f'），回车被吞
     const wt = callsOf('WriteTerminal')
-    expect(wt.length).toBe(3)
-    expect(toBytes(base64ToBytes(wt[2].args[2]))).toEqual(toBytes(new TextEncoder().encode('\x15')))
+    expect(wt.length).toBe(2)
+    expect(toBytes(base64ToBytes(wt[1].args[2]))).toEqual(toBytes(new TextEncoder().encode('\x7f')))
   })
 
   it('窗口内按→/Home 等光标键不动行内容：攒行仍有效，危险命令照样被拦', async () => {
@@ -480,11 +531,11 @@ describe('cmdPending · 提交命令后的乐观透传窗口', () => {
     onTermData(key, '\r')
     await flushPromises()
     // 历史上方向键一律作废攒行，「敲完命令按一下→再回车」就成了绕过
-    // 硬拒绝的旁路 —— 现在光标键不动行，复核照常拿到整行
+    // 硬拒绝的旁路 —— 现在光标键不动行，复核照常拿到整行、回车照旧被吞
     expect(callsOf('CheckShellCommand')[0].args[1]).toBe('rm -rf /data')
     const wt = callsOf('WriteTerminal')
-    expect(wt.length).toBe(3)
-    expect(toBytes(base64ToBytes(wt[2].args[2]))).toEqual(toBytes(new TextEncoder().encode('\x15')))
+    expect(wt.length).toBe(2)
+    expect(toBytes(base64ToBytes(wt[1].args[2]))).toEqual(toBytes(new TextEncoder().encode('\x1b[C')))
   })
 
   it('复核期间继续敲的字先排队，结论出来后按序补发——顺序不颠倒', async () => {
@@ -507,7 +558,7 @@ describe('cmdPending · 提交命令后的乐观透传窗口', () => {
     expect(chk[chk.length - 1].args[1]).toBe('xy')
   })
 
-  it('被拒绝后队列里的输入重放到本地行编辑，不丢键也不直灌 PTY', async () => {
+  it('被拒绝后窗口保持：队列里的输入重放后继续透传给程序（vi 不冻死）', async () => {
     withHost()
     const key = await createSurface()
     await enqueueSubmit(key, 'ls')
@@ -515,12 +566,95 @@ describe('cmdPending · 提交命令后的乐观透传窗口', () => {
     onTermData(key, 'rm')
     onTermData(key, '\r') // 复核中
     onTermData(key, 'h')  // 排队
-    await flushPromises() // 拒绝：Ctrl-U 清行 + 关窗
+    await flushPromises() // 拒绝：吞回车、不关窗
     const enc = s => toBytes(new TextEncoder().encode(s))
     const seq = callsOf('WriteTerminal').map(c => toBytes(base64ToBytes(c.args[2])))
-    expect(seq).toEqual([enc('rm'), enc('\x15')]) // 'h' 没有透传给 PTY
-    expect(getTerm(key).line).toBe('h')            // 落到本地行编辑
-    expect(isCmdRunning(key)).toBe(false)
+    // 'h' 重放后经窗口透传直达 PTY —— 程序继续收得到键
+    expect(seq).toEqual([enc('rm'), enc('h')])
+    // 回车被吞后远端行还挂着：'h' 追加其后（远程行此刻就是 rmh）
+    onTermData(key, '\r')
+    await flushPromises()
+    const chk = callsOf('CheckShellCommand')
+    expect(chk[chk.length - 1].args[1]).toBe('rmh')
+  })
+
+  // ---- vi 卡死回归（后端 vtscreen 的 screenTUI / alt 信号 + 前端接线） ----
+  // 历史缺陷：无 OSC 133、无备用屏检测的 vi 上，窗口 6 秒静默关闭后按键
+  // 全进本地行编辑，vi 从此收不到输入。修复靠后端把主屏 TUI 重绘特征
+  // （busybox vi 的 CUP/ED）上报成 term:tui —— 这里模拟两条信号路径。
+
+  function emitEv(name, payload) {
+    window.runtime.emit(name, payload)
+  }
+
+  it('busybox vi：主屏 TUI 特征上报（term:tui）后按键含回车全部直达 PTY', async () => {
+    withHost()
+    bindTerminalEvents(window.runtime)
+    const key = await createSurface()
+    await enqueueSubmit(key, 'vi')
+    expect(isCmdRunning(key)).toBe(true)
+    // vi 画第一屏：后端 screenTUI 命中 → term:tui active
+    emitEv('term:tui', { hostId: 'h1', sessionId: 'default', active: true })
+    expect(isCmdRunning(key)).toBe(false) // 权威信号收窗
+    calls.length = 0
+    const enc = s => toBytes(new TextEncoder().encode(s))
+    // 静默任意久（用户阅读）也不退化回本地行编辑
+    vi.advanceTimersByTime(CMD_PENDING_IDLE_MS * 10)
+    onTermData(key, 'i')
+    onTermData(key, 'x')
+    onTermData(key, '\r')
+    await flushPromises()
+    const seq = callsOf('WriteTerminal').map(c => toBytes(base64ToBytes(c.args[2])))
+    expect(seq).toEqual([enc('i'), enc('x'), enc('\r')])
+    // 全屏程序 owns 输入：回车不走复核
+    expect(callsOf('CheckShellCommand')).toHaveLength(0)
+  })
+
+  it('竞态：tui 信号先于 RunShellInTerminal resolve、窗口后开 —— 回车是程序输入，不复核', async () => {
+    withHost()
+    bindTerminalEvents(window.runtime)
+    const key = await createSurface()
+    // 后端已把 vi 的备用屏切上报，promise 才 resolve、armCmdPending 才开窗
+    emitEv('term:tui', { hostId: 'h1', sessionId: 'default', active: true })
+    await enqueueSubmit(key, 'vi')
+    expect(store.terms[key].cmdPending).toBe(true) // 竞态：窗口与 tui 并存
+    calls.length = 0
+    onTermData(key, 'i')
+    onTermData(key, 'x')
+    onTermData(key, '\r') // vim 插入模式的换行，不是 shell 命令
+    await flushPromises()
+    const enc = s => toBytes(new TextEncoder().encode(s))
+    const seq = callsOf('WriteTerminal').map(c => toBytes(base64ToBytes(c.args[2])))
+    expect(seq).toEqual([enc('i'), enc('x'), enc('\r')])
+    expect(callsOf('CheckShellCommand')).toHaveLength(0)
+  })
+
+  it('竞态窗口与 tuiActive 并存时静默超时不关窗：续窗直到 term:tui active=false 才收', async () => {
+    withHost()
+    bindTerminalEvents(window.runtime)
+    const key = await createSurface()
+    // 竞态序：tui 信号先到、armCmdPending 后开窗（上一用例同款时序）
+    emitEv('term:tui', { hostId: 'h1', sessionId: 'default', active: true })
+    await enqueueSubmit(key, 'vi')
+    expect(store.terms[key].cmdPending).toBe(true)
+    // vi 打完第一屏静默等用户阅读：静默兜底不该把窗口关掉 —— 静默是 TUI
+    // 的常态，不是「命令结束回到提示符」。
+    vi.advanceTimersByTime(CMD_PENDING_IDLE_MS * 3)
+    expect(store.terms[key].cmdPending).toBe(true)
+    // 窗口仍在 + tuiActive：按键继续直达 PTY
+    calls.length = 0
+    onTermData(key, 'x')
+    const enc = s => toBytes(new TextEncoder().encode(s))
+    expect(callsOf('WriteTerminal').map(c => toBytes(base64ToBytes(c.args[2])))).toEqual([enc('x')])
+    // vi 退出：term:tui active=false 是权威收窗信号
+    emitEv('term:tui', { hostId: 'h1', sessionId: 'default', active: false })
+    expect(store.terms[key].cmdPending).toBe(false)
+    expect(store.terms[key].tuiActive).toBe(false)
+    // 回到提示符：可打印字符重新进本地行编辑
+    calls.length = 0
+    onTermData(key, 'R')
+    expect(callsOf('WriteTerminal')).toEqual([])
+    expect(getTerm(key).line).toBe('R')
   })
 
   it('乐观窗口里敲中文：关窗改走本地行编辑，回车交给 Agent', async () => {

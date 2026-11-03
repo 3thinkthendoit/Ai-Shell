@@ -2,7 +2,10 @@ import { store, writeTerminal, textToBase64, stop, isPtyDirty, termState, backen
 import * as paint from '../termPaint.js'
 import { enqueueSubmit } from './termSubmit.js'
 import { hasCJK } from '../inputRoute.js'
-import { endCmdPending, pendingLine, appendPendingLine, clearPendingLine, popPendingLine } from './termEvents.js'
+import {
+  endCmdPending, pendingLine, appendPendingLine, clearPendingLine, popPendingLine,
+  deniedLine, setDeniedLine, clearDeniedLine
+} from './termEvents.js'
 import {
   getTerm,
   isFullscreen,
@@ -37,11 +40,16 @@ const gateQueues = new Map() // key → 复核期间 hold 住的输入（保序�
 // 攒的行继续有效 —— 见下面 gatePendingKey 里的分支注释。
 const CURSOR_KEYS = new Set(['\x1b[D', '\x1b[C', '\x1b[H', '\x1b[F', '\x1b[1~', '\x1b[4~', '\x1bOD', '\x1bOC', '\x1bOH', '\x1bOF'])
 
+// 窗口内对同一行内容的最近一次硬拒绝（termEvents.gateDenyLast，随窗口
+// 开/关清理）。拒绝只吞一次回车：用户看到裁决后再按回车，同一行原样放
+// 行 —— 知情确认。没有这个出口，在无权威信号的交互程序里（busybox vi
+// 这类不切备用屏的全屏程序）每敲一个危险长相的回车都会被永久吞掉，程
+// 序直接冻死。窗口的兜底语义是「不知道在哪」，处置必须无破坏性副作用。
+
 // flushGateQueue 把复核期间 hold 住的输入按到达顺序重放。
 //
-// 重放走 onTermData 的正常路径，就像用户刚刚才敲了它们：被拒绝后窗口已
-// 关 → 落到本地行编辑（用户继续打字不受影响）；窗口还开着 → 继续攒新行，
-// 队列里若有回车会照常触发新一轮复核。
+// 重放走 onTermData 的正常路径，就像用户刚刚才敲了它们：窗口还开着 →
+// 继续攒新行，队列里若有回车会照常触发新一轮复核（或命中知情放行）。
 function flushGateQueue(key) {
   const q = gateQueues.get(key) || []
   gateQueues.delete(key)
@@ -50,9 +58,12 @@ function flushGateQueue(key) {
 
 function gatePendingKey(key, t, d, send) {
   const st = termState(t.hostId, t.sessionId)
-  // 只管乐观窗口：真 cmdActive（OSC 133 命令边界）时命令起止有权威信号，
-  // 键属于前台程序，轮不到本地裁决。
-  if (!st || !st.cmdPending || st.cmdActive) return true
+  // 只管乐观窗口：真 cmdActive（OSC 133 命令边界）或 tuiActive（备用屏 /
+  // 主屏 TUI 重绘特征）时命令起止有信号，键属于前台程序，轮不到本地裁决。
+  // 含 tuiActive 是为了竞态序：tui 信号先到、窗口后开时（RunShellInTerminal
+  // 的 promise 晚于 vi 启动 resolve），窗口会与 tuiActive 并存 —— 此时回车
+  // 是程序的正文换行，复核它只会误伤（vi 里编辑的脚本内容常长得危险）。
+  if (!st || !st.cmdPending || st.cmdActive || st.tuiActive) return true
   if (gateBusy.get(key)) {
     // 复核进行中：所有输入先排队。不排队的话，回车后敲的字符会立即直达
     // PTY —— 先于被 hold 的回车抵达远端，被并进当前命令行（输入顺序
@@ -65,17 +76,27 @@ function gatePendingKey(key, t, d, send) {
   if (d === '\r') {
     const line = pendingLine(key).trim()
     if (!line) return true // 空行直接放行（vim E325 空回车选默认）
+    if (line && deniedLine(key) === line) {
+      // 知情放行：这行刚被拒绝过、裁决已画到屏上、内容一字未改，用户
+      // 再次回车 = 看过警告仍要继续。闸门的价值在「让用户看见」，不是
+      // 替用户做绝对决定 —— 真要执行的人开个别的终端拦不住。
+      clearDeniedLine(key)
+      clearPendingLine(key)
+      return true
+    }
     gateBusy.set(key, true)
     backendAPI().CheckShellCommand(t.hostId, line).then(res => {
       gateBusy.set(key, false)
       if (res && res.status === 'denied') {
-        // 命令字符早已透传进远端行缓冲：Ctrl-U（bash kill-line）清掉，
-        // 再把裁决画到终端——观感与正常硬拒绝路径一致。既然用户是在
-        // 提示符下敲命令，说明窗口早该关了，顺手关掉恢复本地行编辑。
-        send(textToBase64('\x15'))
+        // 只吞这一次回车 + 画裁决。窗口必须保持开：无权威信号时我们
+        // 并不知道这是提示符还是全屏程序的正文换行（vi 里编辑的脚本
+        // 内容长得像危险命令太常见了）——关窗会让后续按键全部落进
+        // 本地行编辑，vi 从此收不到任何输入，直接冻死。Ctrl-U 同理
+        // 不发：vi 插入模式里它删的是用户正在编辑的正文。
+        setDeniedLine(key, line)
         paint.paintShellVerdict(surfaceWrite(key), res)
-        endCmdPending(t.hostId, t.sessionId)
       } else {
+        clearDeniedLine(key)
         send(textToBase64('\r')) // 放行：补发被 hold 的回车，顺序不变
         // 行已被这次回车消费：不清掉的话，下一次复核拿到的是
         // 「旧命令 + 新输入」的拼接体。

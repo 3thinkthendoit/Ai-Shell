@@ -416,6 +416,131 @@ func TestScreenResize(t *testing.T) {
 	}
 }
 
+// screenTUI 是「无备用屏、无 133 的全屏程序」（busybox vi、传统 vi）的
+// 兜底识别：CUP/ED 重绘特征置位、纯文本滚动清零、静默期保持（等输入的
+// 程序恰恰不发输出）。缺了它 vi 画完第一屏后按键会被前端本地行编辑吞
+// 掉 —— 用户看到的就是「vi 直接卡死」。
+func TestScreenScreenTUI(t *testing.T) {
+	s := NewScreen(20, 3)
+	if s.InTUI() {
+		t.Fatal("空屏幕不该判为 TUI 接管")
+	}
+
+	// busybox vi 启动：清屏 + 定位重绘（既无 ?1049 也无 133）
+	s.Feed([]byte("\x1b[H\x1b[J~\r\n~\r\n~"))
+	if !s.InTUI() {
+		t.Fatal("vi 主屏重绘特征出现后 InTUI 应为真（busybox vi）")
+	}
+
+	// 静默任意久：vi 在等用户输入 —— 特征必须保持，否则 6 秒后按键
+	// 被本地行编辑吞掉、vi 冻死
+	s.Feed(nil)
+	if !s.InTUI() {
+		t.Fatal("静默期 screenTUI 必须保持（vi 等输入不发输出）")
+	}
+
+	// vi 退出：擦屏重绘（此时 vi 已死但特征还在）、随后 shell 打印提示
+	// 符 —— 真实链路里 vi 退出与 bash 醒来是两包数据，提示符文本块
+	// （纯文本、无重绘）把特征清掉
+	s.Feed([]byte("\x1b[H\x1b[2J"))
+	s.Feed([]byte("root@web:~# "))
+	if s.InTUI() {
+		t.Fatal("vi 退出后的提示符文本应清掉 screenTUI，InTUI 为假")
+	}
+
+	// 普通命令的流式输出（cat/ls）不该被误判为 TUI —— 只有定位/擦屏算
+	s2 := NewScreen(20, 3)
+	s2.Feed([]byte("total 0\r\ndrwxr-xr-x 2 root root .\r\n"))
+	if s2.InTUI() {
+		t.Fatal("纯文本滚动输出不该置 screenTUI")
+	}
+	// SGR 颜色（ls --color）同样不算重绘
+	s2.Feed([]byte("\x1b[1;32mfile.txt\x1b[0m\r\n"))
+	if s2.InTUI() {
+		t.Fatal("SGR 着色不算重绘特征")
+	}
+
+	// 命令边界优先于重绘残留：procps top（133;C 期间重绘）结束后必须让出
+	s3 := NewScreen(20, 3)
+	s3.Feed([]byte("\x1b]133;C\x07\x1b[H\x1b[2Jtop"))
+	if !s3.InTUI() {
+		t.Fatal("top 运行中应判为 TUI")
+	}
+	s3.Feed([]byte("\x1b]133;D\x07"))
+	if s3.InTUI() {
+		t.Fatal("133;D 命令结束应让出，screenTUI 不能越界残留")
+	}
+
+	// 备用屏是更高档的权威信号：alt 激活期间 screenTUI 恒被压住，
+	// vim 退出备用屏必须立刻脱离 TUI 态（不能被 alt 期间的重绘拖住）
+	s4 := NewScreen(20, 3)
+	s4.Feed([]byte("\x1b[?1049h\x1b[Hvim"))
+	if !s4.InTUI() {
+		t.Fatal("备用屏激活应判为 TUI（vim）")
+	}
+	s4.Feed([]byte("\x1b[?1049lroot@web:~# "))
+	if s4.InTUI() {
+		t.Fatal("退出备用屏后 InTUI 应为假")
+	}
+}
+
+// clear/reset 的整屏擦除不该误判 TUI：清屏序列与 echo、提示符文本几乎必然
+// 同块到达（PTY 一次读的边界与远端 write 边界无关），ED2 若算重绘证据，
+// redraw 会压过提示符文本 → InTUI 误真 → 前端把按键直灌 PTY，路由与硬拒绝
+// 全被绕过，且 shell 静默等输入后特征再无输出可清 —— clear 之后中文提问
+// 直进 bash 报 command not found。
+func TestScreenClearNotTUI(t *testing.T) {
+	s := NewScreen(20, 3)
+	// echo + clear(\E[H\E[2J) + 提示符，一个 Feed 内到达
+	s.Feed([]byte("clear\r\n\x1b[H\x1b[2Jroot@web:~# "))
+	if s.InTUI() {
+		t.Fatal("clear + 提示符同块：不该判为 TUI")
+	}
+	// reset（RIS）同理：全复位是「擦干净等提示符」
+	s2 := NewScreen(20, 3)
+	s2.Feed([]byte("reset\r\n\x1bcroot@web:~# "))
+	if s2.InTUI() {
+		t.Fatal("RIS 复位不算重绘特征")
+	}
+	// 部分变体在同块先发 CUP 再发 RIS：RIS 也要撤销本块已见的重绘证据，
+	// 否则 feedRedraw 残留 → reset 误判 TUI 接管（与 ED2/ED3 同类事故）
+	s2b := NewScreen(20, 3)
+	s2b.Feed([]byte("reset\r\n\x1b[H\x1bcroot@web:~# "))
+	if s2b.InTUI() {
+		t.Fatal("CUP+RIS 同块：RIS 应撤销本块重绘证据，不判 TUI")
+	}
+	// procps top 这类首帧 clear 后紧跟成排 CUP 的仍要识别（top 无 133 场景）
+	s3 := NewScreen(20, 3)
+	s3.Feed([]byte("\x1b[H\x1b[2J\x1b[1;1Htop\x1b[2;1Hload: 0.1"))
+	if !s3.InTUI() {
+		t.Fatal("清屏后持续定位重绘（top）仍应判为 TUI")
+	}
+}
+
+// 首帧断在多字节字符边界：本块的重绘证据必须存活，补完字符的续块（纯文本）
+// 也不能把刚置位的 screenTUI 清掉 —— 否则 vi 首帧尾恰是汉字时，按键被本地
+// 行编辑吞掉、vi 冻死。
+func TestScreenTUISplitRune(t *testing.T) {
+	s := NewScreen(20, 3)
+	// busybox vi 首帧：CUP+ED0 + 文本，末尾断在「你」(E4BDA0) 的前两字节
+	s.Feed([]byte("\x1b[H\x1b[J~\r\n~\r\n\xe4\xbd"))
+	if !s.InTUI() {
+		t.Fatal("断在半字符上的块，其重绘证据不得丢失（提前收敛）")
+	}
+	// 补完「你」的续块是纯文本：属于同一逻辑帧，不该当提示符证据清零
+	s.Feed([]byte("\xa0"))
+	if !s.InTUI() {
+		t.Fatal("补完半字符的纯文本续块不该清掉 screenTUI")
+	}
+	// 提示符自身断在半字符（prompt 含中文）也不影响非 TUI 会话保持非 TUI
+	s2 := NewScreen(20, 3)
+	s2.Feed([]byte("root@web:~# \xe4\xbd"))
+	s2.Feed([]byte("\xa0# "))
+	if s2.InTUI() {
+		t.Fatal("提示符跨块补完不该误判 TUI")
+	}
+}
+
 // Flush（TUI 退出备用屏幕）与 Final（PTY 退出）都是立即定格：
 // 不等静止计时，且 final=true；内容未变时 Final 与刚送过的帧去重。
 func TestSnapshotterFlushAndFinal(t *testing.T) {

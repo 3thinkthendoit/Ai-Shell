@@ -50,6 +50,22 @@ type Screen struct {
 	cmdActive    bool
 	cmdTUI       bool
 	altDuringCmd bool
+	// screenTUI：主屏正被「不切备用屏的全屏程序」重绘占据 —— busybox vi、
+	// 传统 vi 这类既不发 ?1049 也不发 133 的程序。重绘特征 = 光标定位/整屏
+	// 擦除（CSI H/f/J）；纯文本滚动输出（普通命令、提示符）把它清掉。
+	// 这是对 alt 与 cmdActive 两档信号都缺席时的兜底：缺了它，vi 画完第一屏
+	// 静默等输入，前端 6 秒后把按键全部收进本地行编辑 —— vi 表现为直接
+	// 卡死。alt 激活期间恒为 false：alt 才是权威信号，退出备用屏必须立刻
+	// 回到「非 TUI」，否则 vim 退出后 InTUI 永久为真，输入再也回不到提示符。
+	screenTUI bool
+	// Feed 局部暂存：本次 Feed 里是否见过重绘序列/可见文本。Feed 持锁解析
+	// 期间由 put/csiFinal 写入，Feed 末尾消费掉更新 screenTUI。
+	feedRedraw bool
+	feedText   bool
+	// feedCarry：上次 Feed 断在不完整 UTF-8 上，下一块是同一逻辑帧的延续。
+	// 补完字符的块往往是纯文本（vi 首帧尾断在汉字上），没有它会被「纯文本
+	// 清零」规则误清 screenTUI —— vi 冻死在字节边界上。
+	feedCarry bool
 	// 解析期间挂起的触发（Feed 持锁解析，钩子要在解锁后才调，
 	// 否则钩子里读 Text() 会自锁）。
 	pendCmdEnd, pendCmdEndTUI, pendAltOff bool
@@ -98,12 +114,13 @@ func NewScreen(cols, rows int) *Screen {
 }
 
 // InTUI 报告远端当前是否被全屏程序接管：备用屏幕已激活（vim/htop），
-// 或「命令期间见过全屏重绘」（top 这类不发备用屏幕序列的，靠 CUP/ED 识别）。
+// 主屏出现 TUI 重绘特征（busybox vi 这类不切备用屏的），或「命令期间见
+// 过全屏重绘」（top 这类，靠 CUP/ED 识别，仅命令运行中算数）。
 // 前端终端内直接输入据此让路：接管中不本地缓冲按键，原样透传给程序，避免吞键。
 func (s *Screen) InTUI() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.alt || (s.cmdActive && s.cmdTUI)
+	return s.alt || s.screenTUI || (s.cmdActive && s.cmdTUI)
 }
 
 // CmdActive 报告当前是否有一条命令正在跑（OSC 133;C 与 133;D 之间）。
@@ -178,6 +195,9 @@ func (s *Screen) Resize(cols, rows int) {
 // Feed 吞一段 PTY 输出。可以任意切块（UTF-8 半字跨块也安全）。
 func (s *Screen) Feed(p []byte) {
 	s.mu.Lock()
+	carry := s.feedCarry
+	s.feedCarry = false
+	s.feedRedraw, s.feedText = false, false
 	buf := p
 	if len(s.pending) > 0 {
 		s.pending = append(s.pending, p...)
@@ -191,13 +211,14 @@ func (s *Screen) Feed(p []byte) {
 			if b >= 0x20 && b != 0x7f {
 				r, size := utf8.DecodeRune(buf)
 				if r == utf8.RuneError && size == 1 && !utf8.FullRune(buf) {
-					// 半个汉字：留到下一块。此处提前返回，必须先解锁 ——
-					// Feed 用的是尾部显式 Unlock（为了锁外调钩子），不是 defer，
-					// 漏解锁会让下一次 Feed 死锁。这条路径上没有完成的 OSC，
-					// 不会有待触发的钩子，直接解锁返回即可。
+					// 半个汉字：留到下一块。break 走尾部统一收敛 —— 本块
+					// 已见的重绘/文本特征不能丢（vi 首帧恰断在多字节字符
+					// 边界时，丢了重绘证据 screenTUI 漏置位，按键被本地行
+					// 编辑吞掉、vi 冻死）；本块已完成的 OSC 钩子也照常触发。
 					s.pending = append(s.pending[:0], buf...)
-					s.mu.Unlock()
-					return
+					s.feedCarry = true
+					buf = nil
+					break
 				}
 				s.put(r)
 				buf = buf[size:]
@@ -238,6 +259,10 @@ func (s *Screen) Feed(p []byte) {
 			case b == '8':
 				s.cx, s.cy = s.sx, s.sy
 			case b == 'c':
+				// RIS 全复位：同 ED2 —— 是「擦干净等提示符」（reset 命令），
+				// 不是程序接管重绘，不作为 screenTUI 证据；同样要撤销本块已见的
+				// 重绘证据（部分 tset/reset 变体先发 CUP 再发 RIS，不撤销会残留）。
+				s.feedRedraw = false
 				s.clearAll()
 			case b == 'M': // 反向索引：光标上移，顶行则整体下滚
 				if s.cy == 0 {
@@ -284,6 +309,19 @@ func (s *Screen) Feed(p []byte) {
 	exitCode, exitKnown := s.pendExit, s.pendExitKnown
 	s.pendCmdEnd, s.pendCmdEndTUI, s.pendAltOff = false, false, false
 	s.pendExit, s.pendExitKnown = 0, false
+	// screenTUI 收敛：重绘序列优先（定位/擦屏的铁证），纯文本次之（流式
+	// 输出/提示符），两者都缺席则保持现状（等输入的全屏程序恰恰不发输出）。
+	// carry（上一块断在半字符上）只豁免「纯文本清零」：补完字符的块属于
+	// 同一逻辑帧，vi 首帧尾部断在汉字上时不该把它当提示符证据。
+	// alt 恒清零：备用屏激活时它是唯一权威，退出备用屏必须立刻脱离 TUI 态。
+	if s.alt {
+		s.screenTUI = false
+	} else if s.feedRedraw {
+		s.screenTUI = true
+	} else if s.feedText && !carry {
+		s.screenTUI = false
+	}
+	s.feedRedraw, s.feedText = false, false
 	cmdEndFn, altOffFn := s.onCmdEnd, s.onAltOff
 	s.mu.Unlock()
 	// 钩子在锁外调：它们会回头读 Text()（拿最后一帧），持锁调必自锁。
@@ -331,6 +369,10 @@ func (s *Screen) oscFinal() {
 			s.cmdActive = false
 			s.pendCmdEnd, s.pendCmdEndTUI = true, s.cmdTUI || s.altDuringCmd
 			s.pendExit, s.pendExitKnown = parseOSC133Exit(p)
+			// 命令结束即让出屏幕：主屏的 TUI 重绘特征属于刚结束的这条
+			// 命令（procps top 路径），别让它越过命令边界残留到提示符。
+			// busybox vi 这类无 133 的程序不受影响 —— 它根本没有 D 可收。
+			s.screenTUI = false
 		}
 	}
 }
@@ -394,6 +436,7 @@ func (s *Screen) Cwd() string {
 }
 
 func (s *Screen) put(r rune) {
+	s.feedText = true
 	if s.cx >= s.cols {
 		s.cx = 0
 		s.lineDown()
@@ -540,6 +583,7 @@ func (s *Screen) csiFinal(final byte) {
 			s.cx = s.cols - 1
 		}
 	case 'H', 'f': // 定位（1 基）
+		s.feedRedraw = true
 		if s.cmdActive {
 			s.cmdTUI = true // 流式输出不会定位光标：这是全屏重绘的铁证
 		}
@@ -558,6 +602,7 @@ func (s *Screen) csiFinal(final byte) {
 			s.cx = s.cols - 1
 		}
 	case 'J': // 擦屏
+		s.feedRedraw = true
 		if s.cmdActive {
 			s.cmdTUI = true // 清屏重绘同样是 TUI 特征
 		}
@@ -573,6 +618,13 @@ func (s *Screen) csiFinal(final byte) {
 				s.cells[y] = blankLine(s.cols)
 			}
 		default:
+			// ED2/ED3 整屏擦除是 clear/reset 的输出（xterm: \E[H\E[2J）。
+			// 它与 echo、提示符文本几乎必然同块到达（PTY 读边界无关），
+			// 若让它算重绘证据，redraw 会压过提示符文本 → 误判 TUI 接管，
+			// clear 之后按键直灌 PTY、路由与硬拒绝全被绕过。撤销本块已
+			// 见的重绘证据（H 先于 2J 时已置位）。busybox vi 用 ED0（\E[J）
+			// 重绘，procps top 的首帧 clear 之后还有成排 CUP，均不受影响。
+			s.feedRedraw = false
 			s.clearAll()
 		}
 	case 'K': // 擦行

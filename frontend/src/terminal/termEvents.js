@@ -187,7 +187,9 @@ export function afterTermQuiet(hostId, sessionId, fn) {
 // 一律直达 PTY。窗口由权威信号及时关闭（收到 term:cmd / term:tui 说明真信号
 // 接管了，交还给它们）；没有 shell integration 时靠「输出静默
 // CMD_PENDING_IDLE_MS 秒」兜底关闭，自动回到本地行编辑。持续重绘的程序（top）
-// 每帧都重置静默计时，于是它运行期间窗口一直开着、退出后自动关。
+// 每帧都重置静默计时，于是它运行期间窗口一直开着、退出后自动关。静默兜底
+// 唯独不看 tuiActive：全屏程序静默等输入是常态，此时续窗不关、只认权威信号
+// 收窗（term:tui active=false / term:exit）。
 export const CMD_PENDING_IDLE_MS = 6000
 const cmdPendingTimers = new Map()
 
@@ -195,6 +197,24 @@ const cmdPendingTimers = new Map()
 // 见 termInput.onTermData —— 只有明确 Deny 才吞回车。开窗/关窗都必须清，
 // 否则上一次窗口残留的半行会被当成新窗口的行首，误判风险。
 const pendingLines = new Map()
+
+// 窗口内最近一次被硬拒绝复核拦下的整行内容：拒绝只吞一次回车，同一行
+// 再次回车 = 用户看过裁决仍要继续（知情放行，见 termInput）。必须随窗口
+// 开/关一起清 —— 窗口一关（命令结束 / TUI 接管 / 终端退出），这行的语境
+// 就没了：换个窗口、甚至换个会话撞上同内容，凭旧记忆直接放行就是泄漏。
+const gateDenyLast = new Map()
+
+export function deniedLine(key) {
+  return gateDenyLast.get(key) || ''
+}
+
+export function setDeniedLine(key, line) {
+  gateDenyLast.set(key, line)
+}
+
+export function clearDeniedLine(key) {
+  gateDenyLast.delete(key)
+}
 
 export function clearPendingLine(key) {
   pendingLines.delete(key)
@@ -233,6 +253,14 @@ function armCmdPendingTimer(key, hostId, sessionId) {
   const timer = setTimeout(() => {
     cmdPendingTimers.delete(key)
     const st = termState(hostId, sessionId)
+    if (st && st.tuiActive) {
+      // 全屏程序接管中（含竞态序：term:tui 先到、窗口后开）：静默恰恰是
+      // 它等输入的常态，不是「命令结束回到提示符」。静默关窗的语义依据
+      // 是「没输出 = 大概率提示符已回来」，在 TUI 里不成立 —— 续窗不关，
+      // 收窗交给权威信号（term:tui active=false / term:exit）。
+      armCmdPendingTimer(key, hostId, sessionId)
+      return
+    }
     if (st) st.cmdPending = false
   }, CMD_PENDING_IDLE_MS)
   cmdPendingTimers.set(key, timer)
@@ -245,6 +273,7 @@ export function armCmdPending(hostId, sessionId) {
   if (!st) return
   st.cmdPending = true
   clearPendingLine(key)
+  clearDeniedLine(key)
   armCmdPendingTimer(key, hostId, sessionId)
 }
 
@@ -263,6 +292,7 @@ export function endCmdPending(hostId, sessionId) {
   const key = bucketKey(hostId, sessionId)
   clearCmdPendingTimer(key)
   clearPendingLine(key)
+  clearDeniedLine(key)
   const st = termState(hostId, sessionId)
   if (st) st.cmdPending = false
 }

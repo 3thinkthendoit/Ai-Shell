@@ -278,15 +278,44 @@ export function targetEntries() {
   return store.bySession[targetKey()] || NO_ENTRIES
 }
 
-// hasAgentTurn 判断某条会话是否「已经和 Agent 对话过」：时间线里存在 assistant
-// （Agent 回复）或 tool（工具调用）条目即视为处于 agent 对话中。
+// shellMarks 记录每个会话「最后一次用户直跑 shell 命令」的时刻与当时时间线
+// 末条 id。用于判断 agent 是否还在等回复：AI 回复之后用户一旦跑过命令，
+// 就视为对话已结束、回到命令模式；AI 再有新回复（新条目）则重新进入等待态。
+const shellMarks = new Map()
+
+// markShellRun 在用户输入被判定为 shell 命令并写进 PTY 时调用。
+export function markShellRun(hostId, sessionId) {
+  const key = bucketKey(hostId, sessionId)
+  const list = store.bySession[key]
+  const last = list && list.length ? list[list.length - 1] : null
+  shellMarks.set(key, { at: Date.now(), lastId: last ? last.id : null })
+}
+
+// resetShellMarks 清空直跑标记（会话数据被整体重置时调用，测试亦用）。
+export function resetShellMarks() {
+  shellMarks.clear()
+}
+
+// agentAwaitingReply 判断「AI 是否正在等用户回复」：时间线最后一条是
+// assistant（Agent 回复）或 tool（工具调用），且此后用户没有直跑过 shell 命令
+// （跑过则要求出现更新的 assistant/tool 条目才算回到等待态）。
 //
-// 供输入分流使用（termSubmit）：对话中已知命令仍走 shell；
-// 未知词先远端探测，存在就执行（见 inputRoute.resolveInput）。
-export function hasAgentTurn(hostId, sessionId) {
-  const list = store.bySession[bucketKey(hostId, sessionId)]
-  if (!list) return false
-  return list.some(e => e.kind === 'assistant' || e.kind === 'tool')
+// 供输入分流使用（termSubmit）：**仅当终端不在提示符（忙态）**时才作为
+// agentMode 参与；且它只兜非命令输入（`好的`、`继续`），已知命令词
+// （`ls`/`who`）在 inputRoute 里命令优先、永不因此进 Agent —— 时间线跨
+// 重连/清屏保持旧形状，不能压过用户眼前的提示符。跑一条命令（含 !
+// 前缀）即退出等待态。
+export function agentAwaitingReply(hostId, sessionId) {
+  const key = bucketKey(hostId, sessionId)
+  const list = store.bySession[key]
+  if (!list || !list.length) return false
+  const last = list[list.length - 1]
+  if (last.kind !== 'assistant' && last.kind !== 'tool') return false
+  const mark = shellMarks.get(key)
+  if (!mark) return true
+  if (last.id != null) return last.id > (mark.lastId ?? -1)
+  // 无 id 的条目（测试构造/历史数据）回退时间戳比较；再没有就视为已退出等待。
+  return last.ts != null ? last.ts > mark.at : false
 }
 
 // dismissAuditError 由界面在用户确认告警后调用。

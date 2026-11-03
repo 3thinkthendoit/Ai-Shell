@@ -1,19 +1,26 @@
 // 交互式会话的输入分流：同一输入框既收自然语言（→ Agent），也收 shell 命令（→ 硬拒绝后写 PTY）。
-//
 // resolveInput 的判定顺序（与下面函数一致）：
 //   1. 以 ? / ？ 开头 → 强制走 Agent（去掉前缀）
 //   2. 以 ! 开头      → 强制走 shell（去掉前缀，中文命令也能跑）
 //   3. 以 ? 结尾 / 多行 → Agent
 //   4. 数字编号回复   → Agent（`2`、`2 写入`）
-//   5. 首词是本地命令 → shell（含 agent 对话中的 `ls`）
-//      例外：agent 对话中、整行只有一个回复同形词（`id`/`true`/`date`）→ Agent
+//   5. 首词是已知命令 → shell（**即使在 agent 等待态**，见下）
 //      例外：命令/路径后跟中文自然语言（`nginx 起不来了`、`./start.sh 执行报错`）→ Agent
 //            （`echo 你好` 这类「文本就是参数」的命令仍走 shell）
-//   6. 含中日韩且不是命令 → Agent（`看看磁盘`、`好的`、`执行报错 ./start.sh`）
-//   7. 问不了命令库   → 非中文按 shell；中文已在上一步走 Agent
-//   8. agent 对话中、首词是回复撞车词（`yes`、`open`）→ Agent，不探测、不执行
-//      要真跑用 `!yes` / `!open`
+//   6. AI 正在等回复（agentMode）→ 其余输入当自然语言交给 Agent
+//   7. 含中日韩且不是命令 → Agent（`看看磁盘`、`好的`、`执行报错 ./start.sh`）
+//   8. 问不了命令库   → 非中文按 shell；中文已在上一步走 Agent
 //   9. 其余未知词（含单个 `bt`）→ 远端 command -v：存在就执行，不存在才 Agent
+//
+// 第 5 条为什么压过 agentMode：agentMode 来自会话时间线（上一轮是 AI 说话），
+// 它跨重连、跨清屏一直成立；用户敲 `ls` 时看到的是终端提示符，脑子里就是
+// 「列目录」。让 Agent 劫持真命令的代价是灾难性的（实测：重连后敲 ls，Agent
+// 接管去跑 `ls -la /home/server`，还烧掉一轮 token）——而想在对话里提命令词
+// 的人有 `?` 前缀可用，代价不对称，命令必须赢。agentMode 只兜「不是命令的
+// 输入」（`好的`、`2` 之外的短回复），保证它们不被远端探测包装成怪问题。
+//
+// 模式边界（store.js）：时间线最后一条是 assistant/tool（AI 刚说完话）且用户此后
+// 没直跑过 shell 命令 → agentMode。跑一条命令（含 `!` 前缀）即退出，回到命令优先。
 //
 // 「首词是不是命令」由**后端**判定（见 ClassifyShellInput）。
 // 命令库 = shellBuiltins + vault.DefaultWhitelist，再加用户白名单作扩展；
@@ -101,34 +108,6 @@ export function isCJKNaturalLanguage(trimmed) {
   return !CJK_DATA_COMMANDS.has(commandBaseName(s))
 }
 
-// 对话里常被当成一句回复、同时又是命令名的单词。
-// 仅「整行只有这一个词」且正处于 agent 对话时交给 Agent；
-// 带参数（`date -u`、`id root`）仍是命令，走 shell。
-// `ls`/`df`/`pwd` 不在此列：单独敲也必须执行。
-const AMBIGUOUS_BARE = new Set([
-  'id', 'who', 'w', 'true', 'false', 'test', 'type', 'time',
-  'file', 'host', 'free', 'date'
-])
-
-export function isAmbiguousBareReply(trimmed) {
-  if (/\s/.test(trimmed)) return false
-  return AMBIGUOUS_BARE.has(String(trimmed).toLowerCase())
-}
-
-// 对话里常被当成回复、但 command -v 又能找到的词。
-// `yes` 会刷屏，`open 3306` 会被当成「打开端口」的回答。
-// agent 对话中整行（含参数）都不执行；非对话或 `!` 前缀仍走探测/shell。
-const REPLY_COLLISION = new Set(['yes', 'open'])
-
-function firstToken(trimmed) {
-  const first = String(trimmed || '').trim().split(/\s+/)[0] || ''
-  return first.replace(/^.*\//, '').toLowerCase()
-}
-
-export function isReplyCollision(trimmed) {
-  return REPLY_COLLISION.has(firstToken(trimmed))
-}
-
 // isCommand 问后端「这行首词是不是命令」。
 // 返回 true / false；问不了（无绑定、抛错）返回 null，调用方按「非中文即 shell」退化，
 // 避免绑定失败时把 `ls` 送进 Agent。
@@ -194,9 +173,10 @@ export function unknownToQuestion(binary, text) {
  * @param {string} raw
  * @param {object} api 后端绑定（window.go.main.App），可空
  * @param {string} hostId 当前主机 id（探测需要），可空
- * @param {boolean} [agentMode] 本会话是否已在 agent 对话中。为真时：
- *   已知 Linux 命令仍走 shell；回复同形词（`id`/`true`）和回复撞车词（`yes`/`open`）走 Agent；
- *   其余未知词（含单个 `bt`）一律远端探测，存在就执行。
+ * @param {boolean} [agentMode] AI 是否正在等用户回复（store.agentAwaitingReply）。
+ *   只兜**非命令**输入当自然语言交给 Agent；已知命令（`ls`/`df -h`）即使在等待
+ *   态也照常执行——用户对着终端提示符敲 `ls` 就是要列目录，不能被 Agent 劫持
+ *   （想对话用 `?` 前缀）。
  * @returns {Promise<{ kind: 'agent'|'shell', text: string, missing?: boolean, binary?: string }>}
  *   missing=true 表示该命令在远端不存在，text 已包装成给 LLM 的问题。
  */
@@ -205,11 +185,15 @@ export async function resolveInput(raw, api, hostId, agentMode = false) {
   const base = classifyInput(trimmed)
   if (!trimmed) return base
 
-  // 显式表态（? / !）与纯语言特征（问号结尾、多行）已经定了，不必再问后端：
+  // 显式表态（? / !）已经定了，不必再问后端：
   // 少一次跨进程往返，用户敲回车到发出提问之间没有额外延迟。
   if (trimmed.startsWith('?') || trimmed.startsWith('？') || trimmed.startsWith('!')) {
     return base
   }
+
+  // 模式优先只对「非命令输入」生效，且必须排在命令识别之后：
+  // 用户对着提示符敲 `ls` 就是要执行，agentMode（上一轮 AI 说过话）不能劫持
+  // 真命令 —— 否则重连/清屏后第一条命令全被 Agent 吞掉（实测事故）。
   if (/\?\s*$/.test(trimmed) || trimmed.includes('\n')) {
     return base
   }
@@ -220,18 +204,21 @@ export async function resolveInput(raw, api, hostId, agentMode = false) {
   }
 
   const known = await isCommand(trimmed, api)
-  // 已知 Linux 命令 → shell。聊过 Agent 也不能把 `ls`/`df -h` 改成提问。
-  // 例外：对话中整行只有一个回复同形词（`id`/`true`/`date`）→ Agent。
+  // 已知 Linux 命令 → shell。聊过 Agent 也不能把 `ls`/`df -h`/`who` 改成提问；
+  // 想在对话中把命令词当回复，用 `?` 前缀显式表态。
   // 例外：命令/路径后跟中文自然语言 → Agent，让模型自己去查、去跑
   // （`./start.sh 执行报错`、`nginx 起不来了`）；`echo 你好` 仍走 shell。
   if (known === true) {
-    if (agentMode && isAmbiguousBareReply(trimmed)) {
-      return { kind: 'agent', text: trimmed }
-    }
     if (isCJKNaturalLanguage(trimmed)) {
       return { kind: 'agent', text: trimmed }
     }
     return { kind: 'shell', text: trimmed }
+  }
+
+  // 走到这里说明不是已知命令，agentMode 的输入才当对话（`好的`、`继续`），
+  // 不做远端探测 —— 免得把短回复包装成「命令不存在」的怪问题。
+  if (agentMode) {
+    return { kind: 'agent', text: trimmed }
   }
 
   // 含中文且不是已知命令 → 提问（`看看磁盘`、`执行报错 ./start.sh`）。
@@ -245,14 +232,7 @@ export async function resolveInput(raw, api, hostId, agentMode = false) {
     return { kind: 'shell', text: trimmed }
   }
 
-  // yes / open：远端几乎一定有同名命令。对话中当回复，不探测，避免刷屏或误执行。
-  // `!yes` 已在前面走 shell。
-  if (agentMode && isReplyCollision(trimmed)) {
-    return { kind: 'agent', text: trimmed }
-  }
-
-  // 已确认不是本地命令（含 agent 对话里的单个词 `bt`）。
-  // 一律做远端探测：存在就当命令执行，不存在才交给 Agent。
+  // 已确认不是本地命令。做远端探测：存在就当命令执行，不存在才交给 Agent。
   const decided = await resolveUnknown(trimmed, api, hostId)
   if (decided.kind === 'agent') {
     return {
