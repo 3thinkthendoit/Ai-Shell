@@ -2,7 +2,7 @@ import { store, writeTerminal, textToBase64, stop, isPtyDirty, termState, backen
 import * as paint from '../termPaint.js'
 import { enqueueSubmit } from './termSubmit.js'
 import { hasCJK } from '../inputRoute.js'
-import { endCmdPending, pendingLine, appendPendingLine, clearPendingLine } from './termEvents.js'
+import { endCmdPending, pendingLine, appendPendingLine, clearPendingLine, popPendingLine } from './termEvents.js'
 import {
   getTerm,
   isFullscreen,
@@ -30,17 +30,41 @@ import {
 // 会直灌 bash。这里把窗口内敲的可见字符攒成行，回车时交后端复核
 // （CheckShellCommand）：**只有明确 Deny 才拦**，其余一律放行——vim 菜单、
 // read 应答、E325 直接回车等交互场景必须零改动，所以宁可漏拦不可误拦。
-const gateBusy = new Map() // key → 复核进行中（hold 住后到的回车，别重复发）
+const gateBusy = new Map() // key → 复核进行中（期间到的输入一律排队，复核后按序补发）
+const gateQueues = new Map() // key → 复核期间 hold 住的输入（保序）
+
+// 光标移动键（左/右/Home/End，普通与应用键盘模式两套序列）：不动行内容，
+// 攒的行继续有效 —— 见下面 gatePendingKey 里的分支注释。
+const CURSOR_KEYS = new Set(['\x1b[D', '\x1b[C', '\x1b[H', '\x1b[F', '\x1b[1~', '\x1b[4~', '\x1bOD', '\x1bOC', '\x1bOH', '\x1bOF'])
+
+// flushGateQueue 把复核期间 hold 住的输入按到达顺序重放。
+//
+// 重放走 onTermData 的正常路径，就像用户刚刚才敲了它们：被拒绝后窗口已
+// 关 → 落到本地行编辑（用户继续打字不受影响）；窗口还开着 → 继续攒新行，
+// 队列里若有回车会照常触发新一轮复核。
+function flushGateQueue(key) {
+  const q = gateQueues.get(key) || []
+  gateQueues.delete(key)
+  for (const item of q) onTermData(key, item)
+}
 
 function gatePendingKey(key, t, d, send) {
   const st = termState(t.hostId, t.sessionId)
   // 只管乐观窗口：真 cmdActive（OSC 133 命令边界）时命令起止有权威信号，
   // 键属于前台程序，轮不到本地裁决。
   if (!st || !st.cmdPending || st.cmdActive) return true
+  if (gateBusy.get(key)) {
+    // 复核进行中：所有输入先排队。不排队的话，回车后敲的字符会立即直达
+    // PTY —— 先于被 hold 的回车抵达远端，被并进当前命令行（输入顺序
+    // 颠倒，用户看到的是命令被偷改）。
+    const q = gateQueues.get(key) || []
+    q.push(d)
+    gateQueues.set(key, q)
+    return false
+  }
   if (d === '\r') {
     const line = pendingLine(key).trim()
     if (!line) return true // 空行直接放行（vim E325 空回车选默认）
-    if (gateBusy.get(key)) return false // 上一发还在复核，hold 住别重复发
     gateBusy.set(key, true)
     backendAPI().CheckShellCommand(t.hostId, line).then(res => {
       gateBusy.set(key, false)
@@ -53,16 +77,36 @@ function gatePendingKey(key, t, d, send) {
         endCmdPending(t.hostId, t.sessionId)
       } else {
         send(textToBase64('\r')) // 放行：补发被 hold 的回车，顺序不变
+        // 行已被这次回车消费：不清掉的话，下一次复核拿到的是
+        // 「旧命令 + 新输入」的拼接体。
+        clearPendingLine(key)
       }
+      flushGateQueue(key)
     }).catch(() => {
       gateBusy.set(key, false)
       send(textToBase64('\r')) // 复核通道失败宁可放行，别把交互程序卡死
+      clearPendingLine(key)
+      flushGateQueue(key)
     })
     return false // 本次回车先不发，等复核结果
   }
+  if (d === '\x7f') {
+    // 退格：远端 readline 删一个字符，攒行同步弹尾而不是作废整行 ——
+    // 敲错一个字改回来，不该失去整行的硬拒绝保护。
+    popPendingLine(key)
+    return true
+  }
+  if (CURSOR_KEYS.has(d)) {
+    // 光标移动不动行内容，攒的行继续有效。历史上所有控制键一律作废攒行，
+    // 「敲完命令按一下方向键再回车」就成了绕过硬拒绝的旁路 —— 而方向键
+    // 其实一个字都没改。光标位置不可知：之后敲的字符我们仍按行尾追加，
+    // 内容集合一致、顺序可能不同，对内容级复核够用。
+    return true
+  }
   if (/[\x00-\x1f\x7f]/.test(d)) {
-    // 控制键（方向键历史、Tab 补全、Ctrl-C、粘贴括号序列）之后攒的行
-    // 已不可靠，放弃裁决只放行——漏拦的风险交给下一次干净的行。
+    // 其余控制字符（上/下历史键会让远端整行替换、Tab 补全会改写行、
+    // Ctrl-C 等）：攒的行已不可靠，作废放行——漏拦的风险交给下一次
+    // 干净的行。
     clearPendingLine(key)
     return true
   }

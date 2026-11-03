@@ -197,13 +197,7 @@ type BootstrapInfo struct {
 	LLM         vault.LLMSettingsView  `json:"llm"`
 	LLMProfiles []vault.LLMProfileView `json:"llmProfiles"`
 	Policy      vault.PolicySettings   `json:"policy"`
-	// MaxTransferBytes 是文件管理上传/下载的大小上限。
-	//
-	// 由后端下发而不是前端写死：这个数只有后端一处说了算（它同时用于
-	// 上传校验和下载截断判定），前端再抄一份迟早会漂移 —— 漂移的后果是
-	// 「界面放行、后端拒绝」或提示的数值与实际行为不符，两种都很难查。
-	MaxTransferBytes int64  `json:"maxTransferBytes"`
-	Error            string `json:"error"`
+	Error       string                 `json:"error"`
 }
 
 // Bootstrap 返回启动信息。
@@ -223,9 +217,8 @@ func (a *App) Bootstrap() BootstrapInfo {
 		},
 		Hosts:            hosts,
 		LLM:              a.v.LLMSettingsView(),
-		LLMProfiles:      a.v.LLMProfiles(),
-		Policy:           a.v.Policy(),
-		MaxTransferBytes: sshclient.MaxTransferBytes,
+		LLMProfiles: a.v.LLMProfiles(),
+		Policy:      a.v.Policy(),
 	}
 }
 

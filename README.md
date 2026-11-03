@@ -27,7 +27,7 @@ Built with [Wails v2](https://wails.io/) (Go + Vue 3).
   - Shell-like lines → written into the resident terminal after a hard-deny check (no LLM)
 - **Ops toolkit** — Beyond one-shot `run_command` / file tools, the agent can gather structured diagnostics (`collect_diagnostics`, `journal_query`, `systemd_status`, `net_listen`), take remote state snapshots and diffs (`snapshot_state` / `diff_state`), run post-change checks (`verify_checks`: service, port, file, localhost HTTP), and roll back edits via file backups (`list_file_backups` / `restore_file_backup`).
 - **Vision attachments** — When an LLM profile enables **Supports vision / image input**, paste or drop screenshots into the chat (PNG / JPEG / WebP / GIF; up to 3 images, ≤ 4 MiB each). Images go out on the current turn only — they are not written to session history or the audit trail. The composer and message bubbles show a filename chip; hover to preview.
-- **File manager** — Browse a remote host and upload / download files from the UI (32 MiB per transfer; progress + cancel).
+- **File manager** — Browse a remote host and upload / download files from the UI (progress + cancel).
 - **Policy engine**
   - Hard deny: login/credential paths, app credential files (`.env`, `credentials.json`), full environment dumps, destructive ops (`mkfs`, `dd of=/dev/*`, `rm -rf /`, `shutdown`, …)
   - High-risk confirm (agent-proposed commands only): delete/create/chmod, package changes, service restarts, process kills, Docker/Kubernetes mutations, …

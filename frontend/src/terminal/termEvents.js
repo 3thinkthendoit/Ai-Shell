@@ -208,6 +208,18 @@ export function appendPendingLine(key, text) {
   pendingLines.set(key, (pendingLines.get(key) || '') + text)
 }
 
+// popPendingLine：窗口内按了退格 —— 远端 readline 会删掉光标前一个字符，
+// 攒的行同步弹掉最后一个码点。只有「光标在行尾」时才逐字精确（我们的
+// 假设场景正是从行尾一路敲过来）；复核只需要内容级近似，够用。
+export function popPendingLine(key) {
+  const cur = pendingLines.get(key)
+  if (!cur) return
+  const cps = Array.from(cur)
+  cps.pop()
+  if (cps.length) pendingLines.set(key, cps.join(''))
+  else pendingLines.delete(key)
+}
+
 function clearCmdPendingTimer(key) {
   const timer = cmdPendingTimers.get(key)
   if (timer) {

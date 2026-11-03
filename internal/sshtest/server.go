@@ -744,6 +744,32 @@ func runBinaryWriteScript(cmd string, ch ssh.Channel, fs *memFS, failBackup bool
 	return 0
 }
 
+// runBinaryAppendScript 模拟 sshclient.AppendFileBinary 的远端脚本
+// （`base64 -d >> '<path>'`）：stdin 的 base64 解码后**追加**到目标末尾。
+// 与 runBinaryWriteScript 的差别：没有备份分支，且目标是追加而不是截断。
+func runBinaryAppendScript(cmd string, ch ssh.Channel, fs *memFS) int {
+	p := extractRedirectTarget(cmd)
+	if p == "" {
+		fmt.Fprint(ch.Stderr(), "test-sshd: 无法从追加脚本中解析目标路径\n")
+		return 127
+	}
+	body, _ := io.ReadAll(ch)
+	flat := strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == ' ' || r == '\t' {
+			return -1
+		}
+		return r
+	}, string(body))
+	decoded, err := base64.StdEncoding.DecodeString(flat)
+	if err != nil {
+		fmt.Fprint(ch.Stderr(), "base64: invalid input\n")
+		return 1
+	}
+	old, _ := fs.read(p)
+	fs.write(p, old+string(decoded))
+	return 0
+}
+
 // extractRmTarget 从 `rm -rf -- '<path>'` 里取出路径。
 //
 // 按 `--` 切分而不是取最后一个 token：路径里的空格被 shellQuote 保护在
@@ -998,6 +1024,14 @@ func RunCommand(cmd string, ch ssh.Channel, srv *Server) int {
 		}
 		fs.remove(target)
 		return 0
+
+	// sshclient.AppendFileBinary 下发的脚本：`base64 -d >> '<path>'`。
+	// 分块上传的追加块 —— 没有备份环节（第一块走 WriteFileBinary 才备份），
+	// 所以不带 writeMarkerProbe，必须单列一个分支。
+	// 顺序在 writeMarkerProbe 分支之前：`>>` 不含备份 marker，两者互斥，
+	// 放前面只是与「写」类命令就近对照。
+	case strings.Contains(c, "base64 -d >>"):
+		return runBinaryAppendScript(c, ch, fs)
 
 	case strings.Contains(c, writeMarkerProbe):
 		// sshclient.WriteFile / WriteFileBinary 下发的脚本。

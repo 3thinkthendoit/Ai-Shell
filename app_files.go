@@ -10,9 +10,8 @@ package main
 // 但这不等于「什么都不拦」：
 //   - 删除由前端弹窗二次确认（用户明确点过才知道自己删的是什么）；
 //   - 后端拒绝空路径与根目录（前端那一道拦不住 bug，后端这道是底线）；
-//   - 下载分块流式落盘、内存平稳；上传有防 OOM 的大小上限（与 agent
-//     通道共用 sshclient.MaxTransferBytes）：整份 base64 在内存里要存
-//     三份，不设上限时一个大文件就能把进程顶爆，更大的文件走终端 scp/sftp；
+//   - 下载分块流式落盘、内存平稳；上传同样分块（第一块截断+备份、后续块
+//     追加），任何时刻内存里只有一个块，不设大小上限也没有 OOM 风险；
 //   - 所有操作写审计，事后可查。
 
 import (
@@ -137,7 +136,7 @@ func (a *App) DeleteRemotePath(hostID, path string) FileOpResult {
 	return FileOpResult{OK: true, Message: "已删除 " + target}
 }
 
-// UploadRemoteFile 把本地文件上传到远端目录。
+// UploadRemoteFile 把本地文件上传到远端目录（一次性整份）。
 //
 // 走 base64 而不是原始字节：远端用 `base64 -d` 解码写盘，
 // 这样二进制文件（图片、压缩包、可执行文件）不会被沿途的
@@ -148,6 +147,10 @@ func (a *App) DeleteRemotePath(hostID, path string) FileOpResult {
 // 在 WebView 里是拿不到内容的，前端要读文件只能走 `<input type=file>`，
 // 而它给的正是 File 对象 —— 在那边编码一次比在 Go 里再读一次盘更直接，
 // 也少传一份原始字节。
+//
+// 注意：UI 通道已改走分块路径（UploadRemoteFileChunk + Finish），
+// 整份 base64 会同时存在多份内存副本、大文件有 OOM 风险。这个入口
+// 保留给「一次拿全」的调用方与测试 —— 新调用方请走分块。
 func (a *App) UploadRemoteFile(hostID, dir, name, base64Data string) FileOpResult {
 	if err := a.ready(); err != nil {
 		return FileOpResult{Error: err.Error()}
@@ -162,17 +165,6 @@ func (a *App) UploadRemoteFile(hostID, dir, name, base64Data string) FileOpResul
 		return FileOpResult{Error: "文件名不合法（不能为空、不能含 /）"}
 	}
 	target := joinRemote(normalizeRemotePath(dir), name)
-
-	// 防 OOM 的硬防线：整份内容作为 base64 要在内存里存在三份（IPC 串、
-	// 解码缓冲、远端脚本的 stdin），不设上限时一个大文件就能把进程顶爆。
-	// 在解码**之前**用 base64 长度估算原始大小 —— 超限时连解码的开销都省了。
-	// agent 通道（toolfiles.go）早已按同一个 MaxTransferBytes 拦，这里是
-	// UI 通道的同一道墙：两边共用一个数，不会出现「Agent 能传、人不能传」的漂移。
-	if est := int64(len(base64Data))*3/4 + 1; est > sshclient.MaxTransferBytes {
-		return FileOpResult{Error: fmt.Sprintf(
-			"文件超过上传上限（%d MiB）。请改用终端里的 scp/sftp 传输大文件。",
-			sshclient.MaxTransferBytes>>20)}
-	}
 
 	data, err := base64.StdEncoding.DecodeString(base64Data)
 	if err != nil {
@@ -195,6 +187,125 @@ func (a *App) UploadRemoteFile(hostID, dir, name, base64Data string) FileOpResul
 	a.auditFile(fmt.Sprintf("上传 %d 字节", len(data)), hostID, target)
 	// res.Stdout 里可能有备份说明（decorateBackup 翻译过），一并回给界面。
 	return FileOpResult{OK: true, Message: strings.TrimSpace(res.Stdout + " 已上传 " + name)}
+}
+
+// UploadRemoteFileChunk 分块上传的一块。
+//
+// appendMode=false 是第一块：截断目标文件（覆盖上传）并做备份；
+// true 是后续块：纯追加。前端按约 1 MiB 一块读文件依次调用 —— 任何时刻
+// 内存里只有一个块的 base64，大文件上传不再有整份编码串的内存峰值。
+//
+// 任何失败都尽力清掉远端半成品（覆盖场景下备份已生成，原文件可从 .bak
+// 找回）：与下载侧的铁律对称 —— 一个「看起来完整」的残缺文件比失败危险。
+// 这里的审计只在失败时写；成功走 UploadRemoteFileFinish 统一核验与记录，
+// 否则一个 1 GiB 的文件会写 1024 条「上传 1 MiB」的审计噪音。
+func (a *App) UploadRemoteFileChunk(hostID, dir, name, base64Chunk string, appendMode bool) FileOpResult {
+	if err := a.ready(); err != nil {
+		return FileOpResult{Error: err.Error()}
+	}
+	if strings.TrimSpace(hostID) == "" {
+		return FileOpResult{Error: "请先选择一台主机"}
+	}
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\x00") {
+		return FileOpResult{Error: "文件名不合法（不能为空、不能含 /）"}
+	}
+	target := joinRemote(normalizeRemotePath(dir), name)
+
+	data, err := base64.StdEncoding.DecodeString(base64Chunk)
+	if err != nil {
+		return FileOpResult{Error: "上传内容不是合法 base64：" + err.Error()}
+	}
+
+	var res sshclient.Result
+	if appendMode {
+		res, err = a.ssh.AppendFileBinary(hostID, target, data)
+	} else {
+		res, err = a.ssh.WriteFileBinary(hostID, target, data)
+	}
+	if err != nil {
+		a.uploadFailCleanup(hostID, target)
+		a.auditFile("上传失败："+err.Error(), hostID, target)
+		return FileOpResult{Error: err.Error()}
+	}
+	if res.ExitCode != 0 {
+		msg := strings.TrimSpace(res.Stderr)
+		if msg == "" {
+			msg = fmt.Sprintf("远端退出码 %d", res.ExitCode)
+		}
+		a.uploadFailCleanup(hostID, target)
+		a.auditFile("上传失败："+msg, hostID, target)
+		return FileOpResult{Error: msg}
+	}
+	return FileOpResult{OK: true}
+}
+
+// UploadRemoteFileFinish 分块上传的收尾：核验远端大小与本地一致并写审计。
+//
+// 大小是唯一可靠的「完整性」信号（分块之间远端可能被截断、写入可能
+// 半途失败），少了或多了都不放行 —— 否则用户会拿到一个自称完整的残缺
+// 文件。核验失败同样清掉半成品（uploadFailCleanup）。
+func (a *App) UploadRemoteFileFinish(hostID, dir, name string, expectBytes int64) FileOpResult {
+	if err := a.ready(); err != nil {
+		return FileOpResult{Error: err.Error()}
+	}
+	if strings.TrimSpace(hostID) == "" {
+		return FileOpResult{Error: "请先选择一台主机"}
+	}
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\x00") {
+		return FileOpResult{Error: "文件名不合法（不能为空、不能含 /）"}
+	}
+	target := joinRemote(normalizeRemotePath(dir), name)
+
+	size, err := a.ssh.StatFileSize(hostID, target)
+	if err != nil {
+		a.auditFile("上传失败："+err.Error(), hostID, target)
+		return FileOpResult{Error: err.Error()}
+	}
+	if size != expectBytes {
+		a.uploadFailCleanup(hostID, target)
+		msg := fmt.Sprintf("远端文件大小（%d 字节）与本地（%d 字节）不一致，已清理半成品，请重试", size, expectBytes)
+		a.auditFile("上传失败："+msg, hostID, target)
+		return FileOpResult{Error: msg}
+	}
+	a.auditFile(fmt.Sprintf("上传 %d 字节", size), hostID, target)
+	return FileOpResult{OK: true, Message: "已上传 " + name}
+}
+
+// uploadFailCleanup 尽力清掉远端半成品。失败不出声：调用方随后会报出
+// 更具体的错误，这里再叠一条「清理也失败了」只会把真正的病因埋进噪音。
+// rm -f 对不存在的文件无害，多删一次不致命。
+func (a *App) uploadFailCleanup(hostID, target string) {
+	_, _ = a.ssh.Exec(hostID, "rm -f -- "+shellQuote(target), 30*time.Second)
+}
+
+// UploadRemoteFileAbort 取消上传的善后：清掉这次上传留在远端的半成品。
+//
+// 刻意不复用 DeleteRemotePath：文件管理弹窗不提供删除入口（误点成本
+// 太高，删除请走终端那条看得见历史、也能被审批闸门拦住的路），而
+// 「取消自己的上传」不是删除功能 —— 它是上传事务的回滚，固定只碰
+// 这一次上传的目标文件，并按文件操作审计留痕。
+func (a *App) UploadRemoteFileAbort(hostID, dir, name string) FileOpResult {
+	if err := a.ready(); err != nil {
+		return FileOpResult{Error: err.Error()}
+	}
+	if strings.TrimSpace(hostID) == "" {
+		return FileOpResult{Error: "请先选择一台主机"}
+	}
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\x00") {
+		return FileOpResult{Error: "文件名不合法（不能为空、不能含 /）"}
+	}
+	target := joinRemote(normalizeRemotePath(dir), name)
+	if _, err := a.ssh.Exec(hostID, "rm -f -- "+shellQuote(target), 30*time.Second); err != nil {
+		a.auditFile("取消上传失败："+err.Error(), hostID, target)
+		return FileOpResult{Error: err.Error()}
+	}
+	// 覆盖场景下原文件已被第一块备份成 .bak，取消后仍可从备份找回 ——
+	// 审计里说明白，用户才知道东西没丢。
+	a.auditFile("取消上传：已清理半成品（覆盖上传的原文件在 .bak 备份里）", hostID, target)
+	return FileOpResult{OK: true, Message: "已取消上传并清理半成品 " + name}
 }
 
 // DownloadRemoteFile 把远端文件下载到用户挑选的本地路径。

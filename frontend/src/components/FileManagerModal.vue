@@ -107,19 +107,19 @@
         <div class="fm-progress-head">
           <span class="fm-progress-name mono">{{ fm.progress.name }}</span>
           <span class="fm-progress-pct">{{ progressText }}</span>
-          <!-- 取消只对下载有意义：上传的各阶段（读文件/发送）都发生在
-               这一侧前端，中断不了的调用里塞一个永远灰着的按钮是噪音。
-               id 为空说明第一块还没传完（事件还没来过），先禁着。 -->
+          <!-- 取消对上传和下载都可用：下载把 id 还给后端中断；上传置
+               cancelUpload 标记、块间检查点生效。done 阶段没有可取消的。
+               下载的 id 为空说明第一块还没传完（事件还没来过），先禁着。 -->
           <button
-            v-if="fm.progress.phase === 'downloading'"
+            v-if="fm.progress.phase === 'downloading' || fm.progress.phase === 'uploading'"
             class="sm fm-progress-cancel"
-            :disabled="!fm.progress.id"
+            :disabled="fm.progress.phase === 'downloading' && !fm.progress.id"
             :title="t('fm.cancelTitle')"
             @click="fmCancelTransfer"
           >{{ t('fm.cancel') }}</button>
         </div>
         <div class="fm-progress-track">
-          <!-- 不定进度（发送阶段）用条纹动画：这一段拿不到回调，
+          <!-- 不定进度（total 未知或后端还没推过事件）用条纹动画：
                显示一个假百分比会长时间卡在某个数字上，比诚实的不定态更差。 -->
           <div
             class="fm-progress-bar"
@@ -172,14 +172,13 @@ const canGoParent = computed(() => fm.parent && fm.parent !== fm.cwd)
 // 而且模板里的除零只会安静地产生 NaN%，不容易在 code review 里被看见。
 
 // progressKnown 表示“能给出一个有意义的百分比”。
-// 读阶段（上传）与下载阶段都可以（有文件大小），发送阶段不行
-// （拿不到回调）—— 后者宁可显示不定进度，也不显示一个骗人的数字。
-// compressing / extracting（目录下载的两个阶段）同样是不定进度。
+// 上传与下载阶段都可以（有文件大小且逐块推进）。
+// compressing / extracting（目录下载的两个阶段）是不定进度。
 const progressKnown = computed(() => {
   const p = fm.progress
   if (!p) return false
   if (p.phase === 'compressing' || p.phase === 'extracting') return false
-  if (p.phase === 'reading' || p.phase === 'downloading') return p.total > 0
+  if (p.phase === 'uploading' || p.phase === 'downloading') return p.total > 0
   return false
 })
 
@@ -208,7 +207,6 @@ const progressText = computed(() => {
     return base
   }
   if (p.phase === 'downloading') return p.total ? t('fm.preparing', { size }) : t('fm.preparingNoSize')
-  if (p.phase === 'sending') return t('fm.sending', { size })
   if (p.phase === 'done') return t('fm.done')
   return size
 })

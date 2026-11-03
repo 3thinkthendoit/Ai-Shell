@@ -10,18 +10,19 @@ package agent
 // 必须过策略引擎 —— 上传是写远端，因此走 EvaluateWrite（永远确认）；
 // 下载是读远端，因此走读类规则（凭据路径硬拒绝）。
 //
-// 三条硬边界：
-//   1. 上传大小上限沿用 sshclient.MaxTransferBytes（32 MiB）——
-//      整份内容要在内存里存在三份（文件本体、base64、IPC 序列化）。
-//   2. 下载同样有上限，且在**开始写本地文件之前**就检查 ——
+// 两条硬边界：
+//   1. 下载在**开始写本地文件之前**先探大小并检查远端文件存在 ——
 //      下一半才发现超限，会留下一个自称完整的残缺文件。
-//   3. 本地路径由 LLM 指定，因此必须限制在用户可见的目录内
+//      （历史上这里还有 32 MiB 的大小上限，已按需求移除；整份内容
+//      进内存的内存峰值由调用方自行权衡。）
+//   2. 本地路径由 LLM 指定，因此必须限制在用户可见的目录内
 //      （见 localPathAllowed）。否则模型可以读用户机器上任意文件，
 //      而那已经不是「运维助手」该有的能力。
 
 import (
 	"encoding/base64"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -95,49 +96,118 @@ func runUploadLocalFile(ctx toolCtx, args map[string]any) (sshclient.Result, err
 	// 两条内容来源：本地文件，或模型直接给的 base64。
 	// 后者是逃生门 —— 某些场景下本地没有那个文件（内容本来就是
 	// 模型生成的，比如一份补丁），但它应当是例外而非常态。
-	var (
-		data []byte
-		err  error
-	)
+	//
+	// 本地文件走**分块读写**（第一块截断+备份、后续块追加）：文件可能是
+	// 任意大小，整份读进内存再编码会把进程顶到 OOM —— 这正是当初 32 MiB
+	// 上限存在的理由；分块之后上限没了，风险也没了。
+	var note string
 	if b64 := strArg(args, "content_base64"); b64 != "" {
-		data, err = decodeUploadContent(args)
-		if err != nil {
-			return sshclient.Result{}, err
+		data, derr := decodeUploadContent(args)
+		if derr != nil {
+			return sshclient.Result{}, derr
 		}
-	} else {
-		data, err = os.ReadFile(local)
-	}
-	if err != nil {
-		return sshclient.Result{}, fmt.Errorf("读取本地文件失败：%v", err)
-	}
-	if len(data) == 0 {
-		// 空文件不是错误，但要说明白：否则用户会以为传了个有内容的东西。
-		return sshclient.Result{}, fmt.Errorf("本地文件 %s 是空文件，未上传", local)
-	}
-	if int64(len(data)) > sshclient.MaxTransferBytes {
-		return sshclient.Result{}, fmt.Errorf("文件超过上限（%d MiB）：%s",
-			sshclient.MaxTransferBytes>>20, local)
+		if len(data) == 0 {
+			return sshclient.Result{}, fmt.Errorf("content_base64 是空内容，未上传")
+		}
+		res, werr := ctx.ssh.WriteFileBinary(hostID, remote, data)
+		if werr != nil {
+			return sshclient.Result{}, werr
+		}
+		if res.ExitCode != 0 {
+			msg := strings.TrimSpace(res.Stderr)
+			if msg == "" {
+				msg = fmt.Sprintf("远端退出码 %d", res.ExitCode)
+			}
+			return sshclient.Result{ExitCode: res.ExitCode, Stderr: msg}, fmt.Errorf("上传失败：%s", msg)
+		}
+		note = fmt.Sprintf("已上传 %d 字节到 %s", len(data), remote)
+		if extra := strings.TrimSpace(res.Stdout); extra != "" {
+			note = fmt.Sprintf("已上传 %d 字节到 %s（%s）", len(data), remote, extra)
+		}
+		return sshclient.Result{Stdout: note, ExitCode: 0}, nil
 	}
 
-	res, err := ctx.ssh.WriteFileBinary(hostID, remote, data)
+	uploaded, err := uploadLocalFileChunked(ctx, hostID, local, remote)
 	if err != nil {
 		return sshclient.Result{}, err
 	}
-	if res.ExitCode != 0 {
-		msg := strings.TrimSpace(res.Stderr)
-		if msg == "" {
-			msg = fmt.Sprintf("远端退出码 %d", res.ExitCode)
-		}
-		return sshclient.Result{ExitCode: res.ExitCode, Stderr: msg}, fmt.Errorf("上传失败：%s", msg)
+	return sshclient.Result{Stdout: fmt.Sprintf("已上传 %d 字节到 %s", uploaded, remote), ExitCode: 0}, nil
+}
+
+// uploadLocalFileChunked 分块读本地文件、分块写远端，返回上传的总字节数。
+//
+// 失败的善后与下载侧对称：清掉远端半成品（覆盖场景下备份已生成，原文件
+// 可从 .bak 找回），绝不让一个「看起来完整」的残缺文件留在远端。
+func uploadLocalFileChunked(ctx toolCtx, hostID, local, remote string) (int64, error) {
+	f, err := os.Open(local)
+	if err != nil {
+		return 0, fmt.Errorf("读取本地文件失败：%v", err)
+	}
+	defer f.Close()
+
+	st, err := f.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("读取本地文件失败：%v", err)
+	}
+	total := st.Size()
+	if total == 0 {
+		// 空文件不是错误，但要说明白：否则用户会以为传了个有内容的东西。
+		return 0, fmt.Errorf("本地文件 %s 是空文件，未上传", local)
 	}
 
-	note := strings.TrimSpace(res.Stdout)
-	if note == "" {
-		note = fmt.Sprintf("已上传 %d 字节到 %s", len(data), remote)
-	} else {
-		note = fmt.Sprintf("已上传 %d 字节到 %s（%s）", len(data), remote, note)
+	removePartial := func() {
+		_, _ = ctx.ssh.Exec(hostID, "rm -f -- "+shellQuote(remote), 30*time.Second)
 	}
-	return sshclient.Result{Stdout: note, ExitCode: 0}, nil
+
+	buf := make([]byte, sshclient.ChunkSize)
+	var written int64
+	first := true
+	for written < total {
+		want := total - written
+		if want > int64(len(buf)) {
+			want = int64(len(buf))
+		}
+		n, rerr := io.ReadFull(f, buf[:want])
+		if n == 0 {
+			if rerr != nil {
+				return 0, fmt.Errorf("读取本地文件失败：%v", rerr)
+			}
+			return 0, fmt.Errorf("本地文件在读取中途变短（已读 %d / %d 字节）", written, total)
+		}
+		var res sshclient.Result
+		if first {
+			res, err = ctx.ssh.WriteFileBinary(hostID, remote, buf[:n])
+			first = false
+		} else {
+			res, err = ctx.ssh.AppendFileBinary(hostID, remote, buf[:n])
+		}
+		if err != nil {
+			removePartial()
+			return 0, err
+		}
+		if res.ExitCode != 0 {
+			msg := strings.TrimSpace(res.Stderr)
+			if msg == "" {
+				msg = fmt.Sprintf("远端退出码 %d", res.ExitCode)
+			}
+			removePartial()
+			return 0, fmt.Errorf("上传失败：%s", msg)
+		}
+		written += int64(n)
+	}
+
+	// 收尾核验：远端大小必须与本地一致，否则视为残缺（与 App 通道的
+	// UploadRemoteFileFinish 同一条铁律）。
+	size, err := ctx.ssh.StatFileSize(hostID, remote)
+	if err != nil {
+		removePartial()
+		return 0, fmt.Errorf("核验远端文件失败：%v", err)
+	}
+	if size != total {
+		removePartial()
+		return 0, fmt.Errorf("远端文件大小（%d 字节）与本地（%d 字节）不一致，已清理半成品", size, total)
+	}
+	return written, nil
 }
 
 // runDownloadRemoteFile 把远端文件下载到本地磁盘。
@@ -172,10 +242,6 @@ func runDownloadRemoteFile(ctx toolCtx, args map[string]any) (sshclient.Result, 
 	total, err := ctx.ssh.StatFileSize(hostID, remote)
 	if err != nil {
 		return sshclient.Result{}, err
-	}
-	if total > sshclient.MaxTransferBytes {
-		return sshclient.Result{}, fmt.Errorf("文件（%s）超过 %d MiB 上限，未下载。请改用终端里的 scp/sftp 取这个大文件。",
-			remote, sshclient.MaxTransferBytes>>20)
 	}
 
 	// 父目录不存在时先建：LLM 给出的路径常常带着一层还没建过的目录，

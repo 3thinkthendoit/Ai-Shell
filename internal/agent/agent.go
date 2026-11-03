@@ -1696,7 +1696,7 @@ func systemPrompt(v *vault.Vault, allowCrossHost bool, hostID string) string {
 - upload_local_file：把**运行本应用的那台机器上的文件**传到远端。必须经用户批准。
 
 **拉到本地**
-- download_remote_file：把远端文件下载到本地磁盘（上限 32 MiB，超过请建议用户用 scp/sftp）。
+- download_remote_file：把远端文件下载到本地磁盘。
 
 **查资料（仅在策略允许时可用）**
 - fetch_webpage：抓一个网页的正文。用于查官方文档、看报错页。

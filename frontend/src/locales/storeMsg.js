@@ -32,7 +32,6 @@ export const storeMsg = {
     'msg.termInputFail': '终端输入失败：{msg}',
     'msg.uploaded': '已上传 {name}',
     'msg.uploadFail': '上传失败',
-    'msg.uploadTooLarge': '文件超过上传上限（{max} MiB），请改用终端里的 scp/sftp 传输大文件',
     // ↓ agent 后端推送的固定错误文案（code 字段），按当前语言翻译而非固化后端语言
     'msg.agentBusy': '已有会话正在运行，请等待其完成或点「中断」',
     'msg.agentProfileGone': '所选服务商已不存在（可能已被删除），请刷新后重试。',
@@ -77,7 +76,6 @@ export const storeMsg = {
     'msg.termInputFail': 'Terminal input failed: {msg}',
     'msg.uploaded': 'Uploaded {name}',
     'msg.uploadFail': 'Upload failed',
-    'msg.uploadTooLarge': 'File exceeds the upload limit ({max} MiB). Use scp/sftp in the terminal for large files',
     // Fixed agent error strings pushed by the backend (code field) — translated per current locale
     'msg.agentBusy': 'Another session is still running. Wait for it to finish or press "Interrupt".',
     'msg.agentProfileGone': 'The selected provider no longer exists (it may have been deleted). Refresh and try again.',

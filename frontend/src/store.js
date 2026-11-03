@@ -103,10 +103,6 @@ export const store = reactive({
     allowCrossHost: false
   },
 
-  // 文件上传的大小上限（字节）。由 Bootstrap 下发 —— 数值只有后端一处
-  // 说了算（sshclient.MaxTransferBytes 同时管上传校验和下载截断），前端
-  // 抄写数值迟早漂移。0 表示还没拿到 Bootstrap：预检放行，由后端兜底。
-  maxTransferBytes: 0,
   currentHostId: '',
 
   // draftHostId：新建任务首页底栏「预选」的主机。
@@ -169,8 +165,8 @@ export const store = reactive({
     // progress 是传输进度，只在上传/下载期间非空。
     //
     // 字段：
-    //   phase  'reading'（本地读文件并 base64）/ 'sending'（发给后端）
-    //          / 'downloading'（后端正在分块拉取并落盘）/ 'done'
+    //   phase  'uploading'（前端逐块推进，可取消）/ 'downloading'（后端
+    //          正在分块拉取并落盘，可取消）/ 'done'
     //   loaded 已处理的**原始字节数**（不是 base64 长度 —— 用户看到的
     //          应该是文件本身的进度，而 base64 会膨胀约 33%）
     //   total  原始文件总字节（0 表示未知）
@@ -182,7 +178,11 @@ export const store = reactive({
     // 为什么要有 total 之外还留 loaded：FileReader 的 progress 事件
     // 在文件很小时可能一次都不触发（直接 onload），所以 UI 必须能处理
     // 「有名字有阶段但没有百分比」的状态，而不是除以 0 显示 NaN%。
-    progress: null
+    progress: null,
+    // 上传取消标记：fmCancelTransfer 置位，fmUpload 的块间检查点消费。
+    // 取消走前端标记而不是后端 abort —— 单次块调用是不可中断的原子 IPC，
+    // 但块与块之间永远有检查点，1 MiB 一块的粒度足够灵敏。
+    cancelUpload: false
   },
 
   // bySession 是「每台主机的每条会话各一条独立时间线」：桶键 → 对话记录。
@@ -411,10 +411,6 @@ export async function bootstrap() {
       store.selectedProfileId = (store.llmProfiles.find(p => p.active) || {}).id || ''
     }
     store.policy = info.policy || store.policy
-    // 上传上限以后端为唯一权威（见 store.maxTransferBytes 注释）。
-    // Number() 兜底：绑定未重新生成或后端旧版本时是 undefined，落到 0
-    // 表示「没拿到」，预检放行、后端硬拒绝兜底。
-    store.maxTransferBytes = Number(info.maxTransferBytes) || 0
     // 自动选中只在「只有一台主机」时发生：猜对率 100% 且省一次点击。
     // 多台时不猜 —— 选错的主机会被立即建立 SSH 连接（远端登录、审计痕迹），
     // 而用户启动后未必先用终端（可能只想看审计/改设置）。选中动作交给用户，
@@ -1478,56 +1474,65 @@ export async function fmGoParent() {
 // 后端 App.DeleteRemotePath 仍然保留：它是通用能力（终端、自动化都能用），
 // 只是这个前端入口不再暴露它。
 
-// fmUpload 把本地 File 内容 base64 后上传到当前目录（二进制安全，带进度）。
+// fmUpload 把本地 File 分块读到内存、逐块 base64 后上传到当前目录。
 //
-// 走的是和下载同一条路：整个文件 base64 后一次性交给后端，后端再
-// base64 -d 落到远端。所以「二进制」这件事是端到端成立的 —— 上传的不是
-// 文本，而是原始字节的 base64 表示，`\x00` 与无效 UTF-8 都能原样过去。
+// 走的是和下载对称的分块路：第一块调 UploadRemoteFileChunk(append=false)
+// 截断远端目标并做备份，后续块 append=true 追加，最后 UploadRemoteFileFinish
+// 核验远端大小与本地一致。任何时刻内存里只有一个块（约 1 MiB）的
+// 原始字节与 base64 —— 大文件上传不再有整份编码串的内存峰值，
+// 大小上限也因此彻底不需要。
 //
-// 关于进度：Wails 的绑定调用是**一次性**的（参数就是一个大字符串），
-// 中间没有可观测的传输事件。所以进度只能分两段报：
+// 「二进制」这件事端到端成立：每块各自 base64，远端 `base64 -d` 解码，
+// `\x00` 与无效 UTF-8 都能原样过去。
 //
-//   1. 'reading' —— 本地把文件读成 base64。这一段是真实分块的（FileReader
-//      的 progress 事件），也是大文件耗时最长的部分，进度是真的。
-//   2. 'sending' —— 调后端。这一段只能显示"不定进度"（UI 上做条纹动画），
-//      因为拿不到回调。硬要显示一个假百分比，在大文件上会长时间停着不动，
-//      比诚实的"发送中"更让人心慌。
-//
-// 两段都报**原始字节数**，不是 base64 长度：base64 会膨胀约 33%，
-// 直接用它当分子会让"读完了"显示成 75% 那种莫名其妙的数字。
+// 进度是**真实的单调节**：每传完一块就把 loaded 推进到该块的末尾。
+// 取消在块间生效（fmCancelTransfer 置 cancelUpload），取消或失败都会调
+// UploadRemoteFileAbort 清掉远端半成品 —— 一个「看起来完整」的残缺文件
+// 比失败危险得多。清理走专用的 Abort 而不是通用删除：文件管理弹窗刻意
+// 不提供删除入口，而「取消自己的上传」是上传事务的回滚，不是删除功能。
 export async function fmUpload(file) {
   const fm = fmState()
   if (!api() || !file) return
-  // 大小预检：与后端同一上限（Bootstrap 下发的 maxTransferBytes）。在这里
-  // 拦而不是只靠后端：base64 整串在前端、IPC、后端各存一份内存，超限的
-  // 文件连读都不该读。上限拿不到（0）时放行，由后端硬拒绝兜底。
-  const limit = store.maxTransferBytes
-  if (limit > 0 && file.size > limit) {
-    fm.error = t('msg.uploadTooLarge', { max: Math.round(limit / 1048576) })
-    fm.progress = null
-    return
-  }
   fm.busy = true
   fm.error = ''
   fm.notice = ''
-  fm.progress = { phase: 'reading', loaded: 0, total: file.size, name: file.name }
+  fm.cancelUpload = false
+  fm.progress = { phase: 'uploading', loaded: 0, total: file.size, name: file.name }
+  const size = file.size || 0
+  // 远端半成品清理：只在至少有一块真正写进远端之后才有东西可清。
+  let sentAny = false
   try {
-    const pure = await fileToBase64Paced(file, loaded => {
-      // 读阶段：loaded 是已读的原始字节。
-      fm.progress = { phase: 'reading', loaded, total: file.size, name: file.name }
-    })
-    // 读完之后切到"发送中"。这一段的百分比是未知的，UI 会显示不定进度。
-    fm.progress = { phase: 'sending', loaded: file.size, total: file.size, name: file.name }
-    const res = await api().UploadRemoteFile(fm.hostId, fm.cwd, file.name, pure)
-    if (res && res.ok) {
-      fm.progress = { phase: 'done', loaded: file.size, total: file.size, name: file.name }
-      fm.notice = res.message || t('msg.uploaded', { name: file.name })
+    // 至少一块：空文件也要把远端目标截断成 0 字节，Finish 的大小核验
+    // （0 == 0）才有意义 —— 否则一个已存在的同名文件会原样留下来冒充新上传。
+    const chunks = size === 0 ? 1 : Math.ceil(size / B64_CHUNK)
+    for (let i = 0; i < chunks; i++) {
+      if (fm.cancelUpload) throw new Error('已取消，远端半成品已清理')
+      const start = i * B64_CHUNK
+      const end = Math.min(start + B64_CHUNK, size)
+      const buf = size === 0 ? new ArrayBuffer(0) : await readFileSlice(file, start, end)
+      const res = await api().UploadRemoteFileChunk(fm.hostId, fm.cwd, file.name, bytesToBase64(new Uint8Array(buf)), i > 0)
+      if (!res || !res.ok) throw new Error((res && res.error) || t('msg.uploadFail'))
+      sentAny = true
+      // 报原始字节数：base64 会膨胀约 33%，拿它当分子会让百分比虚高。
+      fm.progress = { phase: 'uploading', loaded: end, total: size, name: file.name }
+    }
+    const fin = await api().UploadRemoteFileFinish(fm.hostId, fm.cwd, file.name, size)
+    if (fin && fin.ok) {
+      fm.progress = { phase: 'done', loaded: size, total: size, name: file.name }
+      fm.notice = fin.message || t('msg.uploaded', { name: file.name })
       await loadDir(fm.cwd)
     } else {
-      fm.error = (res && res.error) || t('msg.uploadFail')
+      fm.error = (fin && fin.error) || t('msg.uploadFail')
+      // Finish 核验失败：后端已清过半成品，这里不重复（rm 幂等但没必要再发一次 IPC）。
     }
   } catch (e) {
     fm.error = String(e && e.message ? e.message : e)
+    // 取消或某一块失败：远端可能留着半成品（块失败时后端已尽力清过，
+    // 这里再删一次无害——rm -f 对不存在的文件是 no-op），清掉它 ——
+    // 一个「看起来完整」的残缺文件比失败危险得多。
+    if (sentAny) {
+      try { await api().UploadRemoteFileAbort(fm.hostId, fm.cwd, file.name) } catch { /* 尽力而为 */ }
+    }
   } finally {
     // 无论成败都要清掉进度：留着会让下次打开弹窗看到一个停在 60% 的
     // 陈旧进度条，用户以为还在传。
@@ -1571,10 +1576,18 @@ export async function fmDownload(entryPath, name, isDir) {
   }
 }
 
-// fmCancelTransfer 取消当前下载：把进度事件里带回来的 id 还给后端。
-// id 为空说明第一块还没传完（事件还没来过），此时没有真正可取消的东西。
+// fmCancelTransfer 取消当前传输。
+//
+// 下载：把进度事件里带回来的 id 还给后端；id 为空说明第一块还没传完
+// （事件还没来过），此时没有真正可取消的东西。
+// 上传：置 cancelUpload 标记，fmUpload 的块间检查点消费 —— 前端驱动
+// 的分块循环天然可中断，不需要后端参与。
 export function fmCancelTransfer() {
   const fm = fmState()
+  if (fm.progress && fm.progress.phase === 'uploading') {
+    fm.cancelUpload = true
+    return
+  }
   const id = fm.progress && fm.progress.id
   if (id && api()) api().CancelFileTransfer(id)
 }
@@ -1588,75 +1601,39 @@ export function fmtBytes(n) {
   return `${(n / 1073741824).toFixed(2)} GiB`
 }
 
-// fileToBase64Paced 把本地文件读成**纯** base64（不含 data URL 前缀），
-// 并在读取过程中回调已处理的原始字节数。
+// readFileSlice 读出本地文件 [start, end) 区间的原始字节（ArrayBuffer）。
 //
 // 为什么不直接用 FileReader.readAsDataURL 的 onload：
 //
 //  1. 那个结果是带 `data:...;base64,` 前缀的，调用方还得手动切一刀；
 //  2. onprogress 给的是**整个 data URL 字符串**的进度，而 base64 比原始
-//     字节多约 33%，拿它当进度会让百分比虚高（读到 75% 就显示 100%）；
-//  3. 小文件时 onprogress 可能一次都不触发，只有 onload，
-//     如果 UI 依赖进度事件，小文件会一直显示 0%。
+//     字节多约 33%，拿它当进度会让百分比虚高；
+//  3. 小文件时 onprogress 可能一次都不触发，只有 onload。
 //
-// 所以这里自己按块读：每块是原始字节，先算好总块数再逐块推进，
-// 保证**最后一块读完时 loaded 恰好等于 file.size** —— 进度条一定能走到 100%，
-// 不会停在 97% 那种地方。
+// 用 FileReaderSync 不行（它是 Worker 专用的），所以还是异步 FileReader。
+// File.slice 是惰性的：不真正读盘，readAsArrayBuffer 才读 —— 分块上传
+// 的内存峰值因此只有「一个块 + 它的 base64」。
 //
-// 拼接用字符串而不是先合 Uint8Array 再转：几十 MB 的文件里，前者只是
-// 字符串相加，后者会额外复制一份完整缓冲，内存峰值翻倍。
-//
-// B64_CHUNK 必须是 3 的倍数：每块各自 bytesToBase64 后直接字符串拼接，
-// 若某块长度不是 3 的倍数，它的 base64 尾部会补 '='，下一块再接上去就让
-// 整串在块边界出现非法字符 —— 后端 base64.DecodeString 报
-// "illegal base64 data at input byte <块 base64 长度>"（>1 MiB 的文件必挂）。
-// 取 3×349525=1048575（≈1 MiB）既满足约束、又保留原来的分块粒度与进度节奏。
-const B64_CHUNK = 1048575 // =3×349525，≈1 MiB；必须 3 的倍数，见上
+// B64_CHUNK 取 ≈1 MiB：块太小则 SSH 每块一次 exec 的握手开销占比过高，
+// 块太大则单块 base64 的内存峰值回涨。每块独立交给后端 base64 -d，
+// 块间没有拼接，长度不必再凑 3 的倍数（历史包袱：当初整串拼接时必须）。
+const B64_CHUNK = 1048576 // 1 MiB
 
-function fileToBase64Paced(file, onProgress) {
+function readFileSlice(file, start, end) {
   return new Promise((resolve, reject) => {
-    const size = file.size || 0
-    if (!size) {
-      // 空文件：没有可读的块，直接给空串。给进度回调一个 0/0 的终态，
-      // 让 UI 能立刻显示"完成"而不是一直转圈。
-      if (onProgress) onProgress(0)
-      resolve('')
-      return
-    }
-
-    const parts = []
-    let offset = 0
-
-    // 用 FileReaderSync 不行（它是 Worker 专用的），所以还是异步 FileReader，
-    // 只是把"一次读整个文件"换成"顺序读若干块"。
-    function readNext() {
-      const end = Math.min(offset + B64_CHUNK, size)
-      const fr = new FileReader()
-
-      // onloadend 同时覆盖成功与失败：少写一个分支就少一处忘记推进的地方。
-      // 真失败时 fr.result 为空、fr.error 非空。
-      fr.onerror = () => reject(fr.error || new Error(t('msg.readFileFail')))
-      fr.onload = () => {
-        const buf = fr.result
-        if (!buf) {
-          reject(new Error('读取本地文件失败（内容为空）'))
-          return
-        }
-        const bytes = new Uint8Array(buf)
-        parts.push(bytesToBase64(bytes))
-        offset = end
-        // 报原始字节数：这是"文件传了多少"，和用户看到的文件大小同一个单位。
-        if (onProgress) onProgress(offset)
-        if (offset < size) {
-          readNext()
-        } else {
-          resolve(parts.join(''))
-        }
+    // onloadend 同时覆盖成功与失败：少写一个分支就少一处忘记推进的地方。
+    // 真失败时 fr.result 为空、fr.error 非空。
+    const fr = new FileReader()
+    fr.onerror = () => reject(fr.error || new Error(t('msg.readFileFail')))
+    fr.onload = () => {
+      const buf = fr.result
+      if (!buf) {
+        reject(new Error('读取本地文件失败（内容为空）'))
+        return
       }
-      fr.readAsArrayBuffer(file.slice(offset, end))
+      resolve(buf)
     }
-
-    readNext()
+    fr.readAsArrayBuffer(file.slice(start, end))
   })
 }
 

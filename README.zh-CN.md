@@ -17,7 +17,7 @@
   - 像 shell 的一行 → 经硬拒绝过滤后写进常驻终端执行（不经过 LLM）
 - **运维工具箱** — 除单次 `run_command` / 文件类工具外，Agent 可结构化采集诊断（`collect_diagnostics`、`journal_query`、`systemd_status`、`net_listen`）、对远端状态做快照与对比（`snapshot_state` / `diff_state`）、跑变更后校验（`verify_checks`：服务、端口、文件、本机 HTTP），以及通过文件备份回滚（`list_file_backups` / `restore_file_backup`）。
 - **视觉附图** — 在 LLM 方案中勾选「支持视觉 / 图片输入」后，可在对话里粘贴或拖入截图（PNG / JPEG / WebP / GIF；最多 3 张，单张 ≤ 4 MiB）。图片只进入**当前轮**请求，不写会话历史、不进审计。发送框与消息气泡以文件名芯片展示，悬停才预览。
-- **文件管理** — 在界面里浏览远端目录并上传 / 下载（单次传输上限 32 MiB，支持进度与取消）。
+- **文件管理** — 在界面里浏览远端目录并上传 / 下载（支持进度与取消）。
 - **策略引擎**
   - 硬拒绝：登录凭据路径、应用凭据文件（`.env`、`credentials.json`）、整块环境变量导出、破坏性命令（`mkfs`、`dd of=/dev/*`、`rm -rf /`、`shutdown` 等）
   - 高危确认（仅 Agent/LLM 命令）：删/建/改权限、装包、启停服务、杀进程、Docker/Kubernetes 变更类操作等

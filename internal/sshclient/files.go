@@ -420,15 +420,17 @@ func (c *Client) WriteFileBinary(hostID, path string, data []byte) (Result, erro
 	return c.runWithStdin(hostID, script, encoded, 300*time.Second)
 }
 
-// defaultTransferLimit 是单次上传/下载的大小上限（32 MiB）。
+// AppendFileBinary 把原始字节**追加**到远端文件末尾（不带备份）。
 //
-// 定这个数的理由：整份内容要作为**一个 base64 字符串**在内存里存在三份
-// （文件本体、编码串、Wails 的 IPC 序列化），32 MiB 的文件对应约 130 MiB
-// 峰值占用。再往上就该走 SFTP 或分块，而不是把这份简单实现撑爆。
-const defaultTransferLimit = 32 << 20
-
-// MaxTransferBytes 是上传/下载共用的上限（变量，便于测试压小）。
-var MaxTransferBytes int64 = defaultTransferLimit
+// 分块上传的后续块：第一块走 WriteFileBinary（截断 + 备份），后续块走
+// 这里。备份只在第一块做一次 —— 否则一个 N 块的文件会在目录里留下 N 份
+// .bak，而且后面那些块备份到的本来就是半成品。追加失败时调用方负责
+// 清理半成品（与下载侧的铁律对称：不能留一个「看起来完整」的残缺文件）。
+func (c *Client) AppendFileBinary(hostID, path string, data []byte) (Result, error) {
+	encoded := base64.StdEncoding.EncodeToString(data)
+	script := fmt.Sprintf("base64 -d >> %s", shellQuote(path))
+	return c.runWithStdin(hostID, script, encoded, 300*time.Second)
+}
 
 // writeBinaryScript 构造「解码 stdin 写入文件」的远端脚本。
 //

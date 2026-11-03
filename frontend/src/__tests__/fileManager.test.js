@@ -37,7 +37,9 @@ function makeApp(impl = {}) {
   const calls = []
   const base = {
     ListRemoteDir: async () => ({ ok: true, path: '/home/test', parent: '/home', entries: [] }),
-    UploadRemoteFile: async () => ({ ok: true, message: '已上传' }),
+    UploadRemoteFileChunk: async () => ({ ok: true }),
+    UploadRemoteFileFinish: async () => ({ ok: true, message: '已上传' }),
+    UploadRemoteFileAbort: async () => ({ ok: true }),
     DownloadRemoteFile: async () => ({ ok: true, message: '' }),
     CancelFileTransfer: async () => true
   }
@@ -57,7 +59,7 @@ function resetStore() {
   store.fileManager = {
     open: false, key: '', hostId: '', sessionId: '', cwd: '', parent: '',
     entries: [], loading: false, error: '', busy: false, notice: '',
-    progress: null
+    progress: null, cancelUpload: false
   }
   store.hosts = []
 }
@@ -247,52 +249,50 @@ describe('文件管理 上传进度', () => {
     }
   }
 
-  it('上传过程中 progress 依次经过 reading → sending，结束后清空', async () => {
-    const seen = []
-    const { app } = makeApp({
-      UploadRemoteFile: async () => {
-        // 调后端这一刻，进度应该已经是"发送中"。
-        seen.push(JSON.parse(JSON.stringify(store.fileManager.progress)))
-        return { ok: true, message: '已上传' }
-      }
-    })
+  it('分块上传：首块截断、后续块追加、收尾带本地总大小核验', async () => {
+    const { app, calls } = makeApp()
     window.go = { main: { App: app } }
     await openFileManager('h1', 's1')
 
-    // 3 MiB：会分成多个块，确保 reading 阶段真的推进过多次。
     await fmUpload(fakeFile('big.bin', 3 * 1024 * 1024))
 
-    // 结束时必须清空，否则下次打开弹窗会看到上次残留的进度条。
-    expect(store.fileManager.progress, '结束后应清空进度').toBeNull()
-    expect(seen.length).toBe(1)
-    expect(seen[0].phase, '调后端时进度应处于发送阶段').toBe('sending')
-    expect(seen[0].name).toBe('big.bin')
-    expect(seen[0].total).toBe(3 * 1024 * 1024)
+    const chunks = calls.filter(c => c.name === 'UploadRemoteFileChunk')
+    // 1 MiB 一块，3 MiB 恰好 3 块：首块 append=false（截断+备份），其余追加
+    expect(chunks.map(c => c.args[4])).toEqual([false, true, true])
+    // 每块 base64 独立解码后恰好是块大小的原始字节
+    for (const c of chunks) {
+      expect(atob(c.args[3]).length).toBe(1024 * 1024)
+    }
+    // 收尾核验带上本地总大小：远端大小不一致时后端要报错清理
+    const fin = calls.find(c => c.name === 'UploadRemoteFileFinish')
+    expect(fin.args[3]).toBe(3 * 1024 * 1024)
+    expect(store.fileManager.notice).toBe('已上传')
+    expect(store.fileManager.progress).toBeNull()
+    expect(store.fileManager.busy).toBe(false)
   })
 
-  it('reading 阶段的 loaded 单调递增，且最终恰好等于文件大小', async () => {
-    // 这里刻意**采样整个读取过程**，而不是只看结束时那个值。
+  it('上传进度单调递增，且最终恰好等于文件大小', async () => {
+    // 这里刻意**采样整个上传过程**，而不是只看结束时那个值。
     //
     // 只看终值是不够的：把回调改成恒报 1，终值断言照样通过，
     // 而进度条会永远停在 0% —— 一个断言看不见的真故障。
     // 所以要抓住"途中每一帧"，验证它确实在往上走、每步都在推进。
     const frames = []
     const { app } = makeApp({
-      UploadRemoteFile: async () => ({ ok: true, message: '' })
+      UploadRemoteFileChunk: async () => ({ ok: true }),
+      UploadRemoteFileFinish: async () => ({ ok: true, message: '' })
     })
     window.go = { main: { App: app } }
     await openFileManager('h1', 's1')
 
     const size = 3 * 1024 * 1024 // 3 块（块大小 1 MiB）
-    // 逐帧记录读取过程的进度。
+    // 逐帧记录上传过程的进度。
     //
     // 不能用普通的 Proxy 去替换 store.fileManager —— store 是 reactive() 的，
     // Vue 会把赋进去的对象**再包一层自己的 proxy**，我们那个 set 陷阱永远
-    // 不会被调用（写进去的是 Vue 的代理）。用 Vue 自己的 watch 才是对的：
-    // 它在每次 fm.progress 被替换时同步回调。
-    // flush:'sync' 很重要：默认是异步批处理的，而读取是"同步循环里一路
-    // 替换 progress 对象"，异步回调只会在最后跑一次，中间那些帧全丢。
-    // 要看到真实的推进过程就必须同步回调。
+    // 不会被调用（写进去的是 Vue 的代理）。用 Vue 自己的 watch 才是对的。
+    // flush:'sync' 很重要：块循环是"连续替换 progress 对象"，异步回调只会在
+    // 最后跑一次，中间那些帧全丢。
     const stop = watch(() => store.fileManager.progress, p => {
       if (p) frames.push({ ...p })
     }, { flush: 'sync' })
@@ -300,28 +300,28 @@ describe('文件管理 上传进度', () => {
     await fmUpload(fakeFile('mid.bin', size))
     stop()
 
-    const reading = frames.filter(f => f.phase === 'reading')
-    expect(reading.length, '读取阶段应产生多次进度更新').toBeGreaterThanOrEqual(3)
+    const uploading = frames.filter(f => f.phase === 'uploading')
+    expect(uploading.length, '上传阶段应产生多次进度更新').toBeGreaterThanOrEqual(3)
 
     // 第 0 帧是上传开始时置的 loaded:0（进度条从 0 出发是对的），
     // 真正的推进从第 1 帧起 —— 断言对象是"推进序列"，不是"含初始值的序列"。
-    const advanced = reading.slice(1)
+    const advanced = uploading.slice(1)
     expect(advanced.length, '至少要有一次实际推进').toBeGreaterThanOrEqual(1)
 
-    // 1) 首帧推进必须 > 0：第一块读完就该有可见进展，否则进度条看着像没动。
-    expect(advanced[0].loaded, '第一块读完就该有进展').toBeGreaterThan(0)
+    // 1) 首帧推进必须 > 0：第一块传完就该有可见进展，否则进度条看着像没动。
+    expect(advanced[0].loaded, '第一块传完就该有进展').toBeGreaterThan(0)
     // 2) 严格递增：任何一次回退都说明 offset 记错了。
     for (let i = 1; i < advanced.length; i++) {
       expect(advanced[i].loaded, '进度不能回退').toBeGreaterThan(advanced[i - 1].loaded)
     }
     // 3) 终值精确等于文件大小：差一点就会停在 99%。
-    expect(advanced[advanced.length - 1].loaded, '读完时 loaded 应恰好等于总大小').toBe(size)
-    expect(reading.every(f => f.total === size), 'total 应始终是文件大小').toBe(true)
+    expect(advanced[advanced.length - 1].loaded, '传完时 loaded 应恰好等于总大小').toBe(size)
+    expect(uploading.every(f => f.total === size), 'total 应始终是文件大小').toBe(true)
   })
 
   it('上传失败时也要清空进度（否则进度条会永远停在那里）', async () => {
-    const { app } = makeApp({
-      UploadRemoteFile: async () => ({ ok: false, error: '磁盘满了' })
+    const { app, calls } = makeApp({
+      UploadRemoteFileChunk: async () => ({ ok: false, error: '磁盘满了' })
     })
     window.go = { main: { App: app } }
     await openFileManager('h1', 's1')
@@ -331,36 +331,39 @@ describe('文件管理 上传进度', () => {
     expect(store.fileManager.progress, '失败路径同样要清空进度').toBeNull()
     expect(store.fileManager.error).toBe('磁盘满了')
     expect(store.fileManager.busy).toBe(false)
+    // 第一块就失败：远端没写进过任何字节（后端自己清过），前端不应再发清理
+    expect(calls.filter(c => c.name === 'UploadRemoteFileAbort')).toEqual([])
+    expect(calls.filter(c => c.name === 'UploadRemoteFileFinish')).toEqual([])
   })
 
-  it('多块文件拼出的 base64 必须整体可解码（块边界不能带 padding）', async () => {
-    // 回归：曾经每块各自 base64 再字符串拼接，非 3 倍数块尾的 '=' 让后端
-    // base64.DecodeString 在块边界报 illegal base64 —— >1 MiB 的文件必挂。
-    let received = null
-    const { app } = makeApp({
-      UploadRemoteFile: async (h, d, n, b64) => {
-        received = b64
-        return { ok: true, message: '' }
-      }
+  it('取消在块间生效：停止发块、不收尾、清掉远端半成品', async () => {
+    const { app, calls } = makeApp({
+      // 第一块写完的瞬间用户点了取消
+      UploadRemoteFileChunk: async () => { fmCancelTransfer(); return { ok: true } }
     })
     window.go = { main: { App: app } }
     await openFileManager('h1', 's1')
 
-    const size = 3 * 1024 * 1024 + 7 // 跨多块，且末块长度不是 3 的倍数
-    await fmUpload(fakeFile('big.bin', size))
+    await fmUpload(fakeFile('mid.bin', 3 * 1024 * 1024))
 
-    expect(received, '应把整个文件的 base64 交给后端').toBeTruthy()
-    expect(atob(received).length, '解码出的原始字节数必须等于文件大小').toBe(size)
+    // 只发了第一块就停了：没有后续块、没有收尾核验
+    expect(calls.filter(c => c.name === 'UploadRemoteFileChunk').length).toBe(1)
+    expect(calls.filter(c => c.name === 'UploadRemoteFileFinish')).toEqual([])
+    // 远端半成品被清理（走专用的 Abort 回滚，不走通用删除）：一个
+    // 「看起来完整」的残缺文件比失败危险得多。
+    const abort = calls.filter(c => c.name === 'UploadRemoteFileAbort')
+    expect(abort.length).toBe(1)
+    expect(abort[0].args).toEqual(['h1', '/home/test', 'mid.bin'])
+    expect(store.fileManager.error).toContain('已取消')
+    expect(store.fileManager.progress).toBeNull()
+    expect(store.fileManager.busy).toBe(false)
   })
 
   it('小文件也能走完进度（不能因为只有一块就卡在 0%）', async () => {
-    // 这是真会发生的：早先用 FileReader 的 progress 事件时，
-    // 几百字节的文件可能一次 progress 都不触发，只有 onload，
-    // 于是界面上一直显示 0%。改成按块读之后必须解决这一点。
-    let atSend = null
+    let atFinish = null
     const { app } = makeApp({
-      UploadRemoteFile: async () => {
-        atSend = { ...store.fileManager.progress }
+      UploadRemoteFileFinish: async () => {
+        atFinish = { ...store.fileManager.progress }
         return { ok: true, message: '' }
       }
     })
@@ -369,25 +372,29 @@ describe('文件管理 上传进度', () => {
 
     await fmUpload(fakeFile('tiny.txt', 10))
 
-    expect(atSend.loaded, '小文件的 loaded 必须等于它的大小').toBe(10)
-    expect(atSend.total).toBe(10)
+    expect(atFinish.loaded, '小文件的 loaded 必须等于它的大小').toBe(10)
+    expect(atFinish.total).toBe(10)
   })
 
-  it('超过 Bootstrap 下发上限的文件在前端就被拦下：不读、不发、不进 busy', async () => {
-    // base64 整串在前端、IPC、后端各存一份内存 —— 超限文件连读都是浪费，
-    // 必须在 fmUpload 入口就拦。后端还有同一上限的硬拒绝兜底。
-    const { app, calls } = makeApp()
+  it('每块 base64 独立可解码，拼接后等于原文件（不再受 3 的倍数约束）', async () => {
+    // 每块独立交给后端 base64 -d：没有整串拼接，块边界不再有历史上的
+    // 「padding '=' 让整串解码失败」问题 —— 逐块解码拼接必须还原出与
+    // 本地等长的内容，末块零头恰好检验这点。
+    const parts = []
+    const { app } = makeApp({
+      UploadRemoteFileChunk: async (h, d, n, b64) => {
+        parts.push(b64)
+        return { ok: true }
+      }
+    })
     window.go = { main: { App: app } }
     await openFileManager('h1', 's1')
-    store.maxTransferBytes = 3 * 1024 * 1024 // 模拟 Bootstrap 已下发 3 MiB 上限
 
-    await fmUpload(fakeFile('huge.bin', 10 * 1024 * 1024))
+    const size = 3 * 1024 * 1024 + 7 // 跨多块，且末块是 7 字节零头
+    await fmUpload(fakeFile('big.bin', size))
 
-    expect(calls.filter(c => c.name === 'UploadRemoteFile'), '超限文件不应发给后端').toEqual([])
-    expect(store.fileManager.error, '应给出带上限数值的报错').toContain('上传上限')
-    expect(store.fileManager.busy).toBe(false)
-    expect(store.fileManager.progress).toBeNull()
-    store.maxTransferBytes = 0
+    expect(parts.length).toBe(4)
+    expect(parts.map(atob).join('').length, '逐块解码拼接后必须与本地等长').toBe(size)
   })
 })
 

@@ -436,19 +436,91 @@ describe('cmdPending · 提交命令后的乐观透传窗口', () => {
     expect(isCmdRunning(key)).toBe(true)
   })
 
-  it('窗口内按方向键后回车：攒行已不可靠，不再复核直接放行', async () => {
+  it('窗口内按↑历史键后回车：攒行已不可靠，不再复核直接放行', async () => {
     withHost()
     const key = await createSurface()
     await enqueueSubmit(key, 'ls')
     calls.length = 0
     onTermData(key, 'ls')
-    onTermData(key, '\x1b[A') // ↑ 历史方向键：行编辑复杂化，攒的行作废
+    onTermData(key, '\x1b[A') // ↑ 历史键：远端整行替换成历史命令，攒的行作废
     onTermData(key, '\r')
     // 全程同步放行：复核通道压根没被叫醒
     expect(callsOf('CheckShellCommand')).toEqual([])
     const wt = callsOf('WriteTerminal')
     expect(wt.length).toBe(3)
     expect(toBytes(base64ToBytes(wt[2].args[2]))).toEqual(toBytes(new TextEncoder().encode('\r')))
+  })
+
+  it('窗口内敲错字退格改回：攒行弹尾，复核拿到的是改正后的行', async () => {
+    withHost()
+    const key = await createSurface()
+    await enqueueSubmit(key, 'ls')
+    calls.length = 0
+    onTermData(key, 'rmx')  // 敲错的 x
+    onTermData(key, '\x7f') // 退格删掉 x：弹尾而不是作废整行
+    onTermData(key, '\r')
+    await flushPromises()
+    // 复核拿到 'rm' —— 退格不该让整行失去硬拒绝保护
+    const chk = callsOf('CheckShellCommand')
+    expect(chk.length).toBe(1)
+    expect(chk[0].args[1]).toBe('rm')
+    // 危险命令照旧拦下：字符透传（'rmx'、'\x7f'）+ Ctrl-U 清远端行
+    const wt = callsOf('WriteTerminal')
+    expect(wt.length).toBe(3)
+    expect(toBytes(base64ToBytes(wt[2].args[2]))).toEqual(toBytes(new TextEncoder().encode('\x15')))
+  })
+
+  it('窗口内按→/Home 等光标键不动行内容：攒行仍有效，危险命令照样被拦', async () => {
+    withHost()
+    const key = await createSurface()
+    await enqueueSubmit(key, 'ls')
+    calls.length = 0
+    onTermData(key, 'rm -rf /data')
+    onTermData(key, '\x1b[C') // →：只移光标不改内容，攒的行继续有效
+    onTermData(key, '\r')
+    await flushPromises()
+    // 历史上方向键一律作废攒行，「敲完命令按一下→再回车」就成了绕过
+    // 硬拒绝的旁路 —— 现在光标键不动行，复核照常拿到整行
+    expect(callsOf('CheckShellCommand')[0].args[1]).toBe('rm -rf /data')
+    const wt = callsOf('WriteTerminal')
+    expect(wt.length).toBe(3)
+    expect(toBytes(base64ToBytes(wt[2].args[2]))).toEqual(toBytes(new TextEncoder().encode('\x15')))
+  })
+
+  it('复核期间继续敲的字先排队，结论出来后按序补发——顺序不颠倒', async () => {
+    withHost()
+    const key = await createSurface()
+    await enqueueSubmit(key, 'ls')
+    calls.length = 0
+    onTermData(key, 'vim') // 直接透传
+    onTermData(key, '\r')  // hold 住等复核
+    onTermData(key, 'x')   // 复核没回来：排队，而不是抢在回车前面发
+    onTermData(key, 'y')
+    await flushPromises() // 复核放行：先补发回车，再按序补发排队的字符
+    const enc = s => toBytes(new TextEncoder().encode(s))
+    const seq = callsOf('WriteTerminal').map(c => toBytes(base64ToBytes(c.args[2])))
+    expect(seq).toEqual([enc('vim'), enc('\r'), enc('x'), enc('y')])
+    // 队列里的字符照常攒新行：下一次回车复核拿到的是 'xy' 而不是 'vimxy'
+    onTermData(key, '\r')
+    await flushPromises()
+    const chk = callsOf('CheckShellCommand')
+    expect(chk[chk.length - 1].args[1]).toBe('xy')
+  })
+
+  it('被拒绝后队列里的输入重放到本地行编辑，不丢键也不直灌 PTY', async () => {
+    withHost()
+    const key = await createSurface()
+    await enqueueSubmit(key, 'ls')
+    calls.length = 0
+    onTermData(key, 'rm')
+    onTermData(key, '\r') // 复核中
+    onTermData(key, 'h')  // 排队
+    await flushPromises() // 拒绝：Ctrl-U 清行 + 关窗
+    const enc = s => toBytes(new TextEncoder().encode(s))
+    const seq = callsOf('WriteTerminal').map(c => toBytes(base64ToBytes(c.args[2])))
+    expect(seq).toEqual([enc('rm'), enc('\x15')]) // 'h' 没有透传给 PTY
+    expect(getTerm(key).line).toBe('h')            // 落到本地行编辑
+    expect(isCmdRunning(key)).toBe(false)
   })
 
   it('乐观窗口里敲中文：关窗改走本地行编辑，回车交给 Agent', async () => {

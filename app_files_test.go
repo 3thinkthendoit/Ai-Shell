@@ -187,6 +187,116 @@ func TestUploadRemoteFile_BinaryRoundTrip(t *testing.T) {
 	}
 }
 
+// 分块上传的端到端回路：多块按「第一块截断+备份、后续块追加」拼回完整内容。
+// 内容长度刻意不对齐块边界（2 MiB + 5）—— 最后一块是零头，最容易暴露
+// 「按整块算偏移」这类 off-by-one。
+func TestUploadRemoteFileChunk_RoundTrip(t *testing.T) {
+	a, hostID := newShellTestApp(t, vault.ModeManual, nil)
+
+	raw := []byte(strings.Repeat("A", 2*1024*1024) + "BCDE") // 2 MiB + 5
+	chunk := 1024 * 1024
+	for off, i := 0, 0; off < len(raw); off, i = off+chunk, i+1 {
+		end := off + chunk
+		if end > len(raw) {
+			end = len(raw)
+		}
+		res := a.UploadRemoteFileChunk(hostID, "/srv", "big.bin", base64.StdEncoding.EncodeToString(raw[off:end]), i > 0)
+		if !res.OK {
+			t.Fatalf("第 %d 块上传失败: %s", i, res.Error)
+		}
+	}
+	if fin := a.UploadRemoteFileFinish(hostID, "/srv", "big.bin", int64(len(raw))); !fin.OK {
+		t.Fatalf("收尾核验失败: %s", fin.Error)
+	}
+
+	got, _ := mustDownload(t, a, hostID, "/srv/big.bin")
+	if string(got) != string(raw) {
+		t.Fatalf("分块内容拼装有误：发出 %d 字节 收回 %d 字节", len(raw), len(got))
+	}
+}
+
+// 覆盖场景：N 块只留一份备份 —— 备份属于「旧文件的副本」，只在第一块
+// （截断那次）做；后续追加块备份到的是半成品，只会制造 .bak 垃圾。
+func TestUploadRemoteFileChunk_OverwriteKeepsSingleBackup(t *testing.T) {
+	a, hostID, srv := newShellTestAppWithServer(t, vault.ModeManual, nil)
+	srv.SetRemoteFile("/srv/blob.bin", "旧内容")
+
+	for i := 0; i < 3; i++ {
+		res := a.UploadRemoteFileChunk(hostID, "/srv", "blob.bin", base64.StdEncoding.EncodeToString([]byte("x")), i > 0)
+		if !res.OK {
+			t.Fatalf("第 %d 块上传失败: %s", i, res.Error)
+		}
+	}
+	if fin := a.UploadRemoteFileFinish(hostID, "/srv", "blob.bin", 3); !fin.OK {
+		t.Fatalf("收尾核验失败: %s", fin.Error)
+	}
+
+	if got, ok := srv.ReadRemoteFile("/srv/blob.bin"); !ok || got != "xxx" {
+		t.Fatalf("远端内容应拼成 xxx，实得 %q", got)
+	}
+	if backs := srv.Backups("/srv/blob.bin"); len(backs) != 1 {
+		t.Fatalf("覆盖上传应恰好留一份备份，实得 %d 份", len(backs))
+	}
+}
+
+// 收尾核验的铁律：远端大小与本地不一致（传输中断留下半成品）必须报错并
+// 清掉半成品 —— 一个「看起来完整」的残缺文件比失败危险得多。
+func TestUploadRemoteFileFinish_SizeMismatchCleansPartial(t *testing.T) {
+	a, hostID, srv := newShellTestAppWithServer(t, vault.ModeManual, nil)
+
+	res := a.UploadRemoteFileChunk(hostID, "/srv", "half.bin", base64.StdEncoding.EncodeToString([]byte("abcd")), false)
+	if !res.OK {
+		t.Fatalf("第一块上传失败: %s", res.Error)
+	}
+	fin := a.UploadRemoteFileFinish(hostID, "/srv", "half.bin", 10) // 本地声称 10 字节，远端只有 4
+	if fin.OK {
+		t.Fatal("大小不一致时 Finish 应报错")
+	}
+	if !strings.Contains(fin.Error, "不一致") {
+		t.Fatalf("错误应说明大小不一致，实得: %s", fin.Error)
+	}
+	if _, ok := srv.ReadRemoteFile("/srv/half.bin"); ok {
+		t.Fatal("大小不一致时半成品应被清理")
+	}
+}
+
+// 取消上传的善后：清掉这次上传的半成品。走专用的 Abort 而不是通用删除 ——
+// 文件管理弹窗刻意不提供删除入口，「取消自己的上传」是上传事务的回滚。
+func TestUploadRemoteFileAbort_RemovesPartial(t *testing.T) {
+	a, hostID, srv := newShellTestAppWithServer(t, vault.ModeManual, nil)
+	srv.SetRemoteFile("/srv/blob.bin", "旧内容")
+
+	res := a.UploadRemoteFileChunk(hostID, "/srv", "blob.bin", base64.StdEncoding.EncodeToString([]byte("abc")), false)
+	if !res.OK {
+		t.Fatalf("第一块上传失败: %s", res.Error)
+	}
+	ab := a.UploadRemoteFileAbort(hostID, "/srv", "blob.bin")
+	if !ab.OK {
+		t.Fatalf("取消善后失败: %s", ab.Error)
+	}
+	if _, ok := srv.ReadRemoteFile("/srv/blob.bin"); ok {
+		t.Fatal("取消后半成品应被清理")
+	}
+}
+
+// 空文件也要发一个空的第一块：把远端目标截断成 0 字节，Finish 的核验
+// （0 == 0）才有意义 —— 否则一个已存在的同名文件会原样留下来冒充新上传。
+func TestUploadRemoteFileChunk_EmptyFile(t *testing.T) {
+	a, hostID, srv := newShellTestAppWithServer(t, vault.ModeManual, nil)
+	srv.SetRemoteFile("/srv/empty.bin", "旧内容")
+
+	res := a.UploadRemoteFileChunk(hostID, "/srv", "empty.bin", "", false)
+	if !res.OK {
+		t.Fatalf("空块上传失败: %s", res.Error)
+	}
+	if fin := a.UploadRemoteFileFinish(hostID, "/srv", "empty.bin", 0); !fin.OK {
+		t.Fatalf("收尾核验失败: %s", fin.Error)
+	}
+	if got, ok := srv.ReadRemoteFile("/srv/empty.bin"); !ok || got != "" {
+		t.Fatalf("远端应为 0 字节空文件，实得 %q", got)
+	}
+}
+
 // 回归：远端 stdout 里混进了**别的行**时，下载仍必须成功。
 //
 // 这就是线上报的那条：
@@ -294,27 +404,6 @@ func TestUploadRemoteFile_RejectsPathTraversal(t *testing.T) {
 		if res.OK {
 			t.Errorf("文件名 %q 应被拒绝", name)
 		}
-	}
-}
-
-// 上传必须受 MaxTransferBytes 硬限制：整份内容作为 base64 在内存里要
-// 存三份（IPC 串、解码缓冲、远端脚本的 stdin），超限文件会把进程顶到 OOM。
-// 这道墙与 agent 通道（toolfiles.go）共用同一个数，两边不会漂移。
-func TestUploadRemoteFile_RejectsOversized(t *testing.T) {
-	a, hostID := newShellTestApp(t, vault.ModeManual, nil)
-
-	// 压小上限，避免测试里真的分配几十 MiB。
-	old := sshclient.MaxTransferBytes
-	sshclient.MaxTransferBytes = 1024
-	t.Cleanup(func() { sshclient.MaxTransferBytes = old })
-
-	raw := make([]byte, 4096) // base64 后约 5.5 KiB，远超 1 KiB 上限
-	res := a.UploadRemoteFile(hostID, "/srv", "huge.bin", base64.StdEncoding.EncodeToString(raw))
-	if res.OK {
-		t.Fatal("超过 MaxTransferBytes 的上传应被拒绝")
-	}
-	if !strings.Contains(res.Error, "scp/sftp") {
-		t.Fatalf("错误应指明大文件的替代路径（终端 scp/sftp），实得: %s", res.Error)
 	}
 }
 

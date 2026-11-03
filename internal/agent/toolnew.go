@@ -90,7 +90,7 @@ var toolDownloadRemoteFile = Tool{
 	Def: def(
 		"download_remote_file",
 		"把**远端主机上的一个文件**下载到本地磁盘（运行本应用的那台机器）。"+
-			"用于把日志、配置拉到本地细看。上限 32 MiB，超过请改用终端里的 scp/sftp。",
+			"用于把日志、配置拉到本地细看。",
 		map[string]any{
 			"host_id": hostIDSchema(),
 			"path":    strSchema("远端文件的绝对路径"),

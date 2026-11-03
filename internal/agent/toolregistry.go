@@ -92,6 +92,7 @@ type sshRunner interface {
 	WriteFile(hostID, path, content string) (sshclient.Result, error)
 	SystemInfo(hostID string) (sshclient.Result, error)
 	WriteFileBinary(hostID, path string, data []byte) (sshclient.Result, error)
+	AppendFileBinary(hostID, path string, data []byte) (sshclient.Result, error)
 	ReadFileChunk(hostID, path string, offset, size int64) ([]byte, error)
 	StatFileSize(hostID, path string) (int64, error)
 }
